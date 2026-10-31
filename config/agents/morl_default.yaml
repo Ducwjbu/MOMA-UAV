@@ -1,0 +1,85 @@
+# CONFIGURATION FOR MULTI-OBJECTIVE RL (GPI-DDPG / GPI-TD3)
+# -----------------------------------------------------------
+# Single-agent điều phối tất cả UAVs, với GPI policy set và OLS weight scheduling
+
+agent_type: "gpi_ddpg"       # class name (không đổi)
+algorithm:  "ddpg"            # "ddpg" | "td3" — default: ddpg (backward compat với DDPG checkpoints)
+
+# ============================================================
+# Multi-Objective Settings
+# ============================================================
+num_objectives: 3
+# Objectives: [0] QoS reward, [1] -Energy penalty, [2] Fairness reward
+
+# Names for logging/plotting
+objective_names:
+  - "QoS"
+  - "Energy Efficiency"
+  - "Fairness"
+
+# ============================================================
+# GPI Policy Set
+# ============================================================
+gpi:
+  max_policies: 10            # Maximum policies in the GPI set
+  # Initial corner weights (one per objective + some mixed)
+  # Corner policies are trained first before OLS kicks in
+  corner_weights:
+    - [1.0, 0.0, 0.0]         # Pure QoS
+    - [0.0, 1.0, 0.0]         # Pure Energy Efficiency
+    - [0.0, 0.0, 1.0]         # Pure Fairness
+  # OLS will find the remaining (max_policies - 3) weight vectors
+
+# ============================================================
+# OLS (Optimistic Linear Support) Weight Scheduler
+# ============================================================
+ols:
+  num_candidates: 200         # Candidate weight vectors sampled from simplex
+  corner_train_steps: 5000    # Steps to train each corner policy before OLS starts
+  switch_policy_every: 2000   # Steps between switching active policy
+  mode: "ols"                 # "ols", "uniform_cycle", "random"
+
+# ============================================================
+# Actor Network (Single Agent for ALL UAVs)
+# ============================================================
+actor:
+  uav_encoder_hidden: 128     # Hidden size for per-UAV observation encoder
+  attention_heads: 4          # Multi-head attention for cross-UAV coordination
+  policy_hidden: [512, 256]   # Policy network hidden layers
+  bandwidth_temperature: 10.0 # Temperature for bandwidth softmax
+
+# ============================================================
+# Critic Network (Multi-Objective, outputs Q-vector of K=3)
+# ============================================================
+critic:
+  backbone_hidden: [512, 256, 128]   # Shared backbone layers
+  # Each objective gets its own head (nn.Linear(128, 1))
+
+# ============================================================
+# DDPG Training Parameters
+# ============================================================
+ddpg:
+  actor_lr: 1e-4
+  critic_lr: 1e-3
+  gamma: 0.99                 # Discount factor
+  tau: 0.005                  # Soft update coefficient
+  batch_size: 256
+  buffer_size: 300000         # Shared replay buffer size
+
+# ============================================================
+# Exploration
+# ============================================================
+exploration:
+  noise_type: "gaussian"
+  gaussian_init: 0.5
+  gaussian_decay: 0.9985
+  gaussian_min: 0.01
+  gaussian_2nd: 0.3           # Re-exploration noise after hitting min
+
+# ============================================================
+# TD3-specific parameters (chỉ dùng khi algorithm: "td3")
+# ============================================================
+td3:
+  policy_noise: 0.2     # Std của noise thêm vào logits của target actor
+  noise_clip:   0.5     # Clip noise trong [-noise_clip, noise_clip]
+  policy_freq:  2       # Critic updates trước khi update actor 1 lần

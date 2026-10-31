@@ -1,0 +1,42 @@
+# ============================================================
+# MOMA-AC Training Config — GPI+OLS omega sampling
+# Train với OLS (smart weight selection) + Policy Bank cho GPI inference
+# ============================================================
+
+# Training
+total_training_steps: 1000000
+min_buffer_size: 5000
+train_frequency: 1
+train_iterations: 1
+batch_size: 256
+max_steps_per_episode: 200
+
+# Omega sampling
+omega_sampling: "gpi_ols"
+corner_warmup_episodes: 30    # OLS corner phase (auto via SimpleOLS)
+
+# TD3 hyperparameters
+actor_lr: 3.0e-4
+critic_lr: 3.0e-4
+gamma: 0.99
+tau: 0.005
+policy_delay: 2
+policy_noise: 0.2
+noise_clip: 0.5
+expl_noise: 0.3
+expl_noise_min: 0.05
+expl_noise_decay: 0.9999
+
+# Replay buffer
+buffer_size: 500000
+
+# Logging & saving
+log_interval: 5000
+save_interval: 100000
+eval_interval: 100000
+eval_n_omega: 30
+eval_n_episodes: 5
+eval_steps: 150
+
+# Output
+save_dir: "saved_models_moma_ac_gpi_ols"
