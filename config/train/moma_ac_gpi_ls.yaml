@@ -1,0 +1,46 @@
+# ============================================================
+# MOMA-AC Training Config — GPI-LS omega sampling (model-free)
+# omega ~ support M, grown at corner weights with the largest GPI gain
+# ============================================================
+
+# Training
+total_training_steps: 1000000
+min_buffer_size: 5000
+train_frequency: 1
+train_iterations: 1
+batch_size: 256
+max_steps_per_episode: 60     # 1 hour of flight at T_L = 60 s, about one battery
+
+# Omega sampling
+omega_sampling: "gpi_ls"
+gpi_ls_interval: 50000        # env steps between GPI-LS iterations
+gpi_ls_episodes: 3            # eval episodes per weight in an iteration
+gpi_top_k: 2                  # corner weights added per iteration
+gpi_max_support: 20           # cap on |M|; GPI action cost grows with |M|^2
+gpi_max_corners: 20           # corner weights evaluated per iteration
+
+# TD3 hyperparameters
+actor_lr: 3.0e-4
+critic_lr: 3.0e-4
+gamma: 0.99
+tau: 0.005
+policy_delay: 2
+policy_noise: 0.2
+noise_clip: 0.5
+expl_noise: 0.3
+expl_noise_min: 0.05
+expl_noise_decay: 0.9999
+
+# Replay buffer
+buffer_size: 500000
+
+# Logging & saving
+log_interval: 5000
+save_interval: 100000
+eval_interval: 50000
+eval_n_omega: 30
+eval_n_episodes: 3
+eval_steps: 60
+
+# Output
+save_dir: "saved_models_moma_ac_gpi_ls"

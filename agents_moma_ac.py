@@ -2,22 +2,31 @@
 agents_moma_ac.py
 =================
 MOMA-AC: Multi-Objective Actor-Critic voi Preference Conditioning (TD3 backbone)
-- PreferencedActor : obs || omega concatenation → split sigmoid/tanh output
-- VectorCritic     : twin critics output R^n_obj
-- ReplayBuffer     : luu omega theo tung transition
-- SimpleOLS        : standalone OLS weight selector
-- MOMA_AC_Agent    : main class, omega_sampling='random'|'ols'
+- PreferencedActor  : obs || omega concatenation → split sigmoid/tanh output
+- VectorCritic      : twin critics output R^n_obj
+- ReplayBuffer      : luu omega theo tung transition
+- PrioritizedReplayBuffer : GPI-based priorities (GPI-PD, Eq. 10 + 17)
+- GPILinearSupport  : weight support M, corner weights (GPI-LS, Alg. 1)
+- DynamicsEnsemble  : learned model for Dyna updates (GPI-PD, Eq. 13-14)
+- MOMA_AC_Agent     : main class, omega_sampling='random'|'gpi_ls'|'gpi_pd'
 """
 
 import os
 import copy
+import itertools
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List
+from typing import List, Optional
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# MOMA_DEVICE overrides the choice, e.g. to train on CPU on a machine with a GPU
+DEVICE = torch.device(os.environ.get("MOMA_DEVICE")
+                      or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+# Evaluation episodes reuse these seeds (common random numbers), so values stay
+# comparable across omegas, checkpoints and sampling variants.
+EVAL_SEED = 12345
 
 
 # ============================================================
@@ -27,10 +36,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class PreferencedActor(nn.Module):
     """
     Preference-conditioned actor: concatenate omega with obs as input.
-    Split output: tanh for pose dims, sigmoid for BW dims.
+    Split output: tanh for position dims, sigmoid for power and BW dims.
     """
     def __init__(self, obs_dim: int, act_dim: int, n_obj: int = 3,
-                 hidden: int = 256, n_pose_dims: int = 4):
+                 hidden: int = 256, n_pose_dims: int = 3):
         super().__init__()
         self.n_pose_dims = n_pose_dims
         inp = obs_dim + n_obj          # concat omega → simple, proven to work
@@ -46,9 +55,9 @@ class PreferencedActor(nn.Module):
         h   = F.relu(self.ln2(self.fc2(h)))
         raw = self.out(h)
         # Split activation per semantic:
-        pose = torch.tanh(raw[..., :self.n_pose_dims])   # pos+power: [-1, 1]
-        bw   = torch.sigmoid(raw[..., self.n_pose_dims:]) # BW alloc:  [ 0, 1]
-        return torch.cat([pose, bw], dim=-1)
+        pose = torch.tanh(raw[..., :self.n_pose_dims])    # position:    [-1, 1]
+        rest = torch.sigmoid(raw[..., self.n_pose_dims:]) # power + BW:  [ 0, 1]
+        return torch.cat([pose, rest], dim=-1)
 
 
 # ============================================================
@@ -73,7 +82,7 @@ class VectorCritic(nn.Module):
 
 
 # ============================================================
-# Replay Buffer  (stores omega per transition)
+# Replay Buffers
 # ============================================================
 
 class ReplayBuffer:
@@ -100,8 +109,23 @@ class ReplayBuffer:
         self.ptr  = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
-    def sample(self, batch_size: int):
-        idx = np.random.randint(0, self.size, batch_size)
+    def add_batch(self, obs, action, r_vec, obs_next, omega):
+        """Add non-terminal transitions in one call (model rollouts)."""
+        n = len(obs)
+        i = (self.ptr + np.arange(n)) % self.max_size
+        self.obs[i]      = obs
+        self.action[i]   = action
+        self.r_vec[i]    = r_vec
+        self.obs_next[i] = obs_next
+        self.omega[i]    = omega
+        self.done[i]     = 0.0
+        self.ptr  = (self.ptr + n) % self.max_size
+        self.size = min(self.size + n, self.max_size)
+
+    def sample_indices(self, batch_size: int) -> np.ndarray:
+        return np.random.randint(0, self.size, batch_size)
+
+    def get(self, idx: np.ndarray):
         def t(arr): return torch.FloatTensor(arr[idx]).to(DEVICE)
         return t(self.obs), t(self.action), t(self.r_vec), \
                t(self.obs_next), t(self.omega), t(self.done)
@@ -109,83 +133,242 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
 
+    def _state(self) -> dict:
+        n = self.size
+        return {"ptr": self.ptr, "size": n,
+                "obs": self.obs[:n], "action": self.action[:n], "r_vec": self.r_vec[:n],
+                "obs_next": self.obs_next[:n], "omega": self.omega[:n], "done": self.done[:n]}
+
+    def save(self, path: str):
+        np.savez(path, **self._state())
+
+    def load(self, path: str):
+        with np.load(path) as st:
+            self.ptr, self.size = int(st["ptr"]), int(st["size"])
+            for key in ("obs", "action", "r_vec", "obs_next", "omega", "done"):
+                getattr(self, key)[:self.size] = st[key]
+            self._load_extra(st)
+
+    def _load_extra(self, st):
+        pass
+
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+    """
+    Proportional sampling with a sum tree. The stored priority is
+    max(|delta|^alpha, kappa) (Eq. 17 of GPI-PD, from Fujimoto et al. 2020).
+    """
+    def __init__(self, obs_dim: int, act_dim: int, n_obj: int,
+                 max_size: int = 500_000, alpha: float = 0.6, kappa: float = 0.1):
+        super().__init__(obs_dim, act_dim, n_obj, max_size)
+        self.alpha = alpha
+        self.kappa = kappa
+        self.capacity = 1 << int(np.ceil(np.log2(max_size)))
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float64)
+        self.max_priority = 1.0
+
+    def _set_priorities(self, idx: np.ndarray, priorities: np.ndarray):
+        pos = idx + self.capacity
+        self.tree[pos] = priorities
+        pos = np.unique(pos // 2)
+        while pos[0] >= 1:
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+            pos = np.unique(pos // 2)
+
+    def add(self, obs, action, r_vec, obs_next, omega, done):
+        i = self.ptr
+        super().add(obs, action, r_vec, obs_next, omega, done)
+        self._set_priorities(np.array([i]), np.array([self.max_priority]))
+
+    def sample_indices(self, batch_size: int) -> np.ndarray:
+        # Stratified: one draw from each of batch_size equal slices of the total
+        u = (np.arange(batch_size) + np.random.random(batch_size)) / batch_size * self.tree[1]
+        pos = np.ones(batch_size, dtype=np.int64)
+        while pos[0] < self.capacity:
+            left = 2 * pos
+            go_right = u >= self.tree[left]
+            u = u - self.tree[left] * go_right
+            pos = left + go_right
+        return np.minimum(pos - self.capacity, self.size - 1)
+
+    def update_priorities(self, idx: np.ndarray, td_errors: np.ndarray):
+        priorities = np.maximum(np.abs(td_errors) ** self.alpha, self.kappa)
+        self.max_priority = max(self.max_priority, float(priorities.max()))
+        # A batch can hold an index twice; keep one priority per index
+        idx, first = np.unique(idx, return_index=True)
+        self._set_priorities(idx, priorities[first])
+
+    def _state(self) -> dict:
+        return {**super()._state(), "tree": self.tree, "max_priority": self.max_priority}
+
+    def _load_extra(self, st):
+        self.tree[:] = st["tree"]
+        self.max_priority = float(st["max_priority"])
+
 
 # ============================================================
-# Policy Bank  (actor snapshots for GPI inference)
+# GPI Linear Support
 # ============================================================
 
-class PolicyBank:
+def corner_weights(values: np.ndarray) -> np.ndarray:
     """
-    Luu toi da max_policies snapshot cua actor sau moi OLS omega.
-    GPI inference: chon action tu policy co scalarized Q-value cao nhat.
+    Corner weights of a value set: the weight parts of the vertices of the
+    polyhedron in Eq. 6 of GPI-PD, {(w, u) | V w <= u, sum(w) = 1, w >= 0}.
+    Enumerates vertices directly, which is cheap for a small V and 3 objectives.
     """
-    def __init__(self, max_policies: int = 10):
-        self.max_policies = max_policies
-        self.actor_states: List[dict]       = []  # state_dicts
-        self.omegas:        List[np.ndarray] = []  # omega tương ứng
+    V = np.asarray(values, dtype=np.float64)
+    n, d = V.shape
+    G = np.vstack([
+        np.hstack([V, -np.ones((n, 1))]),
+        np.hstack([-np.eye(d), np.zeros((d, 1))]),
+    ])
+    combos = np.array(list(itertools.combinations(range(n + d), d)))
+    A = np.zeros((len(combos), d + 1, d + 1))
+    A[:, :d, :] = G[combos]
+    A[:, d, :d] = 1.0
+    b = np.zeros((len(combos), d + 1, 1))
+    b[:, d, 0] = 1.0
 
-    def add(self, actor: nn.Module, omega: np.ndarray):
-        if len(self.actor_states) < self.max_policies:
-            self.actor_states.append(copy.deepcopy(actor.state_dict()))
-            self.omegas.append(omega.copy())
-            print(f"[Bank] Added policy {len(self.actor_states)}/{self.max_policies} "
-                  f"for ω={np.round(omega, 2)}")
-
-    def __len__(self):
-        return len(self.actor_states)
+    regular = np.abs(np.linalg.det(A)) > 1e-12
+    x = np.linalg.solve(A[regular], b[regular])[..., 0]
+    feasible = np.all(x @ G.T <= 1e-9, axis=1)
+    return np.unique(x[feasible, :d].round(4) + 0.0, axis=0)    # + 0.0 turns -0. into 0.
 
 
+class GPILinearSupport:
+    """Weight support M of GPI-LS (Alg. 1). Starts from the extrema weights."""
+    def __init__(self, n_obj: int = 3, top_k: int = 2, max_support: int = 20,
+                 max_corners: int = 20, min_distance: float = 0.05):
+        self.n_obj       = n_obj
+        self.top_k       = top_k
+        self.max_support = max_support
+        self.max_corners = max_corners
+        self.min_distance = min_distance
+        self.weights: List[np.ndarray] = list(np.eye(n_obj, dtype=np.float32))
 
-class SimpleOLS:
+    def remove_dominated(self, values: np.ndarray) -> np.ndarray:
+        """
+        Drop weights whose value is not the best at any corner weight, and
+        return the values that remain. Extrema weights are always kept, so the
+        ends of the front keep being trained.
+        """
+        corners = corner_weights(values)
+        scalarized = corners @ values.T                    # (n_corners, n_values)
+        is_best = scalarized >= scalarized.max(axis=1, keepdims=True) - 1e-6
+        keep = is_best.any(axis=0)
+        keep[:self.n_obj] = True
+        self.weights = [w for w, k in zip(self.weights, keep) if k]
+        return values[keep]
+
+    def candidates(self, values: np.ndarray) -> np.ndarray:
+        """Corner weights of V that are not already in the support."""
+        corners = corner_weights(values)
+        support = np.array(self.weights)
+        dist = np.linalg.norm(corners[:, None, :] - support[None, :, :], axis=2).min(axis=1)
+        corners = corners[dist > self.min_distance]
+        if len(corners) > self.max_corners:
+            corners = corners[np.random.choice(len(corners), self.max_corners, replace=False)]
+        return corners.astype(np.float32)
+
+
+# ============================================================
+# Dynamics Model (GPI-PD)
+# ============================================================
+
+class EnsembleLinear(nn.Module):
+    """n_members independent linear layers, applied in one tensor operation."""
+    def __init__(self, n_members: int, in_dim: int, out_dim: int):
+        super().__init__()
+        bound = 1.0 / np.sqrt(in_dim)    # Same initialization as nn.Linear
+        self.weight = nn.Parameter(torch.empty(n_members, in_dim, out_dim).uniform_(-bound, bound))
+        self.bias   = nn.Parameter(torch.empty(n_members, 1, out_dim).uniform_(-bound, bound))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(x, self.weight) + self.bias   # x: (M, B, in_dim)
+
+
+class DynamicsEnsemble:
     """
-    Phase 1 (corner): Xoay vong qua n_obj corner weights [1,0,0], [0,1,0], [0,0,1].
-    Phase 2 (ols)   : Chon omega co max gap (ideal-point upper bound - current best).
+    Ensemble of probabilistic MLPs predicting (obs_next - obs, r_vec) from
+    (obs, action) as a diagonal Gaussian (Eq. 13-14 of GPI-PD). All members run
+    as one batched network, and each one still trains on its own random batch.
     """
-    def __init__(self, n_obj: int = 3, n_candidates: int = 500,
-                 epsilon: float = 0.005):
-        self.n_obj        = n_obj
-        self.n_candidates = n_candidates
-        self.epsilon      = epsilon
-        self.corner_idx   = 0
-        self.phase        = "corner"
-        self.omegas: List[np.ndarray] = []
-        self.values: List[np.ndarray] = []
+    def __init__(self, obs_dim: int, act_dim: int, n_obj: int, n_members: int = 5,
+                 hidden: int = 200, lr: float = 1e-3):
+        self.obs_dim = obs_dim
+        self.n_members = n_members
+        out = obs_dim + n_obj
+        self.net = nn.Sequential(
+            EnsembleLinear(n_members, obs_dim + act_dim, hidden), nn.SiLU(),
+            EnsembleLinear(n_members, hidden, hidden), nn.SiLU(),
+            EnsembleLinear(n_members, hidden, hidden), nn.SiLU(),
+            EnsembleLinear(n_members, hidden, hidden), nn.SiLU(),
+            EnsembleLinear(n_members, hidden, 2 * out),
+        ).to(DEVICE)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
 
-    def update(self, omega: np.ndarray, value_vec: np.ndarray):
-        self.omegas.append(omega.copy())
-        self.values.append(value_vec.copy())
-        if self.phase == "corner" and self.corner_idx >= self.n_obj:
-            self.phase = "ols"
-            print("[SimpleOLS] Corner phase done -> OLS phase")
+    def _gaussian_nll(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Sum over members of each member's mean NLL, so no member's gradient is scaled down."""
+        mu, logvar = self.net(x).chunk(2, dim=-1)
+        logvar = logvar.clamp(-10.0, 4.0)
+        return 0.5 * self.n_members * (((mu - y) ** 2) * torch.exp(-logvar) + logvar).mean()
 
-    def select_next(self) -> np.ndarray:
-        # Phase 1: corner weights
-        if self.phase == "corner":
-            w = np.zeros(self.n_obj, dtype=np.float32)
-            w[self.corner_idx % self.n_obj] = 1.0
-            self.corner_idx += 1
-            return w
+    def _batch(self, buffer: ReplayBuffer, idx: np.ndarray):
+        """Normalized (x, y) tensors for an index array of shape (M, B)."""
+        def t(arr): return torch.as_tensor(arr, dtype=torch.float32, device=DEVICE)
+        x = t(np.concatenate([buffer.obs[idx], buffer.action[idx]], axis=-1))
+        y = t(np.concatenate([buffer.obs_next[idx] - buffer.obs[idx], buffer.r_vec[idx]], axis=-1))
+        return (x - self.x_mean) / self.x_std, (y - self.y_mean) / self.y_std
 
-        if not self.values:
-            return np.random.dirichlet(np.ones(self.n_obj)).astype(np.float32)
+    def fit(self, buffer: ReplayBuffer, max_steps: int = 200, batch_size: int = 256,
+            patience: int = 5, check_every: int = 10) -> float:
+        """Train on the buffer with early stopping on a holdout set. Returns holdout NLL."""
+        def t(arr): return torch.as_tensor(arr, dtype=torch.float32, device=DEVICE)
+        n = len(buffer)
+        # Normalization stats from a sample: a full pass over a 500k buffer is slow
+        idx = np.random.randint(0, n, min(n, 50_000))
+        x = np.concatenate([buffer.obs[idx], buffer.action[idx]], axis=1)
+        y = np.concatenate([buffer.obs_next[idx] - buffer.obs[idx], buffer.r_vec[idx]], axis=1)
+        self.x_mean, self.x_std = t(x.mean(0)), t(x.std(0) + 1e-6)
+        self.y_mean, self.y_std = t(y.mean(0)), t(y.std(0) + 1e-6)
+        self.y_min,  self.y_max = t(y.min(0)),  t(y.max(0))
 
-        values = np.array(self.values, dtype=np.float64)  # (N, n_obj)
+        perm    = np.random.permutation(n)
+        n_val   = min(max(n // 10, 1), 2000)
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
+        x_val, y_val = self._batch(buffer, np.tile(val_idx, (self.n_members, 1)))
 
-        # Use 90th-percentile as ideal point instead of absolute max
-        # This prevents early bad episodes (e.g. Energy=-0.8) from skewing UB
-        ideal = np.percentile(values, 90, axis=0)
+        best, since_best = float("inf"), 0
+        for step in range(max_steps):
+            idx = train_idx[np.random.randint(0, len(train_idx), (self.n_members, batch_size))]
+            loss = self._gaussian_nll(*self._batch(buffer, idx))
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
 
-        # Sample candidate omegas uniformly on simplex
-        cands    = np.random.dirichlet(np.ones(self.n_obj), self.n_candidates)
-        ubs      = cands @ ideal                           # (n_cands,) upper bound
-        cur_best = (cands @ values.T).max(axis=1)         # (n_cands,) current best
-        gaps     = ubs - cur_best
-        best_i   = int(gaps.argmax())
+            if (step + 1) % check_every == 0:
+                with torch.no_grad():
+                    val = self._gaussian_nll(x_val, y_val).item() / self.n_members
+                if val < best - 1e-3:
+                    best, since_best = val, 0
+                else:
+                    since_best += 1
+                    if since_best >= patience:
+                        break
+        return best
 
-        if float(gaps[best_i]) < self.epsilon:
-            # Converged: random fallback
-            return np.random.dirichlet(np.ones(self.n_obj)).astype(np.float32)
-        return cands[best_i].astype(np.float32)
+    @torch.no_grad()
+    def predict(self, obs: torch.Tensor, action: torch.Tensor):
+        """Sample (obs_next, r_vec) from a random ensemble member per transition."""
+        B = obs.shape[0]
+        x = (torch.cat([obs, action], dim=-1) - self.x_mean) / self.x_std
+        out = self.net(x.expand(self.n_members, -1, -1))        # (M, B, 2*out)
+        pick = torch.randint(self.n_members, (B,), device=DEVICE)
+        mu, logvar = out[pick, torch.arange(B, device=DEVICE)].chunk(2, dim=-1)
+        y = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar.clamp(-10.0, 4.0))
+        y = y * self.y_std + self.y_mean
+        y = torch.max(torch.min(y, self.y_max), self.y_min)
+        return obs + y[:, :self.obs_dim], y[:, self.obs_dim:]
 
 
 # ============================================================
@@ -195,8 +378,9 @@ class SimpleOLS:
 class MOMA_AC_Agent:
     """
     MOMA-AC: preference-conditioned TD3 voi vector-valued critic.
-      omega_sampling='random' -> Dirichlet moi episode
-      omega_sampling='ols'    -> OLS gap-maximizing moi episode
+      omega_sampling='random' -> Dirichlet moi episode (baseline MOMA-AC goc)
+      omega_sampling='gpi_ls' -> GPI Linear Support: omega ~ M, hanh dong theo GPI
+      omega_sampling='gpi_pd' -> GPI-LS + GPI-prioritized replay + Dyna (hoc model)
     """
 
     def __init__(
@@ -217,8 +401,22 @@ class MOMA_AC_Agent:
         expl_noise_decay: float = 0.9999,
         buffer_size: int        = 500_000,
         omega_sampling: str     = "random",
-        corner_warmup_episodes: int = 30,
+        corner_warmup_episodes: int = 0,
+        # GPI-LS
+        gpi_top_k: int          = 2,
+        gpi_max_support: int    = 20,
+        gpi_max_corners: int    = 20,
+        # GPI-PD
+        per_alpha: float        = 0.6,
+        per_kappa: float        = 0.1,
+        dyna_beta: float        = 0.5,
+        dyna_rollouts: int      = 2000,
+        model_fit_steps: int    = 200,
+        model_buffer_size: int  = 100_000,
     ):
+        if omega_sampling not in ("random", "gpi_ls", "gpi_pd"):
+            raise ValueError(f"Unknown omega_sampling: {omega_sampling}")
+
         self.obs_dim   = obs_dim
         self.act_dim   = act_dim
         self.n_obj     = n_objectives
@@ -232,6 +430,10 @@ class MOMA_AC_Agent:
         self.expl_noise_decay = expl_noise_decay
         self.omega_sampling  = omega_sampling
         self.corner_warmup_episodes = corner_warmup_episodes
+        self.dyna_beta       = dyna_beta
+        self.dyna_rollouts   = dyna_rollouts
+        self.model_fit_steps = model_fit_steps
+        self.per_kappa       = per_kappa
 
         # ── Networks ─────────────────────────────────────────────
         self.actor        = PreferencedActor(obs_dim, act_dim, n_objectives, hidden_dim).to(DEVICE)
@@ -246,14 +448,20 @@ class MOMA_AC_Agent:
             list(self.critic1.parameters()) + list(self.critic2.parameters()),
             lr=critic_lr)
 
-        # ── Replay Buffer ────────────────────────────────────────
-        self.buffer = ReplayBuffer(obs_dim, act_dim, n_objectives, buffer_size)
+        # ── GPI-LS weight support ────────────────────────────────
+        self.support = (GPILinearSupport(n_objectives, gpi_top_k, gpi_max_support, gpi_max_corners)
+                        if omega_sampling in ("gpi_ls", "gpi_pd") else None)
 
-        # ── OLS / Policy Bank ────────────────────────────────────
-        self.ols  = SimpleOLS(n_objectives) if omega_sampling in ("ols", "gpi_ols") else None
-        self.bank = PolicyBank(max_policies=10) if omega_sampling == "gpi_ols" else None
-        # Track previous omega to detect OLS transitions
-        self._prev_ols_omega: Optional[np.ndarray] = None
+        # ── Replay Buffer / Dyna model ───────────────────────────
+        self.model = None
+        self.model_buffer = None
+        if omega_sampling == "gpi_pd":
+            self.buffer = PrioritizedReplayBuffer(obs_dim, act_dim, n_objectives, buffer_size,
+                                                  per_alpha, per_kappa)
+            self.model = DynamicsEnsemble(obs_dim, act_dim, n_objectives)
+            self.model_buffer = ReplayBuffer(obs_dim, act_dim, n_objectives, model_buffer_size)
+        else:
+            self.buffer = ReplayBuffer(obs_dim, act_dim, n_objectives, buffer_size)
 
         # ── State ────────────────────────────────────────────────
         self.total_updates  = 0
@@ -272,51 +480,154 @@ class MOMA_AC_Agent:
 
     # ── Omega Sampling ───────────────────────────────────────────
 
-    def sample_omega(self, episode_value_vec: Optional[np.ndarray]) -> np.ndarray:
-        """Call at start of each new episode. Pass last episode's mean r_vec."""
-        if self.omega_sampling in ("ols", "gpi_ols"):
-            if episode_value_vec is not None:
-                self.ols.update(self.current_omega, episode_value_vec)
-            new_omega = self.ols.select_next()
-
-            # GPI_OLS: snapshot actor when OLS transitions to a meaningfully different omega
-            if (self.omega_sampling == "gpi_ols"
-                    and self._prev_ols_omega is not None
-                    and episode_value_vec is not None
-                    and not np.allclose(new_omega, self._prev_ols_omega, atol=0.08)
-                    and len(self.bank) < self.bank.max_policies):
-                self.bank.add(self.actor, self._prev_ols_omega)
-
-            self._prev_ols_omega = new_omega.copy()
-            omega = new_omega
-        else:
+    def sample_omega(self) -> np.ndarray:
+        """Call at start of each new episode."""
+        if self.support is not None:
+            # GPI-PD Alg. 2, line 10: w_t ~ M
+            omega = self.support.weights[np.random.randint(len(self.support.weights))]
+        elif self.episode_count < self.corner_warmup_episodes:
             # Random: corner warmup then Dirichlet
-            if self.episode_count < self.corner_warmup_episodes:
-                omega = np.zeros(self.n_obj, dtype=np.float32)
-                omega[self.episode_count % self.n_obj] = 1.0
-            else:
-                omega = np.random.dirichlet(np.ones(self.n_obj)).astype(np.float32)
+            omega = np.zeros(self.n_obj, dtype=np.float32)
+            omega[self.episode_count % self.n_obj] = 1.0
+        else:
+            omega = np.random.dirichlet(np.ones(self.n_obj)).astype(np.float32)
 
         self.current_omega = omega
         self.episode_count += 1
         return omega
 
+    def update_weight_support(self, env, n_episodes: int = 3, steps: int = 60) -> dict:
+        """One GPI-LS iteration on the support M (GPI-PD Alg. 2, lines 5-8)."""
+        values = np.array([self.eval_omega(env, w, n_episodes, steps)
+                           for w in self.support.weights])
+        values = self.support.remove_dominated(values)
+
+        corners = self.support.candidates(values)
+        gaps = np.zeros(len(corners))
+        for i, w in enumerate(corners):
+            v_gpi   = self.eval_omega(env, w, n_episodes, steps, use_gpi=True)
+            gaps[i] = v_gpi @ w - (values @ w).max()               # Eq. 7
+
+        free = self.support.max_support - len(self.support.weights)
+        n_add = max(min(self.support.top_k, free), 0)
+        added = 0
+        for i in np.argsort(-gaps)[:n_add]:
+            if gaps[i] > 0:     # Eq. 7 is noisy; a corner with no measured gain isn't worth training
+                self.support.weights.append(corners[i].copy())
+                added += 1
+
+        return {
+            "support_size": len(self.support.weights),
+            "n_corners":    len(corners),
+            "max_gap":      float(gaps.max()) if len(gaps) else 0.0,
+            "added":        added,
+        }
+
     # ── Action Selection ─────────────────────────────────────────
+
+    def _scalarized_q(self, critic_a, critic_b, obs, action, cond_omega, omega) -> torch.Tensor:
+        """min(Q_a, Q_b) · omega for critics conditioned on cond_omega. Shape (B,)."""
+        q_a = (critic_a(obs, action, cond_omega) * omega).sum(-1)
+        q_b = (critic_b(obs, action, cond_omega) * omega).sum(-1)
+        return torch.min(q_a, q_b)
+
+    def _support_tensor(self, extra: Optional[np.ndarray] = None) -> torch.Tensor:
+        weights = list(self.support.weights)
+        if extra is not None:
+            weights.append(extra)
+        return torch.as_tensor(np.array(weights), dtype=torch.float32, device=DEVICE)
+
+    @torch.no_grad()
+    def gpi_select_action(self, obs: np.ndarray, omega: np.ndarray) -> np.ndarray:
+        """
+        GPI policy of a weight-conditioned network (GPI-PD Eq. 21):
+        argmax over a in {pi(s, w')} of max over w' in M of Q(s, a, w') · omega.
+        omega itself joins the set, so GPI can always fall back on pi(s, omega).
+        """
+        M = self._support_tensor(omega)
+        K = M.shape[0]
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        omega_t = torch.as_tensor(omega, dtype=torch.float32, device=DEVICE)
+
+        candidates = self.actor(obs_t.repeat(K, 1), M)                     # (K, act_dim)
+        q = self._scalarized_q(self.critic1, self.critic2,
+                               obs_t.repeat(K * K, 1),
+                               candidates.repeat_interleave(K, dim=0),
+                               M.repeat(K, 1),
+                               omega_t)
+        best = q.view(K, K).max(dim=1).values.argmax()
+        return candidates[best].cpu().numpy()
+
+    @torch.no_grad()
+    def _gpi_action_batch(self, obs: torch.Tensor, omega: np.ndarray) -> torch.Tensor:
+        """
+        Batched GPI action for Dyna rollouts. Each candidate pi(s, w') is scored
+        only with its own Q(s, a, w'), since the full K x K sweep is too slow per batch.
+        """
+        M = self._support_tensor(omega)
+        B, K = obs.shape[0], M.shape[0]
+        omega_t = torch.as_tensor(omega, dtype=torch.float32, device=DEVICE)
+
+        obs_r = obs.repeat_interleave(K, dim=0)
+        cond  = M.repeat(B, 1)
+        a     = self.actor(obs_r, cond)
+        q     = self._scalarized_q(self.critic1, self.critic2, obs_r, a, cond, omega_t)
+        best  = q.view(B, K).argmax(dim=1)
+        return a.view(B, K, -1)[torch.arange(B, device=DEVICE), best]
 
     @torch.no_grad()
     def select_action(self, obs: np.ndarray, omega: np.ndarray,
-                      explore: bool = True) -> np.ndarray:
-        obs_t   = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
-        omega_t = torch.FloatTensor(omega).unsqueeze(0).to(DEVICE)
-        action  = self.actor(obs_t, omega_t).cpu().numpy()[0]
+                      explore: bool = True, use_gpi: bool = False) -> np.ndarray:
+        if use_gpi:
+            action = self.gpi_select_action(obs, omega)
+        else:
+            obs_t   = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
+            omega_t = torch.FloatTensor(omega).unsqueeze(0).to(DEVICE)
+            action  = self.actor(obs_t, omega_t).cpu().numpy()[0]
         if explore:
+            n_pose = self.actor.n_pose_dims
             noise = np.random.normal(0, self.expl_noise, size=action.shape)
-            # Clip per range: pose dims [-1,1], BW dims [0,1]
-            action[:4] = np.clip(action[:4] + noise[:4], -1.0,  1.0)
-            action[4:] = np.clip(action[4:] + noise[4:],  0.0,  1.0)
+            # Clip per range: position dims [-1,1], power and BW dims [0,1]
+            action[:n_pose] = np.clip(action[:n_pose] + noise[:n_pose], -1.0, 1.0)
+            action[n_pose:] = np.clip(action[n_pose:] + noise[n_pose:],  0.0, 1.0)
             self.expl_noise = max(self.expl_noise_min,
                                   self.expl_noise * self.expl_noise_decay)
         return action
+
+    # ── Dyna (GPI-PD) ────────────────────────────────────────────
+
+    def dyna_step(self) -> dict:
+        """Fit the model, then add GPI-prioritized simulated transitions (Alg. 2, lines 15-19)."""
+        val_nll = self.model.fit(self.buffer, max_steps=self.model_fit_steps)
+
+        idx   = self.buffer.sample_indices(self.dyna_rollouts)
+        obs_t = torch.FloatTensor(self.buffer.obs[idx]).to(DEVICE)
+        action   = self._gpi_action_batch(obs_t, self.current_omega)
+        obs_next, r_vec = self.model.predict(obs_t, action)
+        omega = np.tile(self.current_omega, (self.dyna_rollouts, 1))
+        self.model_buffer.add_batch(self.buffer.obs[idx], action.cpu().numpy(),
+                                    r_vec.cpu().numpy(), obs_next.cpu().numpy(), omega)
+        return {"model_val_nll": val_nll}
+
+    @torch.no_grad()
+    def _gpi_td_errors(self, obs, action, r_vec, obs_next, done) -> np.ndarray:
+        """Eq. 10 of GPI-PD for the current omega, scoring each pi(s', w') with its own Q."""
+        omega = self.current_omega
+        omega_t = torch.as_tensor(omega, dtype=torch.float32, device=DEVICE)
+        M = self._support_tensor(omega)
+        B, K = obs.shape[0], M.shape[0]
+
+        obs_n_r = obs_next.repeat_interleave(K, dim=0)
+        cond    = M.repeat(B, 1)
+        a_next  = self.actor_target(obs_n_r, cond)
+        q_next  = self._scalarized_q(self.critic1_target, self.critic2_target,
+                                     obs_n_r, a_next, cond, omega_t)
+        q_next  = q_next.view(B, K).max(dim=1).values
+
+        omega_b = omega_t.expand(B, -1)
+        q = (self.critic1(obs, action, omega_b) * omega_t).sum(-1)
+        target = (r_vec * omega_t).sum(-1) + self.gamma * (1.0 - done[:, 0]) * q_next
+        return (target - q).cpu().numpy()
 
     # ── TD3 Update ───────────────────────────────────────────────
 
@@ -324,33 +635,61 @@ class MOMA_AC_Agent:
         if len(self.buffer) < batch_size:
             return {}
 
-        obs_b, act_b, r_b, obs_n_b, omega_b, done_b = self.buffer.sample(batch_size)
+        # GPI-PD Alg. 2, line 21: beta*b simulated tuples and (1-beta)*b real tuples
+        n_model = 0
+        if self.model_buffer is not None and len(self.model_buffer) >= batch_size:
+            n_model = int(self.dyna_beta * batch_size)
+        idx  = self.buffer.sample_indices(batch_size - n_model)
+        real = self.buffer.get(idx)
+        obs_b, act_b, r_b, obs_n_b, omega_b, done_b = real
+        if n_model > 0:
+            fake = self.model_buffer.get(self.model_buffer.sample_indices(n_model))
+            obs_b, act_b, r_b, obs_n_b, omega_b, done_b = (
+                torch.cat(pair, dim=0) for pair in zip(real, fake))
+
+        # GPI-PD Alg. 2, line 22: L(theta; w_t) + L(theta; w'), w' ~ M, so that
+        # training on one weight doesn't make the network forget the others
+        if self.support is not None:
+            n = obs_b.shape[0]
+            M = self._support_tensor()
+            w_t = torch.as_tensor(self.current_omega, dtype=torch.float32, device=DEVICE)
+            omega_b = torch.cat([w_t.expand(n, -1),
+                                 M[torch.randint(M.shape[0], (n,), device=DEVICE)]], dim=0)
+            obs_b, act_b, r_b, obs_n_b, done_b = (
+                x.repeat(2, 1) for x in (obs_b, act_b, r_b, obs_n_b, done_b))
 
         with torch.no_grad():
             # Target policy smoothing (TD3) — clamp per range
             noise  = (torch.randn_like(act_b) * self.policy_noise).clamp(
                         -self.noise_clip, self.noise_clip)
             next_a_raw = self.actor_target(obs_n_b, omega_b) + noise
-            # Pose dims clamp [-1,1], BW dims clamp [0,1]
+            # Position dims clamp [-1,1], power and BW dims clamp [0,1]
             n_pose = self.actor.n_pose_dims
             next_a = torch.cat([
                 next_a_raw[..., :n_pose].clamp(-1., 1.),
                 next_a_raw[..., n_pose:].clamp(0.,  1.),
             ], dim=-1)
 
-            # Twin critic targets — take min per objective
+            # Twin critic targets — pick the critic with the lower scalarized value
+            # (MOMA-AC Eq. 4-6, GPI-PD appendix Eq. 19)
             Q1_next = self.critic1_target(obs_n_b, next_a, omega_b)  # (B, n_obj)
             Q2_next = self.critic2_target(obs_n_b, next_a, omega_b)
-            Q_next  = torch.min(Q1_next, Q2_next)                    # (B, n_obj)
+            use_q1  = (Q1_next * omega_b).sum(-1, keepdim=True) <= (Q2_next * omega_b).sum(-1, keepdim=True)
+            Q_next  = torch.where(use_q1, Q1_next, Q2_next)          # (B, n_obj)
 
             # Bellman target (vector-valued, NO scalarization here)
             target = r_b + self.gamma * (1.0 - done_b) * Q_next   # (B, n_obj)
 
-        # Critic loss: VECTOR MSE — train all objectives every transition
+        # Critic loss: VECTOR — train all objectives every transition
         # (Scalarizing here would starve objectives not in current omega)
         Q1 = self.critic1(obs_b, act_b, omega_b)
         Q2 = self.critic2(obs_b, act_b, omega_b)
-        c_loss = F.mse_loss(Q1, target) + F.mse_loss(Q2, target)
+        if self.model is not None:
+            # Prioritized sampling is paired with a Huber loss (LAP, Fujimoto et al. 2020)
+            c_loss = (F.smooth_l1_loss(Q1, target, beta=self.per_kappa)
+                      + F.smooth_l1_loss(Q2, target, beta=self.per_kappa))
+        else:
+            c_loss = F.mse_loss(Q1, target) + F.mse_loss(Q2, target)
 
         self.critic_opt.zero_grad()
         c_loss.backward()
@@ -360,6 +699,11 @@ class MOMA_AC_Agent:
         self.total_updates += 1
 
         info = {"critic_loss": float(c_loss)}
+
+        # GPI-PD Alg. 2, line 23
+        if self.model is not None:
+            r_obs, r_act, r_rew, r_next, _, r_done = real
+            self.buffer.update_priorities(idx, self._gpi_td_errors(r_obs, r_act, r_rew, r_next, r_done))
 
         # Delayed actor update (every policy_delay critic steps)
         if self.total_updates % self.policy_delay == 0:
@@ -385,20 +729,21 @@ class MOMA_AC_Agent:
     # ── Pareto Evaluation ────────────────────────────────────────
 
     @torch.no_grad()
-    def eval_omega(self, env, omega: np.ndarray,
-                   n_episodes: int = 5, steps: int = 150) -> np.ndarray:
+    def eval_omega(self, env, omega: np.ndarray, n_episodes: int = 5, steps: int = 60,
+                   use_gpi: bool = False) -> np.ndarray:
         """Evaluate policy for one omega. Returns mean reward vector."""
-        uav_ids = sorted(env.reset().keys())
-        uid     = uav_ids[0]
-        all_rv  = []
-        for _ in range(n_episodes):
+        rng_state = np.random.get_state()
+        uid    = sorted(env.uavs.keys())[0]
+        all_rv = []
+        for ep in range(n_episodes):
+            np.random.seed(EVAL_SEED + ep)
             obs_dict = env.reset()
             obs      = obs_dict[uid]
             ep_rv    = []
             done     = False
             t        = 0
             while not done and t < steps:
-                action   = self.select_action(obs, omega, explore=False)
+                action   = self.select_action(obs, omega, explore=False, use_gpi=use_gpi)
                 obs_dict, _, done, info = env.step({uid: action})
                 obs = obs_dict.get(uid, obs)
                 rv  = info.get("reward_vector", None)
@@ -407,85 +752,20 @@ class MOMA_AC_Agent:
                 t += 1
             if ep_rv:
                 all_rv.append(np.mean(ep_rv, axis=0))
+        np.random.set_state(rng_state)
         return np.mean(all_rv, axis=0) if all_rv else np.zeros(self.n_obj, dtype=np.float32)
 
-    @torch.no_grad()
-    def gpi_select_action(self, obs: np.ndarray, omega_test: np.ndarray) -> np.ndarray:
-        """
-        GPI inference: evaluate actor with each (omega_i) in bank,
-        pick action that maximizes omega_test^T * Q(s, a_i, omega_i).
-        Falls back to standard select_action if bank is empty.
-        """
-        if self.bank is None or len(self.bank) == 0:
-            return self.select_action(obs, omega_test, explore=False)
-
-        obs_t      = torch.FloatTensor(obs).unsqueeze(0).to(DEVICE)
-        omega_t    = torch.FloatTensor(omega_test).unsqueeze(0).to(DEVICE)
-        best_val   = -float("inf")
-        best_action = None
-
-        # Also consider current actor with test omega
-        all_entries = list(zip(self.bank.actor_states, self.bank.omegas))
-
-        for actor_sd, omega_i in all_entries:
-            # Temporarily load snapshot
-            tmp = copy.deepcopy(self.actor)
-            tmp.load_state_dict(actor_sd)
-            tmp.eval()
-            omega_i_t = torch.FloatTensor(omega_i).unsqueeze(0).to(DEVICE)
-            a_i = tmp(obs_t, omega_i_t)                         # action under omega_i
-            q   = self.critic1(obs_t, a_i, omega_i_t)           # Q-vector (1, n_obj)
-            val = (q * omega_t).sum(-1).item()                  # scalarized by test omega
-            if val > best_val:
-                best_val    = val
-                best_action = a_i.cpu().numpy()[0]
-
-        # Also try current actor with test omega
-        a_cur = self.actor(obs_t, omega_t)
-        q_cur = self.critic1(obs_t, a_cur, omega_t)
-        val_cur = (q_cur * omega_t).sum(-1).item()
-        if val_cur > best_val:
-            best_action = a_cur.cpu().numpy()[0]
-
-        return best_action
-
-    @torch.no_grad()
-    def eval_omega_gpi(self, env, omega: np.ndarray,
-                       n_episodes: int = 5, steps: int = 150) -> np.ndarray:
-        """Evaluate GPI policy (bank + current actor) for one omega."""
-        uav_ids = sorted(env.reset().keys())
-        uid     = uav_ids[0]
-        all_rv  = []
-        for _ in range(n_episodes):
-            obs_dict = env.reset()
-            obs      = obs_dict[uid]
-            ep_rv    = []
-            done     = False
-            t        = 0
-            while not done and t < steps:
-                action   = self.gpi_select_action(obs, omega)
-                obs_dict, _, done, info = env.step({uid: action})
-                obs = obs_dict.get(uid, obs)
-                rv  = info.get("reward_vector", None)
-                if rv is not None:
-                    ep_rv.append(np.array(rv, dtype=np.float32))
-                t += 1
-            if ep_rv:
-                all_rv.append(np.mean(ep_rv, axis=0))
-        return np.mean(all_rv, axis=0) if all_rv else np.zeros(self.n_obj, dtype=np.float32)
-
-    def eval_pareto_front(self, env, n_omega: int = 50,
-                          n_episodes: int = 5, steps: int = 150,
+    def eval_pareto_front(self, env, n_omega: int = 30,
+                          n_episodes: int = 5, steps: int = 60,
                           use_gpi: bool = False):
-        """Sweep n_omega weights, eval each. use_gpi=True uses GPI inference."""
+        """Sweep a fixed set of n_omega weights, eval each. use_gpi=True uses GPI inference."""
         corners  = np.eye(self.n_obj, dtype=np.float32)
-        interior = np.random.dirichlet(np.ones(self.n_obj),
-                                       n_omega - self.n_obj).astype(np.float32)
+        interior = np.random.RandomState(EVAL_SEED).dirichlet(
+            np.ones(self.n_obj), n_omega - self.n_obj).astype(np.float32)
         omegas   = np.vstack([corners, interior])
         results  = []
-        eval_fn  = self.eval_omega_gpi if use_gpi else self.eval_omega
         for i, w in enumerate(omegas):
-            rv = eval_fn(env, w, n_episodes, steps)
+            rv = self.eval_omega(env, w, n_episodes, steps, use_gpi=use_gpi)
             results.append(rv)
             print(f"  eval {i+1}/{len(omegas)}: w={np.round(w,2)} "
                   f"QoS={rv[0]:.3f} Eng={rv[1]:.3f} Fair={rv[2]:.3f}")
@@ -502,22 +782,21 @@ class MOMA_AC_Agent:
             "critic2":        self.critic2.state_dict(),
             "critic1_target": self.critic1_target.state_dict(),
             "critic2_target": self.critic2_target.state_dict(),
+            "actor_opt":      self.actor_opt.state_dict(),
+            "critic_opt":     self.critic_opt.state_dict(),
+            # Dynamics model (gpi_pd mode)
+            "model_state":    self.model.net.state_dict() if self.model else None,
+            "model_opt":      self.model.opt.state_dict() if self.model else None,
             "expl_noise":     self.expl_noise,
             "total_updates":  self.total_updates,
             "episode_count":  self.episode_count,
             "omega_sampling": self.omega_sampling,
             "current_omega":  self.current_omega.tolist(),
-            # OLS state
-            "ols_omegas":  [w.tolist() for w in self.ols.omegas]    if self.ols else [],
-            "ols_values":  [v.tolist() for v in self.ols.values]    if self.ols else [],
-            "ols_phase":   self.ols.phase                           if self.ols else None,
-            "ols_corner":  self.ols.corner_idx                      if self.ols else 0,
-            # Policy bank (gpi_ols mode)
-            "bank_actor_states": self.bank.actor_states if self.bank else [],
-            "bank_omegas":       [w.tolist() for w in self.bank.omegas] if self.bank else [],
+            # GPI-LS weight support
+            "support_weights": [w.tolist() for w in self.support.weights] if self.support else [],
         }, path)
-        if self.bank:
-            print(f"[MOMA-AC] Saved: {path}  (bank={len(self.bank)} policies)")
+        if self.support:
+            print(f"[MOMA-AC] Saved: {path}  (support={len(self.support.weights)} weights)")
         else:
             print(f"[MOMA-AC] Saved: {path}")
 
@@ -529,19 +808,19 @@ class MOMA_AC_Agent:
         self.critic2.load_state_dict(st["critic2"])
         self.critic1_target.load_state_dict(st["critic1_target"])
         self.critic2_target.load_state_dict(st["critic2_target"])
+        if "actor_opt" in st:
+            self.actor_opt.load_state_dict(st["actor_opt"])
+            self.critic_opt.load_state_dict(st["critic_opt"])
+        if self.model and st.get("model_state"):
+            self.model.net.load_state_dict(st["model_state"])
+            self.model.opt.load_state_dict(st["model_opt"])
         self.expl_noise    = st.get("expl_noise",    self.expl_noise)
         self.total_updates = st.get("total_updates", 0)
         self.episode_count = st.get("episode_count", 0)
         self.current_omega = np.array(st.get("current_omega", self.current_omega),
                                       dtype=np.float32)
-        if self.ols and st.get("ols_omegas"):
-            self.ols.omegas     = [np.array(w, np.float32) for w in st["ols_omegas"]]
-            self.ols.values     = [np.array(v, np.float32) for v in st["ols_values"]]
-            self.ols.phase      = st.get("ols_phase",  "corner")
-            self.ols.corner_idx = st.get("ols_corner", 0)
-        if self.bank and st.get("bank_actor_states"):
-            self.bank.actor_states = st["bank_actor_states"]
-            self.bank.omegas       = [np.array(w, np.float32) for w in st["bank_omegas"]]
-            print(f"[MOMA-AC] Loaded bank: {len(self.bank)} policies")
+        if self.support and st.get("support_weights"):
+            self.support.weights = [np.array(w, np.float32) for w in st["support_weights"]]
+            print(f"[MOMA-AC] Loaded support: {len(self.support.weights)} weights")
         print(f"[MOMA-AC] Loaded: {path} "
               f"(ep={self.episode_count}, updates={self.total_updates})")

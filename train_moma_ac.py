@@ -1,21 +1,21 @@
 """
 train_moma_ac.py
 ================
-Training loop cho MOMA-AC (Random va OLS sampling variants).
+Training loop cho MOMA-AC (Random, GPI-LS va GPI-PD sampling variants).
 Chay:
   py train_moma_ac.py --config config/train/moma_ac_random.yaml
-  py train_moma_ac.py --config config/train/moma_ac_ols.yaml
+  py train_moma_ac.py --config config/train/moma_ac_gpi_ls.yaml
+  py train_moma_ac.py --config config/train/moma_ac_gpi_pd.yaml
 """
 
 import os
 import sys
 import argparse
+import shutil
 import time
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import torch
 from tqdm import tqdm
 
 from utils import Configuration
@@ -23,11 +23,11 @@ from environment import NetworkSlicingEnv
 from agents_moma_ac import MOMA_AC_Agent
 
 
-# Shared HV reference point — same as GPI-LS (train_morl.py)
+# Shared HV reference point
 # Must be worse than any observed reward on all objectives:
-#   QoS    in [0,  ~0.5]  -> ref = -0.1
-#   Energy in [-1,  0.0]  -> ref = -1.1
-#   Fair   in [0,  ~0.8]  -> ref = -0.1
+#   QoS    in [0,  1]  -> ref = -0.1
+#   Energy in [-1, 0]  -> ref = -1.1
+#   Fair   in [0,  1]  -> ref = -0.1
 HV_REF_POINT = np.array([-0.1, -1.1, -0.1])
 
 
@@ -102,9 +102,16 @@ class MOMA_AC_Trainer:
         train_config_path: str,
         env_config_path:   str = "./config/environment/default.yaml",
         checkpoint_path:   str = None,
+        seed:              int = None,
+        resume:            bool = False,
+        max_hours:         float = None,
     ):
         tcfg = Configuration(train_config_path)
         ecfg = Configuration(env_config_path)
+
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
 
         self.cfg = {
             "total_steps":            int(_get(tcfg, "total_training_steps", 1_000_000)),
@@ -112,9 +119,23 @@ class MOMA_AC_Trainer:
             "train_frequency":        int(_get(tcfg, "train_frequency",       1)),
             "train_iterations":       int(_get(tcfg, "train_iterations",      1)),
             "batch_size":             int(_get(tcfg, "batch_size",            256)),
-            "max_steps_per_episode":  int(_get(tcfg, "max_steps_per_episode", 200)),
+            "max_steps_per_episode":  int(_get(tcfg, "max_steps_per_episode", 60)),
             "omega_sampling":         str(_get(tcfg, "omega_sampling",        "random")),
-            "corner_warmup_episodes": int(_get(tcfg, "corner_warmup_episodes", 30)),
+            "corner_warmup_episodes": int(_get(tcfg, "corner_warmup_episodes", 0)),
+            # GPI-LS
+            "gpi_ls_interval":  int(_get(tcfg, "gpi_ls_interval",  50_000)),
+            "gpi_ls_episodes":  int(_get(tcfg, "gpi_ls_episodes",  3)),
+            "gpi_top_k":        int(_get(tcfg, "gpi_top_k",        2)),
+            "gpi_max_support":  int(_get(tcfg, "gpi_max_support",  20)),
+            "gpi_max_corners":  int(_get(tcfg, "gpi_max_corners",  20)),
+            # GPI-PD
+            "per_alpha":         float(_get(tcfg, "per_alpha",         0.6)),
+            "per_kappa":         float(_get(tcfg, "per_kappa",         0.1)),
+            "dyna_beta":         float(_get(tcfg, "dyna_beta",         0.5)),
+            "dyna_interval":     int(  _get(tcfg, "dyna_interval",     250)),
+            "dyna_rollouts":     int(  _get(tcfg, "dyna_rollouts",     2000)),
+            "model_fit_steps":   int(  _get(tcfg, "model_fit_steps",   200)),
+            "model_buffer_size": int(  _get(tcfg, "model_buffer_size", 100_000)),
             # TD3
             "actor_lr":         float(_get(tcfg, "actor_lr",         3e-4)),
             "critic_lr":        float(_get(tcfg, "critic_lr",         3e-4)),
@@ -130,20 +151,22 @@ class MOMA_AC_Trainer:
             # Logging
             "log_interval":    int(_get(tcfg, "log_interval",    5_000)),
             "save_interval":   int(_get(tcfg, "save_interval",  100_000)),
-            "eval_interval":   int(_get(tcfg, "eval_interval",  100_000)),
+            "eval_interval":   int(_get(tcfg, "eval_interval",   50_000)),
             "eval_n_omega":    int(_get(tcfg, "eval_n_omega",    30)),
-            "eval_n_episodes": int(_get(tcfg, "eval_n_episodes", 5)),
-            "eval_steps":      int(_get(tcfg, "eval_steps",      150)),
+            "eval_n_episodes": int(_get(tcfg, "eval_n_episodes", 3)),
+            "eval_steps":      int(_get(tcfg, "eval_steps",      60)),
             "save_dir":        str(_get(tcfg, "save_dir",        "saved_models_moma_ac")),
         }
 
         self.model_dir = self.cfg["save_dir"]
+        if seed is not None:
+            self.model_dir = os.path.join(self.model_dir, f"seed_{seed}")
         os.makedirs(os.path.join(self.model_dir, "checkpoints"), exist_ok=True)
-        os.makedirs(os.path.join(self.model_dir, "plots"),       exist_ok=True)
 
         # ── Environment ──────────────────────────────────────────
         print("[MOMA-AC] Initializing environment...")
         self.env    = NetworkSlicingEnv(config_path=env_config_path)
+        self.eval_env = NetworkSlicingEnv(config_path=env_config_path)
         obs_dict    = self.env.reset()
         self.uav_id = sorted(obs_dict.keys())[0]
         self.obs_dim = len(obs_dict[self.uav_id])
@@ -172,6 +195,15 @@ class MOMA_AC_Trainer:
             buffer_size       = self.cfg["buffer_size"],
             omega_sampling    = self.cfg["omega_sampling"],
             corner_warmup_episodes = self.cfg["corner_warmup_episodes"],
+            gpi_top_k         = self.cfg["gpi_top_k"],
+            gpi_max_support   = self.cfg["gpi_max_support"],
+            gpi_max_corners   = self.cfg["gpi_max_corners"],
+            per_alpha         = self.cfg["per_alpha"],
+            per_kappa         = self.cfg["per_kappa"],
+            dyna_beta         = self.cfg["dyna_beta"],
+            dyna_rollouts     = self.cfg["dyna_rollouts"],
+            model_fit_steps   = self.cfg["model_fit_steps"],
+            model_buffer_size = self.cfg["model_buffer_size"],
         )
 
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -180,37 +212,49 @@ class MOMA_AC_Trainer:
         # ── Metrics ──────────────────────────────────────────────
         self.step_log: list = []
         self.eval_log: list = []
+        self.gpi_log:  list = []
+        self.pareto_log: list = []
+
+        # ── Resume across sessions ───────────────────────────────
+        self.max_hours  = max_hours
+        self.start_step = 0
+        self.resume_dir = os.path.join(self.model_dir, "resume")
+        if resume and os.path.exists(os.path.join(self.resume_dir, "state.pth")):
+            self._load_resume()
 
     # ── Main Training Loop ──────────────────────────────────────
 
     def train(self):
         total    = self.cfg["total_steps"]
-        pbar     = tqdm(total=total, desc="MOMA-AC", dynamic_ncols=True)
+        pbar     = tqdm(total=total, initial=self.start_step, desc="MOMA-AC",
+                        dynamic_ncols=True, mininterval=30)
 
-        step          = 0
+        step          = self.start_step
         obs_dict      = self.env.reset()
         obs           = obs_dict[self.uav_id]
         ep_rvec       = []
         ep_steps      = 0
         last_ep_val   = None
-        omega         = self.agent.sample_omega(None)
+        omega         = self.agent.sample_omega()
+        use_gpi       = self.agent.support is not None   # Follow GPI policy (GPI-PD Alg. 2, line 12)
         t0            = time.time()
 
         while step < total:
             # ── Environment step ─────────────────────────────────────
-            action = self.agent.select_action(obs, omega, explore=True)
-            # Actor output: dims[0:4]=tanh[-1,1] (pos+power),
-            #               dims[4:] =sigmoid[0,1] (BW) — no clipping needed
+            action = self.agent.select_action(obs, omega, explore=True, use_gpi=use_gpi)
+            # Actor output: dims[0:3]=tanh[-1,1] (pos),
+            #               dims[3:] =sigmoid[0,1] (power, BW) — no clipping needed
             obs_dict_new, _, done, info = self.env.step({self.uav_id: action})
             obs_next = obs_dict_new.get(self.uav_id, obs)
             r_vec    = np.array(info.get("reward_vector", [0., 0., 0.]),
                                 dtype=np.float32)
 
-            # Use raw reward vector — same as GPI-LS (no normalization)
-            # Env reward ranges: QoS[0,~0.5], Energy[-1,0], Fair[0,~0.8]
+            # Use raw reward vector (no normalization)
+            # Env reward ranges: QoS[0,1], Energy[-1,0], Fair[0,1]
             # all already in similar scale, no normalization needed
             ep_end = done or (ep_steps + 1 >= self.cfg["max_steps_per_episode"])
-            self.agent.buffer.add(obs, action, r_vec, obs_next, omega, ep_end)
+            # Store the env's done only: the time limit truncates, it isn't terminal
+            self.agent.buffer.add(obs, action, r_vec, obs_next, omega, done)
 
             ep_rvec.append(r_vec)
             obs      = obs_next
@@ -224,11 +268,22 @@ class MOMA_AC_Trainer:
                 for _ in range(self.cfg["train_iterations"]):
                     self.agent.update(self.cfg["batch_size"])
 
+            # ── Dyna: fit model, add simulated transitions (GPI-PD) ──
+            if (self.agent.model is not None and
+                    step % self.cfg["dyna_interval"] == 0 and
+                    len(self.agent.buffer) >= self.cfg["min_buffer_size"]):
+                self.last_dyna_info = self.agent.dyna_step()
+
+            # ── GPI-LS: grow the weight support ──────────────────
+            if (use_gpi and step % self.cfg["gpi_ls_interval"] == 0 and
+                    len(self.agent.buffer) >= self.cfg["min_buffer_size"]):
+                self._gpi_ls_iteration(step)
+
             # ── Episode reset ────────────────────────────────────
             if ep_end:
                 last_ep_val = np.mean(ep_rvec, axis=0) if ep_rvec else None
-                omega       = self.agent.sample_omega(last_ep_val)
-                obs_dict    = self.env.reset()
+                omega       = self.agent.sample_omega()
+                obs_dict   = self.env.reset()
                 obs         = obs_dict[self.uav_id]
                 ep_rvec     = []
                 ep_steps    = 0
@@ -261,45 +316,145 @@ class MOMA_AC_Trainer:
             # ── Checkpoint ──────────────────────────────────────
             if step % self.cfg["save_interval"] == 0:
                 self._save_checkpoint(step)
+                if step < total:
+                    self._save_resume(step)
+
+            # ── Time budget: stop cleanly before the session limit ──
+            if (self.max_hours is not None and step < total
+                    and time.time() - t0 > self.max_hours * 3600):
+                self._save_resume(step)
+                pbar.close()
+                print(f"\n[MOMA-AC] Time budget reached at step {step}/{total}. "
+                      f"Continue with --resume.")
+                return
 
         pbar.close()
 
         # Final save
         self._save_checkpoint(total)
         self._save_step_csv()
-        self._eval_and_log(total)
+        if total % self.cfg["eval_interval"] != 0:
+            self._eval_and_log(total)
+        # A finished run needs no replay buffer: free the space and mark it done
+        shutil.rmtree(self.resume_dir, ignore_errors=True)
+        open(os.path.join(self.model_dir, "DONE"), "w").close()
         print("\n[MOMA-AC] Training complete!")
+
+    # ── Resume ──────────────────────────────────────────────────
+
+    def _save_resume(self, step: int):
+        """
+        Save everything training needs to continue. The env isn't saved, so the
+        run continues from a fresh episode. The swap at the end keeps the last
+        complete copy if the session dies mid-save.
+        """
+        tmp = self.resume_dir + "_tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
+        self.agent.save(os.path.join(tmp, "agent.pth"))
+        self.agent.buffer.save(os.path.join(tmp, "buffer.npz"))
+        if self.agent.model_buffer is not None:
+            self.agent.model_buffer.save(os.path.join(tmp, "model_buffer.npz"))
+        torch.save({
+            "step":      step,
+            "step_log":  self.step_log,
+            "eval_log":  self.eval_log,
+            "gpi_log":   self.gpi_log,
+            "pareto_log": self.pareto_log,
+            "last_dyna_info": getattr(self, "last_dyna_info", {}),
+            "np_rng":    np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+        }, os.path.join(tmp, "state.pth"))
+        shutil.rmtree(self.resume_dir, ignore_errors=True)
+        os.replace(tmp, self.resume_dir)
+        print(f"[MOMA-AC] Resume state saved at step {step}")
+
+    def _load_resume(self):
+        self.agent.load(os.path.join(self.resume_dir, "agent.pth"))
+        self.agent.buffer.load(os.path.join(self.resume_dir, "buffer.npz"))
+        if self.agent.model_buffer is not None:
+            self.agent.model_buffer.load(os.path.join(self.resume_dir, "model_buffer.npz"))
+        st = torch.load(os.path.join(self.resume_dir, "state.pth"), weights_only=False)
+        self.start_step = st["step"]
+        self.step_log   = st["step_log"]
+        self.eval_log   = st["eval_log"]
+        self.gpi_log    = st["gpi_log"]
+        self.pareto_log = st["pareto_log"]
+        self.last_dyna_info = st["last_dyna_info"]
+        np.random.set_state(st["np_rng"])
+        torch.set_rng_state(st["torch_rng"])
+        print(f"[MOMA-AC] Resumed at step {self.start_step} (buffer={len(self.agent.buffer)})")
 
     # ── Helpers ─────────────────────────────────────────────────
 
-    def _eval_and_log(self, step: int):
-        use_gpi = (self.cfg["omega_sampling"] == "gpi_ols")
+    def _gpi_ls_iteration(self, step: int):
+        info = self.agent.update_weight_support(
+            self.eval_env,
+            n_episodes = self.cfg["gpi_ls_episodes"],
+            steps      = self.cfg["eval_steps"],
+        )
+        self.gpi_log.append({"step": step, **info, **getattr(self, "last_dyna_info", {})})
+        pd.DataFrame(self.gpi_log).to_csv(
+            os.path.join(self.model_dir, "gpi_ls_metrics.csv"), index=False)
+        print(f"\n[GPI-LS] step={step}  {info}")
+
+    def _sweep_metrics(self, use_gpi: bool):
         results, omegas = self.agent.eval_pareto_front(
-            self.env,
+            self.eval_env,
             n_omega    = self.cfg["eval_n_omega"],
             n_episodes = self.cfg["eval_n_episodes"],
             steps      = self.cfg["eval_steps"],
             use_gpi    = use_gpi,
         )
-        hv       = self._compute_hv(results)
-        n_pareto = self._count_pareto(results)
-        self.eval_log.append({
+        metrics = {
+            "hv":       self._compute_hv(results),
+            # EUM of MOMA-AC: utility of each omega's own policy
+            "eum":      float((results * omegas).sum(axis=1).mean()),
+            # EU of GPI-PD: best utility over the whole front for each omega
+            "eu_front": float((omegas @ results.T).max(axis=1).mean()),
+            "n_pareto": self._count_pareto(results),
+        }
+        return metrics, results, omegas
+
+    def _eval_and_log(self, step: int):
+        # GPI variants report the GPI policy, and the plain actor as *_actor for
+        # a like-for-like comparison with the random baseline
+        use_gpi = self.agent.support is not None
+        metrics, results, omegas = self._sweep_metrics(use_gpi)
+        row = {
             "step":     step,
-            "hv":       hv,
-            "n_pareto": n_pareto,
+            **metrics,
             "avg_qos":  float(results[:, 0].mean()),
             "avg_eng":  float(results[:, 1].mean()),
             "avg_fair": float(results[:, 2].mean()),
             "best_qos": float(results[:, 0].max()),
             "best_fair":float(results[:, 2].max()),
-        })
+        }
+        if use_gpi:
+            row["support_size"] = len(self.agent.support.weights)
+            actor_metrics, actor_results, _ = self._sweep_metrics(False)
+            row.update({f"{k}_actor": v for k, v in actor_metrics.items()})
+            self._log_pareto(step, "actor", actor_results, omegas)
+        self._log_pareto(step, "gpi" if use_gpi else "actor", results, omegas)
+        self.eval_log.append(row)
         self._save_eval_csv()
-        self._plot_pareto(results, omegas, step)
-        print(f"  HV={hv:.4f}  n_pareto={n_pareto}  "
+        print(f"  HV={metrics['hv']:.4f}  EUM={metrics['eum']:.4f}  n_pareto={metrics['n_pareto']}  "
               f"best_QoS={results[:,0].max():.3f}  best_Fair={results[:,2].max():.3f}")
 
+    def _log_pareto(self, step: int, policy: str, results: np.ndarray, omegas: np.ndarray):
+        """Keep each evaluated point, so the front can be analyzed without rerunning."""
+        for w, rv in zip(omegas, results):
+            self.pareto_log.append({
+                "step":   step,
+                "policy": policy,
+                "w_qos":  float(w[0]), "w_energy": float(w[1]), "w_fair": float(w[2]),
+                "qos":    float(rv[0]), "energy":  float(rv[1]), "fair":  float(rv[2]),
+            })
+        pd.DataFrame(self.pareto_log).to_csv(
+            os.path.join(self.model_dir, "pareto_points.csv"), index=False)
+
     def _compute_hv(self, pts: np.ndarray) -> float:
-        """Exact 3D HV via sweep-line, fixed ref point (same as GPI-LS)."""
+        """Exact 3D HV via sweep-line, fixed ref point."""
         return _hv_3d(pts, HV_REF_POINT)
 
     def _count_pareto(self, pts: np.ndarray) -> int:
@@ -311,35 +466,6 @@ class MOMA_AC_Trainer:
                     mask[i] = False
                     break
         return int(mask.sum())
-
-    def _plot_pareto(self, results: np.ndarray, omegas: np.ndarray, step: int):
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        fig.suptitle(f"MOMA-AC ({self.cfg['omega_sampling']}) Pareto — step {step}")
-
-        # QoS vs Fairness
-        sc = axes[0].scatter(results[:, 0], results[:, 2],
-                             c=omegas[:, 0], cmap="RdYlGn", s=60, alpha=0.8,
-                             edgecolors="black", lw=0.4)
-        plt.colorbar(sc, ax=axes[0], label="ω_QoS")
-        axes[0].set_xlabel("QoS Reward")
-        axes[0].set_ylabel("Fairness Reward")
-        axes[0].set_title("QoS vs Fairness")
-        axes[0].grid(True, alpha=0.3)
-
-        # QoS vs Energy
-        sc2 = axes[1].scatter(results[:, 0], results[:, 1],
-                              c=omegas[:, 1], cmap="coolwarm", s=60, alpha=0.8,
-                              edgecolors="black", lw=0.4)
-        plt.colorbar(sc2, ax=axes[1], label="ω_Energy")
-        axes[1].set_xlabel("QoS Reward")
-        axes[1].set_ylabel("Energy Reward")
-        axes[1].set_title("QoS vs Energy")
-        axes[1].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        path = os.path.join(self.model_dir, "plots", f"pareto_step_{step}.png")
-        plt.savefig(path, dpi=100)
-        plt.close()
 
     def _save_checkpoint(self, step: int):
         path = os.path.join(self.model_dir, "checkpoints",
@@ -368,11 +494,20 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint",
                         default=None,
                         help="Path to checkpoint to resume from")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed; results go to <save_dir>/seed_<seed>")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue from <save_dir>/resume if it exists")
+    parser.add_argument("--max_hours", type=float, default=None,
+                        help="Save resume state and stop after this many hours")
     args = parser.parse_args()
 
     trainer = MOMA_AC_Trainer(
         train_config_path = args.config,
         env_config_path   = args.env_config,
         checkpoint_path   = args.checkpoint,
+        seed              = args.seed,
+        resume            = args.resume,
+        max_hours         = args.max_hours,
     )
     trainer.train()

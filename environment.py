@@ -383,15 +383,20 @@ class NetworkSlicingEnv:
         self.slice_probs = env_config.slicing.slice_probabilities  # Probabilities for each slice type
 
         # Channel parameters
-        self.noise_power = env_config.channel.noise_power  # Watts
-
         self.carrier_frequency = env_config.channel.carrier_frequency  # Hz
 
         # Resource block parameters
-        self.rb_bandwidth = env_config.channel.rb_bandwidth  # Hz (LTE standard)
+        self.rb_bandwidth = env_config.channel.rb_bandwidth  # Hz (12 subcarriers x 30 kHz)
         self.total_bandwidth = env_config.channel.total_bandwidth  # Hz per UAV
-        self.total_rbs = int(self.total_bandwidth / self.rb_bandwidth)
+        self.total_rbs = int(round(self.total_bandwidth / self.rb_bandwidth))
         self.carrier_frequency = env_config.channel.carrier_frequency  # Hz
+        self.shannon_attenuation = env_config.channel.shannon_attenuation
+        self.max_spectral_efficiency = env_config.channel.max_spectral_efficiency  # bps/Hz
+
+        # Noise power per RB (Watts)
+        noise_dbm = (env_config.channel.noise_psd_dbm_hz + env_config.channel.noise_figure_db
+                     + 10.0 * np.log10(self.rb_bandwidth))
+        self.noise_power = 10.0 ** ((noise_dbm - 30.0) / 10.0)
         print(f"Total Resource Blocks per UAV: {self.total_rbs}")
 
         # Handover tracker
@@ -402,30 +407,31 @@ class NetworkSlicingEnv:
         self.uav_beam_angle = getattr(env_config.uav_params, 'beam_angle', 60.0)
         self.energy_models = env_config.energy_models
         self.uav_buffer_size = env_config.uav_params.buffer_size  # bits
-        
+        self.velocity_max_vertical = env_config.uav_params.velocity_max_vertical  # m/s
+        self.processing_delay_ms = env_config.uav_params.processing_delay_ms
+        self.min_power_ratio = 0.05  # Lowest transmit power, as a fraction of max_power
+        self._init_energy_bounds()
+
         # UE dynamics parameters
         self.ue_id_pool = set()  # Pool of available IDs for reuse
         self.next_ue_id = 0  # Only used when pool is empty
         self.ue_dynamics = env_config.ue_dynamics  # UE dynamics parameters
         self.ue_arrival_rate = self.ue_dynamics.arrival_rate  # New UEs per second
-        self.ue_departure_rate = self.ue_dynamics.departure_rate  # Probability of UE leaving per minute
+        # Probability of a UE leaving per T_L, from exponential session durations
+        self.ue_departure_rate = 1.0 - np.exp(-self.T_L / self.ue_dynamics.session_duration_avg)
         self.ue_max_initial_velocity = self.ue_dynamics.max_initial_velocity  # m/s
         self.max_ues = int(self.num_ues * self.ue_dynamics.max_ues_multiplier)  # Maximum UEs allowed
         self.change_direction_prob = self.ue_dynamics.change_direction_prob  # Probability of changing direction
 
         self.hotspots = []
         self.hotspot_attraction_strength = 0.6
-        self.hotspot_spawn_rate = 0.15  # Probability per T_L period (15% chance)
+        self.hotspot_spawn_rate = 0.05  # Probability per T_L period (5% chance)
         self.hotspot_max_count = 4  # Maximum concurrent hotspots
-        self.hotspot_min_lifetime = 300  # seconds
-        self.hotspot_max_lifetime = 400.0  # seconds
+        self.hotspot_min_lifetime = 900.0  # seconds
+        self.hotspot_max_lifetime = 1800.0  # seconds
 
         #Traffic model
         self.traffic_patterns = env_config.traffic_patterns
-
-        for _ in range(2):
-            self._spawn_new_hotspot()
-
 
         # Distance thresholds for forming Demand Areas
         self.da_distance_thresholds = env_config.da_distance_thresholds
@@ -494,8 +500,19 @@ class NetworkSlicingEnv:
                 beam_direction=np.array([0.0, 0.0, -1.0])  # NEW: Default pointing down
             )
         
+        # Episodes start with two active hotspots, so UEs are clustered from step 0
+        self.hotspots = []
+        for _ in range(2):
+            hotspot = self._spawn_new_hotspot()
+            hotspot['age'] = hotspot['lifetime'] * 0.2
+            hotspot['current_strength'] = hotspot['max_strength']
+            hotspot['state'] = 'active'
+
+        self.handover_tracker = HandoverTracker()
+
         # Initialize UEs with random positions and slice types
         self.ues = {}
+        self.ue_id_pool = set()
         self.next_ue_id = 0
 
         for i in range(self.num_ues):
@@ -565,8 +582,7 @@ class NetworkSlicingEnv:
             norm_h = (uav.position[2] - self.uav_fly_range_h[0]) / (self.uav_fly_range_h[1] - self.uav_fly_range_h[0])
             obs.extend([norm_x, norm_y, norm_h])  # 3
             obs.append(uav.current_power / uav.max_power)  # 1
-            # obs.append(uav.current_battery / uav.battery_capacity)  # 1
-            obs.append(0.0)
+            obs.append(uav.current_battery / uav.battery_capacity)  # 1
 
             # ============================================================
             # 2. Demand Area Info (9 DAs × 7 features = 63 dims). So far 5 + 63 = 68
@@ -671,10 +687,13 @@ class NetworkSlicingEnv:
             # print(f"UAV {uav_id} action: {action}")
             uav = self.uavs[uav_id]
             
-            # Action format: [delta_x, delta_y, delta_h, delta_power, bandwidth_allocation_per_da...]
+            # Action format: [delta_x, delta_y, delta_h, power, bandwidth_allocation_per_da...]
             # Position update (constrained by velocity)
-            delta_pos = action[:3] * uav.velocity_max * self.T_L
-            new_pos = uav.position + delta_pos
+            delta_xy = action[:2] * uav.velocity_max * self.T_L
+            max_delta_xy = uav.velocity_max * self.T_L
+            delta_xy = delta_xy * min(1.0, max_delta_xy / max(np.linalg.norm(delta_xy), 1e-9))
+            delta_h = action[2] * self.velocity_max_vertical * self.T_L
+            new_pos = uav.position + np.array([delta_xy[0], delta_xy[1], delta_h])
             # Constrain to service area
             new_pos[0] = np.clip(new_pos[0], self.uav_fly_range_x[0], self.uav_fly_range_x[1])
             new_pos[1] = np.clip(new_pos[1], self.uav_fly_range_y[0], self.uav_fly_range_y[1])
@@ -684,19 +703,17 @@ class NetworkSlicingEnv:
             v_x = (new_pos[0] - uav.position[0]) / self.T_L
             v_y = (new_pos[1] - uav.position[1]) / self.T_L
             v_z = (new_pos[2] - uav.position[2]) / self.T_L
-            
-            h_factor = self.energy_models.get('horizontal_energy_factor')
-            v_factor = self.energy_models.get('vertical_energy_factor')
-            movement_energy = h_factor * (v_x**2 + v_y**2) * self.T_L + v_factor * (v_z**2) * self.T_L
-            
+
+            movement_energy = self._propulsion_power(np.hypot(v_x, v_y), v_z) * self.T_L
+
             uav.position = new_pos
-            
+
             # Power update
             # print("Action power component:", action[3])
-            uav.current_power = np.clip(action[3], 0.05, 1) * uav.max_power
-            
+            uav.current_power = np.clip(action[3], self.min_power_ratio, 1) * uav.max_power
+
             # Energy consumption
-            transmission_energy = uav.current_power * self.T_L
+            transmission_energy = uav.current_power / self.energy_models['pa_efficiency'] * self.T_L
             uav.energy_used = {"movement": movement_energy, "transmission": transmission_energy}
             uav.current_battery -= sum(uav.energy_used.values())
             uav.current_battery = max(0, uav.current_battery)
@@ -734,11 +751,12 @@ class NetworkSlicingEnv:
         # Update SINR, throughput, delay, reliability caches
         self._update_sinr_cache()
         self._update_throughput_cache()
+
+        # Update queuing statistics at UAVs (the delay cache reads them)
+        self._update_uavs_queuing_stats()
+
         self._update_delay_cache()
         self._update_per_cache()
-
-        # Update queuing statistics at UAVs
-        self._update_uavs_queuing_stats()
 
         # Calculate rewards
         # print("Is throughput cache valid?", self.throughput_cache_valid)
@@ -752,8 +770,7 @@ class NetworkSlicingEnv:
         
         # Check termination conditions
         done = any(uav.current_battery <= 0 for uav in self.uavs.values())
-        done = False
-        
+
         # Get new observations
         observations = self._get_observations()
 
@@ -1120,20 +1137,16 @@ class NetworkSlicingEnv:
             else:
                 uav.avg_queuing_delay_ms = rho / (2 * uav_service_rate * (1 - rho)) * 1000  # in ms, M/D/1 formula
 
-            # CALCULATE DROP RATE ()
-            if rho != 1:
-                try:
-                    avg_drop_rate = ( (rho**(uav_buffer_size + 1)) * (1 - rho) ) / (1 - rho**(uav_buffer_size + 1))
-                except:
-                    avg_drop_rate = 1.0
-                uav.avg_drop_rate = avg_drop_rate
-            elif uav_service_rate == 0:
-                uav.avg_drop_rate = 1.0
-            else:
+            # CALCULATE DROP RATE (M/M/1/K blocking probability)
+            if uav_service_rate == 0:
+                uav.avg_drop_rate = 1.0 if uav_arrival_rate > 0 else 0.0
+            elif rho > 1:
+                # Limit for an overloaded queue; the finite-K formula overflows here
+                uav.avg_drop_rate = 1.0 - 1.0 / rho
+            elif rho == 1:
                 uav.avg_drop_rate = 1 / (uav_buffer_size + 1)
-            
-            if np.isnan(uav.avg_drop_rate):
-                uav.avg_drop_rate = 1.0
+            else:
+                uav.avg_drop_rate = ( (rho**(uav_buffer_size + 1)) * (1 - rho) ) / (1 - rho**(uav_buffer_size + 1))
             uav.avg_drop_rate = np.clip(uav.avg_drop_rate, 0.0, 1.0)
 
             # print(f"UAV {uav.id} - Arrival rate: {uav_arrival_rate:<10.2f} pkt/s | Service rate: {uav_service_rate:<12.2f} pkt/s | Rho: {rho:<10.4f} | Buffer size: {uav_buffer_size:<5.0f} pkts | Avg Delay: {uav.avg_queuing_delay_ms:<10.6f} ms | Drop Rate: {uav.avg_drop_rate:<10.4f}")
@@ -1437,8 +1450,12 @@ class NetworkSlicingEnv:
         # Prepare arrays for Numba
         ue_positions = np.array([ue.position for ue in calculation_list], dtype=np.float32)
         uav_positions = np.array([uav.position for uav in self.uavs.values()], dtype=np.float32)
-        uav_powers = np.array([uav.current_power for uav in self.uavs.values()], dtype=np.float32)
-        
+        # Each UAV splits its transmit power equally across the RBs it actually uses
+        uav_powers = np.array([
+            uav.current_power / max(1, sum(rb.allocated_ue_id != -1 for rb in uav.RBs))
+            for uav in self.uavs.values()
+        ], dtype=np.float32)
+
         # Map serving UAV IDs to indices
         uav_ids_list = list(self.uavs.keys())
         uav_index_map = {uid: idx for idx, uid in enumerate(uav_ids_list)}
@@ -1491,7 +1508,7 @@ class NetworkSlicingEnv:
 
         packet_size_bits = np.array([self.traffic_patterns[ue.slice_type]['packet_size'] * 8 for _, ue in active_ues], dtype=np.float32)
         throughputs = np.array([np.clip(self._get_cached_throughput(ue), 0.1, None) for _, ue in active_ues], dtype=np.float32)
-        t_trans = packet_size_bits / throughputs  # Initial placeholder
+        t_trans = packet_size_bits / throughputs * 1000  # ms
 
         # ========================
         # Retransmission delays
@@ -1522,7 +1539,7 @@ class NetworkSlicingEnv:
         # Processing delays
         # ========================
 
-        t_proc = np.full(len(active_ues), 3.0, dtype=np.float32)
+        t_proc = np.full(len(active_ues), self.processing_delay_ms, dtype=np.float32)
 
         # Process each UE's delay components
         for i, (ue_id, ue) in enumerate(active_ues):
@@ -1565,7 +1582,9 @@ class NetworkSlicingEnv:
 
             sinr_db = self._get_cached_sinr(ue, self.uavs[ue.assigned_uav])
             sinr_linear = 10.0 ** (sinr_db * 0.1)
-            ue_throughput += self.rb_bandwidth * np.log2(1.0 + sinr_linear) * len(ue.assigned_rb)  # in bps
+            spectral_efficiency = min(self.shannon_attenuation * np.log2(1.0 + sinr_linear),
+                                      self.max_spectral_efficiency)
+            ue_throughput += self.rb_bandwidth * spectral_efficiency * len(ue.assigned_rb)  # in bps
             
             self.throughput_cache[ue.id] = ue_throughput
 
@@ -2041,28 +2060,34 @@ class NetworkSlicingEnv:
         }
         return weights[slice_type]
 
+    def _propulsion_power(self, v_h: float, v_z: float) -> float:
+        """Rotary-wing propulsion power in Watts (Zeng, Xu & Zhang 2019) plus climb power"""
+        m = self.energy_models
+        v0 = m['mean_induced_velocity']
+        blade = m['blade_profile_power'] * (1 + 3 * v_h**2 / m['rotor_tip_speed']**2)
+        induced = m['induced_power'] * np.sqrt(np.sqrt(1 + v_h**4 / (4 * v0**4)) - v_h**2 / (2 * v0**2))
+        parasite = 0.5 * m['fuselage_drag_ratio'] * m['air_density'] * m['rotor_solidity'] * m['rotor_disc_area'] * v_h**3
+        climb = m['uav_weight'] * max(v_z, 0.0)  # Descent is not credited back
+        return blade + induced + parasite + climb
+
+    def _init_energy_bounds(self):
+        """Lowest and highest total power draw, used to normalize the energy objective"""
+        level_flight = [self._propulsion_power(v, 0.0) for v in np.linspace(0.0, self.uav_params.velocity_max, 151)]
+        pa = self.energy_models['pa_efficiency']
+        self.min_total_power = min(level_flight) + self.min_power_ratio * self.uav_params.max_power / pa
+        self.max_total_power = (max(level_flight) + self._propulsion_power(0.0, self.velocity_max_vertical)
+                                - self._propulsion_power(0.0, 0.0) + self.uav_params.max_power / pa)
+
     def _calculate_energy_consumption_penalty(self) -> float:
-        """Calculate normalized energy consumption"""
-        energy_consumption_penalty = 0.0
+        """Average UAV power draw over T_L, min-max normalized to [0, 1]"""
         total_energy_ratio = 0.0
-        
-        
+
         for uav in self.uavs.values():
-            max_transmission_energy = uav.max_power * self.T_L  # Max possible energy use in T_L
-            max_movement_energy = self.energy_models.get('vertical_energy_factor', 0.15) * (uav.velocity_max)**2 * self.T_L  # Max possible movement energy in T_L
-            max_total_energy = max_transmission_energy + max_movement_energy # Max possible energy used in T_L
-            total_energy_ratio += sum(uav.energy_used.values()) / max_total_energy  # Normalize by max possible energy use in T_L
+            total_power = sum(uav.energy_used.values()) / self.T_L
+            total_energy_ratio += (total_power - self.min_total_power) / (self.max_total_power - self.min_total_power)
 
-        energy_consumption_penalty = total_energy_ratio / self.num_uavs
-        # print("Total energy used by all UAVs:", total_energy_ratio)
+        return float(np.clip(total_energy_ratio / self.num_uavs, 0.0, 1.0))
 
-        # Extra penalty if any UAV's power is near zero
-        zero_power_penalty = sum(1 for uav in self.uavs.values() if uav.current_power < 0.03 * uav.max_power)
-        if zero_power_penalty > 0:
-            energy_consumption_penalty += zero_power_penalty * 0.2  # Add 0.2 penalty per zero-power UAV
-
-        return energy_consumption_penalty
- 
     def _calculate_fairness_index(self) -> float:
         """PRODUCTION VERSION: Fast and clean"""
         if not self.sinr_cache_valid:
@@ -2079,11 +2104,12 @@ class NetworkSlicingEnv:
         throughputs = []
         
         for ue in self.ues.values():
-            if not ue.is_active or ue.assigned_uav is None:
+            if not ue.is_active:
                 continue
-            
+
+            # Uncovered UEs count with zero throughput, so dropping UEs can't raise fairness
             ue_throughput = self._get_cached_throughput(ue)
-            
+
             # Normalize
             throughputs.append(ue_throughput / min_rates[ue.slice_type])
         
@@ -2168,7 +2194,7 @@ class NetworkSlicingEnv:
         print(f"  Total Bandwidth per UAV: {self.total_bandwidth} Hz")
         print(f"  Total Resource Blocks: {self.total_rbs}")
         print(f"  UE Arrival Rate: {self.ue_arrival_rate} per second")
-        print(f"  UE Departure Rate: {self.ue_departure_rate} per minute")
+        print(f"  UE Departure Rate: {self.ue_departure_rate} per T_L")
         print(f"  UE dynamics Params: {self.ue_dynamics}")
         print(f"  Max UEs Allowed: {self.max_ues}")
 
