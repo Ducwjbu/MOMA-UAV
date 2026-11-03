@@ -3,12 +3,15 @@ agents_moma_ac.py
 =================
 MOMA-AC: Multi-Objective Actor-Critic voi Preference Conditioning (TD3 backbone)
 - PreferencedActor  : obs || omega concatenation → split sigmoid/tanh output
+- MultiHeadActor    : shared trunk, one output head per UAV (MOMA-AC Sec. 4.2)
 - VectorCritic      : twin critics output R^n_obj
 - ReplayBuffer      : luu omega theo tung transition
 - PrioritizedReplayBuffer : GPI-based priorities (GPI-PD, Eq. 10 + 17)
 - GPILinearSupport  : weight support M, corner weights (GPI-LS, Alg. 1)
+- optimistic_value  : LP upper bound on the value at a weight (OLS)
 - DynamicsEnsemble  : learned model for Dyna updates (GPI-PD, Eq. 13-14)
-- MOMA_AC_Agent     : main class, omega_sampling='random'|'gpi_ls'|'gpi_pd'
+- MOMA_AC_Agent     : main class, omega_sampling='random'|'ols'|'gpi_ls'|'gpi_pd'
+- MOMA_CTDE_Agent   : several UAVs, multi-headed actor + centralised critics (MOMA-AC Alg. 1)
 """
 
 import os
@@ -18,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.optimize import linprog
 from typing import List, Optional
 
 # MOMA_DEVICE overrides the choice, e.g. to train on CPU on a machine with a GPU
@@ -55,6 +59,34 @@ class PreferencedActor(nn.Module):
         h   = F.relu(self.ln2(self.fc2(h)))
         raw = self.out(h)
         # Split activation per semantic:
+        pose = torch.tanh(raw[..., :self.n_pose_dims])    # position:    [-1, 1]
+        rest = torch.sigmoid(raw[..., self.n_pose_dims:]) # power + BW:  [ 0, 1]
+        return torch.cat([pose, rest], dim=-1)
+
+
+class MultiHeadActor(nn.Module):
+    """
+    One network for all UAVs (MOMA-AC Sec. 4.2): a shared trunk maps a UAV's own
+    obs || omega to features, and that UAV's head maps the features to its action.
+    Same split output as PreferencedActor.
+    """
+    def __init__(self, obs_dim: int, act_dim: int, n_agents: int, n_obj: int = 3,
+                 hidden: int = 256, n_pose_dims: int = 3):
+        super().__init__()
+        self.n_agents = n_agents
+        self.n_pose_dims = n_pose_dims
+        inp = obs_dim + n_obj
+        self.fc1 = nn.Linear(inp, hidden)
+        self.ln1 = nn.LayerNorm(hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.heads = nn.ModuleList(nn.Linear(hidden, act_dim) for _ in range(n_agents))
+
+    def forward(self, obs: torch.Tensor, omega: torch.Tensor, agent_idx: int) -> torch.Tensor:
+        x   = torch.cat([obs, omega], dim=-1)       # [obs_i || omega]
+        h   = F.relu(self.ln1(self.fc1(x)))
+        h   = F.relu(self.ln2(self.fc2(h)))
+        raw = self.heads[agent_idx](h)
         pose = torch.tanh(raw[..., :self.n_pose_dims])    # position:    [-1, 1]
         rest = torch.sigmoid(raw[..., self.n_pose_dims:]) # power + BW:  [ 0, 1]
         return torch.cat([pose, rest], dim=-1)
@@ -235,6 +267,18 @@ def corner_weights(values: np.ndarray) -> np.ndarray:
     return np.unique(x[feasible, :d].round(4) + 0.0, axis=0)    # + 0.0 turns -0. into 0.
 
 
+def optimistic_value(w: np.ndarray, weights: np.ndarray, best: np.ndarray) -> float:
+    """
+    OLS upper bound (SFOLS Alg. 2): max w·v such that W v <= best, where W holds
+    the explored weights and best the top scalarized value at each of them. The
+    extrema in W keep it bounded. Returns -inf if the solver fails, so that a
+    numerical failure skips this weight instead of ending the run.
+    """
+    res = linprog(-np.asarray(w, dtype=np.float64), A_ub=weights, b_ub=best,
+                  bounds=(None, None), method="highs")
+    return -res.fun if res.success else -np.inf
+
+
 class GPILinearSupport:
     """Weight support M of GPI-LS (Alg. 1). Starts from the extrema weights."""
     def __init__(self, n_obj: int = 3, top_k: int = 2, max_support: int = 20,
@@ -245,6 +289,7 @@ class GPILinearSupport:
         self.max_corners = max_corners
         self.min_distance = min_distance
         self.weights: List[np.ndarray] = list(np.eye(n_obj, dtype=np.float32))
+        self.explored: List[np.ndarray] = list(self.weights)   # W_exp of SFOLS: dropped weights stay here
 
     def remove_dominated(self, values: np.ndarray) -> np.ndarray:
         """
@@ -379,6 +424,7 @@ class MOMA_AC_Agent:
     """
     MOMA-AC: preference-conditioned TD3 voi vector-valued critic.
       omega_sampling='random' -> Dirichlet moi episode (baseline MOMA-AC goc)
+      omega_sampling='ols'    -> Optimistic Linear Support: omega ~ M, hanh dong theo actor, khong dung Q de chon
       omega_sampling='gpi_ls' -> GPI Linear Support: omega ~ M, hanh dong theo GPI
       omega_sampling='gpi_pd' -> GPI-LS + GPI-prioritized replay + Dyna (hoc model)
     """
@@ -414,7 +460,7 @@ class MOMA_AC_Agent:
         model_fit_steps: int    = 200,
         model_buffer_size: int  = 100_000,
     ):
-        if omega_sampling not in ("random", "gpi_ls", "gpi_pd"):
+        if omega_sampling not in ("random", "ols", "gpi_ls", "gpi_pd"):
             raise ValueError(f"Unknown omega_sampling: {omega_sampling}")
 
         self.obs_dim   = obs_dim
@@ -448,9 +494,10 @@ class MOMA_AC_Agent:
             list(self.critic1.parameters()) + list(self.critic2.parameters()),
             lr=critic_lr)
 
-        # ── GPI-LS weight support ────────────────────────────────
+        # ── Weight support (OLS, GPI-LS) ─────────────────────────
+        self.use_gpi = omega_sampling in ("gpi_ls", "gpi_pd")
         self.support = (GPILinearSupport(n_objectives, gpi_top_k, gpi_max_support, gpi_max_corners)
-                        if omega_sampling in ("gpi_ls", "gpi_pd") else None)
+                        if omega_sampling in ("ols", "gpi_ls", "gpi_pd") else None)
 
         # ── Replay Buffer / Dyna model ───────────────────────────
         self.model = None
@@ -497,16 +544,27 @@ class MOMA_AC_Agent:
         return omega
 
     def update_weight_support(self, env, n_episodes: int = 3, steps: int = 60) -> dict:
-        """One GPI-LS iteration on the support M (GPI-PD Alg. 2, lines 5-8)."""
+        """
+        One iteration on the support M (GPI-PD Alg. 2, lines 5-8). GPI variants rank
+        corner weights by measured GPI gain (Eq. 7), OLS by its optimistic bound.
+        Both use rollout values only, so critic estimates don't enter either ranking.
+        """
         values = np.array([self.eval_omega(env, w, n_episodes, steps)
                            for w in self.support.weights])
         values = self.support.remove_dominated(values)
 
         corners = self.support.candidates(values)
         gaps = np.zeros(len(corners))
-        for i, w in enumerate(corners):
-            v_gpi   = self.eval_omega(env, w, n_episodes, steps, use_gpi=True)
-            gaps[i] = v_gpi @ w - (values @ w).max()               # Eq. 7
+        if self.use_gpi:
+            for i, w in enumerate(corners):
+                v_gpi   = self.eval_omega(env, w, n_episodes, steps, use_gpi=True)
+                gaps[i] = v_gpi @ w - (values @ w).max()           # Eq. 7
+        else:
+            W = np.array(self.support.explored, dtype=np.float64)
+            best = (W @ values.T).max(axis=1)
+            for i, w in enumerate(corners):
+                gaps[i] = optimistic_value(w, W, best) - (values @ w).max()
+            gaps[gaps < 1e-6] = 0.0                                # Solver noise, not a real gap
 
         free = self.support.max_support - len(self.support.weights)
         n_add = max(min(self.support.top_k, free), 0)
@@ -514,6 +572,7 @@ class MOMA_AC_Agent:
         for i in np.argsort(-gaps)[:n_add]:
             if gaps[i] > 0:     # Eq. 7 is noisy; a corner with no measured gain isn't worth training
                 self.support.weights.append(corners[i].copy())
+                self.support.explored.append(corners[i].copy())
                 added += 1
 
         return {
@@ -794,6 +853,7 @@ class MOMA_AC_Agent:
             "current_omega":  self.current_omega.tolist(),
             # GPI-LS weight support
             "support_weights": [w.tolist() for w in self.support.weights] if self.support else [],
+            "explored_weights": [w.tolist() for w in self.support.explored] if self.support else [],
         }, path)
         if self.support:
             print(f"[MOMA-AC] Saved: {path}  (support={len(self.support.weights)} weights)")
@@ -821,6 +881,181 @@ class MOMA_AC_Agent:
                                       dtype=np.float32)
         if self.support and st.get("support_weights"):
             self.support.weights = [np.array(w, np.float32) for w in st["support_weights"]]
+            self.support.explored = [np.array(w, np.float32)
+                                     for w in st.get("explored_weights") or st["support_weights"]]
             print(f"[MOMA-AC] Loaded support: {len(self.support.weights)} weights")
         print(f"[MOMA-AC] Loaded: {path} "
               f"(ep={self.episode_count}, updates={self.total_updates})")
+
+
+# ============================================================
+# Several UAVs: centralised training, decentralised execution
+# ============================================================
+
+def episode_diagnostics(steps: list) -> dict:
+    """Team diagnostics of one episode, from (coverage, handovers, min_uav_distance, backhaul_limited) per step."""
+    coverage, handovers, distance, backhaul = np.array(steps, dtype=np.float64).T
+    return {"coverage": float(coverage.mean()), "handovers": float(handovers.mean()),
+            "backhaul_limited": float(backhaul.mean()),
+            "min_uav_distance": float(distance.min()),    # closest approach of the episode
+            "mean_uav_distance": float(distance.mean())}  # mean over steps of each step's closest pair
+
+
+def average_diagnostics(episodes: list) -> dict:
+    """Mean of episode means, as for the reward vector; min_uav_distance stays the true minimum."""
+    return {key: min(ep[key] for ep in episodes) if key == "min_uav_distance"
+                 else float(np.mean([ep[key] for ep in episodes]))
+            for key in episodes[0]}
+
+
+class MOMA_CTDE_Agent(MOMA_AC_Agent):
+    """
+    MOMA-TD3 of the paper (Alg. 1) for a team of UAVs sharing one reward vector.
+      Actor   : pi_i(o_i, omega), uses only what UAV i observes
+      Critics : Q(o, a, omega) over the joint observation and joint action
+    obs_dim and act_dim are per UAV. Critics and buffer hold them flattened in UAV id
+    order: one buffer is the paper's per-agent buffers sampled in sync by timestep.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, n_agents: int, n_objectives: int = 3,
+                 hidden_dim: int = 256, actor_lr: float = 3e-4,
+                 omega_sampling: str = "random", **kwargs):
+        if omega_sampling != "random":
+            raise ValueError(f"MOMA_CTDE_Agent only supports omega_sampling='random', got {omega_sampling}")
+
+        super().__init__(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
+                         actor_lr=actor_lr, omega_sampling=omega_sampling, **kwargs)
+        self.obs_dim  = obs_dim
+        self.act_dim  = act_dim
+        self.n_agents = n_agents
+
+        self.actor        = MultiHeadActor(obs_dim, act_dim, n_agents, n_objectives, hidden_dim).to(DEVICE)
+        self.actor_target = copy.deepcopy(self.actor)
+        self.actor_opt    = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+
+        self.eval_diagnostics: list = []
+        print(f"[MOMA-AC] CTDE: {n_agents} agents, obs_dim={obs_dim}, act_dim={act_dim} per agent\n")
+
+    # ── Action Selection ─────────────────────────────────────────
+
+    @torch.no_grad()
+    def select_joint_action(self, obs: np.ndarray, omega: np.ndarray,
+                            explore: bool = True) -> np.ndarray:
+        """obs has shape (n_agents, obs_dim). Each UAV acts on its own obs_i and omega only."""
+        omega_t = torch.as_tensor(omega, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        obs_t   = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=DEVICE)
+        action  = np.stack([self.actor(obs_t[i:i + 1], omega_t, i).cpu().numpy()[0]
+                            for i in range(self.n_agents)])
+        if explore:
+            n_pose = self.actor.n_pose_dims
+            noise = np.random.normal(0, self.expl_noise, size=action.shape)
+            # Clip per range: position dims [-1,1], power and BW dims [0,1]
+            action[:, :n_pose] = np.clip(action[:, :n_pose] + noise[:, :n_pose], -1.0, 1.0)
+            action[:, n_pose:] = np.clip(action[:, n_pose:] + noise[:, n_pose:],  0.0, 1.0)
+            self.expl_noise = max(self.expl_noise_min,
+                                  self.expl_noise * self.expl_noise_decay)
+        return action
+
+    # ── Update ───────────────────────────────────────────────────
+
+    def update(self, batch_size: int = 256) -> dict:
+        if len(self.buffer) < batch_size:
+            return {}
+
+        idx = self.buffer.sample_indices(batch_size)
+        obs_b, act_b, r_b, obs_n_b, omega_b, done_b = self.buffer.get(idx)
+        B, n = obs_b.shape[0], self.n_agents
+        obs_i   = obs_b.view(B, n, self.obs_dim)
+        obs_n_i = obs_n_b.view(B, n, self.obs_dim)
+
+        with torch.no_grad():
+            # Joint next action: each head plus its own clipped noise (Eq. 1-2)
+            n_pose = self.actor.n_pose_dims
+            next_a = []
+            for i in range(n):
+                raw   = self.actor_target(obs_n_i[:, i], omega_b, i)
+                noise = (torch.randn_like(raw) * self.policy_noise).clamp(
+                            -self.noise_clip, self.noise_clip)
+                raw   = raw + noise
+                next_a.append(torch.cat([raw[..., :n_pose].clamp(-1., 1.),
+                                         raw[..., n_pose:].clamp(0.,  1.)], dim=-1))
+            next_a = torch.cat(next_a, dim=-1)
+
+            # Target from the critic with the lower scalarized value (Eq. 4-6)
+            Q1_next = self.critic1_target(obs_n_b, next_a, omega_b)
+            Q2_next = self.critic2_target(obs_n_b, next_a, omega_b)
+            use_q1  = (Q1_next * omega_b).sum(-1, keepdim=True) <= (Q2_next * omega_b).sum(-1, keepdim=True)
+            Q_next  = torch.where(use_q1, Q1_next, Q2_next)
+            target  = r_b + self.gamma * (1.0 - done_b) * Q_next
+
+        # Critic loss (Eq. 8-9)
+        c_loss = (F.mse_loss(self.critic1(obs_b, act_b, omega_b), target)
+                  + F.mse_loss(self.critic2(obs_b, act_b, omega_b), target))
+        self.critic_opt.zero_grad()
+        c_loss.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.critic1.parameters()) + list(self.critic2.parameters()), 10.)
+        self.critic_opt.step()
+        self.total_updates += 1
+
+        info = {"critic_loss": float(c_loss)}
+
+        # Delayed actor update (every policy_delay critic steps)
+        if self.total_updates % self.policy_delay == 0:
+            # Eq. 10-12: in copy i of the batch only a_i comes from the actor, the
+            # other UAVs keep their replay actions. One critic pass over all copies.
+            joint = act_b.repeat(n, 1)
+            for i in range(n):
+                start = i * self.act_dim
+                joint[i * B:(i + 1) * B, start:start + self.act_dim] = self.actor(obs_i[:, i], omega_b, i)
+            omega_r = omega_b.repeat(n, 1)
+            Q_a     = self.critic1(obs_b.repeat(n, 1), joint, omega_r)
+            a_loss  = -(Q_a * omega_r).sum(-1).view(n, B).mean(dim=1).sum()
+            self.actor_opt.zero_grad()
+            a_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 10.)
+            self.actor_opt.step()
+
+            # Soft update target networks
+            self._soft_update(self.actor,   self.actor_target)
+            self._soft_update(self.critic1, self.critic1_target)
+            self._soft_update(self.critic2, self.critic2_target)
+            info["actor_loss"] = float(a_loss)
+
+        return info
+
+    # ── Pareto Evaluation ────────────────────────────────────────
+
+    @torch.no_grad()
+    def eval_omega(self, env, omega: np.ndarray, n_episodes: int = 5, steps: int = 60,
+                   use_gpi: bool = False) -> np.ndarray:
+        """Evaluate the team for one omega, each UAV acting on its own observation."""
+        if use_gpi:
+            raise ValueError("MOMA_CTDE_Agent has no GPI policy")
+        rng_state = np.random.get_state()
+        uids   = sorted(env.uavs.keys())
+        all_rv = []
+        for ep in range(n_episodes):
+            np.random.seed(EVAL_SEED + ep)
+            obs_dict = env.reset()
+            ep_rv    = []
+            ep_diag  = []
+            done     = False
+            t        = 0
+            while not done and t < steps:
+                action = self.select_joint_action(np.stack([obs_dict[u] for u in uids]), omega, explore=False)
+                obs_dict, _, done, info = env.step({u: action[i] for i, u in enumerate(uids)})
+                ep_rv.append(np.array(info["reward_vector"], dtype=np.float32))
+                ep_diag.append((info["coverage"], info["handovers"], info["min_uav_distance"], info["backhaul_limited"]))
+                t += 1
+            if ep_rv:
+                all_rv.append(np.mean(ep_rv, axis=0))
+                self.eval_diagnostics.append(episode_diagnostics(ep_diag))
+        np.random.set_state(rng_state)
+        return np.mean(all_rv, axis=0) if all_rv else np.zeros(self.n_obj, dtype=np.float32)
+
+    def pop_eval_diagnostics(self) -> dict:
+        """Team diagnostics over the eval episodes since the last call."""
+        result = average_diagnostics(self.eval_diagnostics)
+        self.eval_diagnostics = []
+        return result

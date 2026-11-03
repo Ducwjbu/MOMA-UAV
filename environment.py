@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple, Optional
 from utils import Configuration
 from dataclasses import dataclass, field
 from numba import jit, prange
-from collections import defaultdict
+from collections import defaultdict, deque
 
 global_env_config = Configuration("config/environment/default.yaml")
 global_beam_angle = global_env_config.uav_params['beam_angle']
@@ -24,14 +24,12 @@ class HandoverTracker:
         # Statistics
         self.total_handovers = 0
         self.ping_pong_handovers = 0
-        
-        # FIX: Cache the handover rate instead of recalculating
-        self._cached_handover_rate = 0.0
-        self._last_rate_update_time = 0.0
-        self._rate_cache_ttl = 1.0  # Update every second
-    
+
+        # Time of each handover still inside the rate window
+        self.handover_times = deque()
+
     def check_handover(self, ue_id, old_uav, new_uav, current_time):
-        if old_uav is None or old_uav == new_uav or not new_uav:
+        if old_uav is None or old_uav == new_uav or new_uav is None:
             return {'handover': False, 'delay_penalty_ms': 0.0, 'ping_pong': False}
         
         self.total_handovers += 1
@@ -44,11 +42,8 @@ class HandoverTracker:
                 self.ping_pong_handovers += 1
         
         self.recent_handovers[ue_id] = current_time
-        
-        # Update cached rate if needed
-        if current_time - self._last_rate_update_time >= self._rate_cache_ttl:
-            self._update_handover_rate_cache(current_time)
-        
+        self.handover_times.append(current_time)
+
         handover_delay_ms = self.handover_delay_ms
         if is_ping_pong:
             handover_delay_ms *= 1.5
@@ -60,18 +55,11 @@ class HandoverTracker:
             'ping_pong': is_ping_pong
         }
     
-    def _update_handover_rate_cache(self, current_time, time_window=60.0):
-        """Update cached handover rate"""
-        recent = sum(1 for t in self.recent_handovers.values() 
-                    if current_time - t <= time_window)
-        self._cached_handover_rate = recent / (time_window / 60.0)
-        self._last_rate_update_time = current_time
-    
-    def get_handover_rate(self, time_window=60.0):
-        """OPTIMIZED: Return cached rate instead of recalculating"""
-        # This is called 30,000 times costing 135 seconds!
-        # Original had O(n) iteration over all handovers
-        return self._cached_handover_rate  # O(1) lookup!
+    def get_handover_rate(self, current_time, time_window=60.0):
+        """Handovers per minute over the last time_window seconds, window end included"""
+        while self.handover_times and current_time - self.handover_times[0] > time_window:
+            self.handover_times.popleft()
+        return len(self.handover_times) / (time_window / 60.0)
 
 @dataclass
 class QoSProfile:
@@ -218,9 +206,10 @@ def calculate_sinr_batch_numba(ue_positions, uav_positions,
     return sinr_db
 
 @jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def calculate_sinr_batch_numba_a2g(ue_positions, uav_positions, 
+def calculate_sinr_batch_numba_a2g(ue_positions, uav_positions,
                                     uav_powers, serving_indices, noise_power,
-                                    carrier_frequency):
+                                    carrier_frequency, interference_powers,
+                                    sidelobe_gain):
     """
     Ultra-fast SINR calculation with Al-Hourani A2G path loss model
     
@@ -228,11 +217,13 @@ def calculate_sinr_batch_numba_a2g(ue_positions, uav_positions,
         ue_positions: (N, 3) array of UE positions [x, y, z]
         rb_frequencies: (N,) array of RB frequencies (not used, kept for compatibility)
         uav_positions: (M, 3) array of UAV positions [x, y, h]
-        uav_powers: (M,) array of UAV transmit powers
+        uav_powers: (M,) array of power per RB a UAV sends to the UEs it serves
         serving_indices: (N,) array of serving UAV indices
         noise_power: Noise power in Watts
         carrier_frequency: Carrier frequency in Hz
-    
+        interference_powers: (M,) array of power per RB a UAV leaks onto another UAV's RBs
+        sidelobe_gain: Linear gain of an interferer's beam at UEs outside it
+
     Returns:
         sinr_db: (N,) array of SINR values in dB
     """
@@ -308,21 +299,21 @@ def calculate_sinr_batch_numba_a2g(ue_positions, uav_positions,
             # PL_linear = 10^(-PL_dB/10)
             path_loss_linear = 10.0 ** (-path_loss_db / 10.0)
             
-            # 6. Received power
-            rx_power = path_loss_linear * uav_powers[j]
-            
             # ==========================================
             # SIGNAL vs INTERFERENCE
             # ==========================================
-            
+
             if j == serving_idx:
                 # This is the serving UAV
-                signal_power = rx_power
+                signal_power = path_loss_linear * uav_powers[j]
             else:
-                # Check if this interfering UAV's beam covers the UE
+                # Inside the interfering UAV's beam at full gain, outside it through the sidelobes
                 angle_to_ue = np.arccos(-dz / distance_3d) * (180.0 / PI)
+                rx_power = path_loss_linear * interference_powers[j]
                 if angle_to_ue <= global_beam_angle:
                     interference_power += rx_power
+                else:
+                    interference_power += rx_power * sidelobe_gain
         
         # ==========================================
         # SINR CALCULATION
@@ -357,6 +348,7 @@ class NetworkSlicingEnv:
         self.uav_fly_range_y = tuple(env_config.system.uav_fly_range_y)  # (min_y, max_y)
         self.uav_fly_range_h = tuple(env_config.system.uav_fly_range_h)  # (min_height, max_height)
         self.num_das_per_slice = env_config.system.num_das_per_slice
+        self.min_uav_separation = getattr(env_config.system, 'min_uav_separation', 0.0)  # meters, 0 = off
 
         # Time scale parameters
         self.T_L = env_config.time.T_L  # Long-term period (seconds)
@@ -397,6 +389,16 @@ class NetworkSlicingEnv:
         noise_dbm = (env_config.channel.noise_psd_dbm_hz + env_config.channel.noise_figure_db
                      + 10.0 * np.log10(self.rb_bandwidth))
         self.noise_power = 10.0 ** ((noise_dbm - 30.0) / 10.0)
+
+        # Wireless backhaul from each UAV to one ground gateway; without the section it is unlimited
+        self.backhaul = getattr(env_config, 'backhaul', None)
+        self.backhaul_load = {}  # {uav_id: carried traffic / backhaul capacity}
+        self.backhaul_capacity = {}  # {uav_id: bps}
+        if self.backhaul is not None:
+            self.backhaul_gateway = np.array(self.backhaul.gateway_position, dtype=np.float64)
+            backhaul_noise_dbm = (env_config.channel.noise_psd_dbm_hz + env_config.channel.noise_figure_db
+                                  + 10.0 * np.log10(self.backhaul.bandwidth))
+            self.backhaul_noise_power = 10.0 ** ((backhaul_noise_dbm - 30.0) / 10.0)
         print(f"Total Resource Blocks per UAV: {self.total_rbs}")
 
         # Handover tracker
@@ -405,6 +407,9 @@ class NetworkSlicingEnv:
         # UAV parameters
         self.uav_params = env_config.uav_params  # UAV parameters like max power, battery, etc.
         self.uav_beam_angle = getattr(env_config.uav_params, 'beam_angle', 60.0)
+        # Without the key there are no sidelobes: UEs outside a beam get no interference from it
+        sidelobe_db = getattr(env_config.uav_params, 'sidelobe_attenuation_db', None)
+        self.sidelobe_gain = 0.0 if sidelobe_db is None else 10.0 ** (-sidelobe_db / 10.0)
         self.energy_models = env_config.energy_models
         self.uav_buffer_size = env_config.uav_params.buffer_size  # bits
         self.velocity_max_vertical = env_config.uav_params.velocity_max_vertical  # m/s
@@ -499,7 +504,12 @@ class NetworkSlicingEnv:
                 beam_angle=self.uav_beam_angle,  # NEW
                 beam_direction=np.array([0.0, 0.0, -1.0])  # NEW: Default pointing down
             )
-        
+
+        if self._separation_active():
+            positions = self._separate_uavs(np.array([uav.position for uav in self.uavs.values()]))
+            for uav, pos in zip(self.uavs.values(), positions):
+                uav.position = pos
+
         # Episodes start with two active hotspots, so UEs are clustered from step 0
         self.hotspots = []
         for _ in range(2):
@@ -521,6 +531,7 @@ class NetworkSlicingEnv:
         # Initialize demand areas
         self.demand_areas = {}
         self.da_counter = 0
+        self.backhaul_load = {uav_id: 0.0 for uav_id in self.uavs}
         
         # Perform initial UAV-UE association and DA formation
         self._associate_ues_to_uavs()
@@ -537,33 +548,28 @@ class NetworkSlicingEnv:
         Logic:
         Each UAV agent combines:
         - The UAV's state (5 dims):
-            + position (x y h) 
+            + position (x y h)
             + power level (normalized)
             + battery level (normalized)
-        - The UAV's demand area info: (9 DAs x 10 dims each = 90 dims)
-            - Each DA's info: (10 dims)
-                + number of users (normalized by dividing by total UEs): 1 dim
-                + slice type (one hot encoded): 3 dims
-                + connection quality level (normalized): 3 dims
-                + buffer utilization (normalized): 1 dim
-                + average delay (normalized by dividing by 100ms): 1 dim
-                + drop rate (normalized): 1 dim
+        - The UAV's demand area info, 9 DAs (slice x distance level) in fixed order:
+            + number of users (share of the UAV's UEs): 1 dim
+            + with one UAV only, slice type and distance level one-hots: 6 constant dims
         - The UAV's handover state (4 dims):
             - recent handover rate (normalized)
             - ping-pong rate (normalized)
             - number of UEs currently in handover (normalized)
             - average handover penalty being experienced by UEs (normalized)
-        - The UAV's load prediction features (5 dims):
-            - UE arrival trend (arrivals in last T_L, normalized)
-            - predicted number of UEs in next T_L (normalized)
-            - predicted traffic load in next T_L (normalized)
-            - predicted buffer utilization in next T_L (normalized)
-            - predicted average delay in next T_L (normalized)
         - The UAV's surrounding condition (8 dims):
-            - number of UEs to each direction (N, E, S, W)
-            - interference from other UAVs to each direction (N, E, S, W)
+            - share of UEs to each direction (N, E, S, W)
+            - share of other UAVs to each direction (N, E, S, W)
+        - With more than one UAV:
+            - share of uncovered UEs to each direction (4 dims)
+            - each other UAV in id order: dx, dy, dh over the fly range, power ratio (4 dims each)
+        - With a backhaul section in the config: the UAV's backhaul load, capped at 2 and halved (1 dim)
 
-        => Total dimension: 5 + 90 + 4 + 5 + 8 = 112 dims
+        => One UAV: 5 + 63 + 4 + 8 = 80 dims
+        => N > 1 UAVs: 5 + 9 + 4 + 8 + 4 + 4 * (N - 1) = 30 + 4 * (N - 1) dims
+        => Plus 1 with a backhaul section
         """
         observations = {}
 
@@ -601,17 +607,18 @@ class NetworkSlicingEnv:
                     num_users = len(da.user_ids) / max(1, total_uav_ues) if da else 0.0
                     obs.append(num_users)
                     
-                    # Slice type one-hot (3 dims)
-                    obs.extend([1.0 if slice_type == st else 0.0 for st in slice_types])
+                    if self.num_uavs == 1:
+                        # Slice type one-hot (3 dims)
+                        obs.extend([1.0 if slice_type == st else 0.0 for st in slice_types])
 
-                    # Distance level one-hot (3 dims)
-                    obs.extend([1.0 if distance_level == st else 0.0 for st in distance_levels])
+                        # Distance level one-hot (3 dims)
+                        obs.extend([1.0 if distance_level == st else 0.0 for st in distance_levels])
 
             # ============================================
             # 3. NEW: Handover State Features (4 dims). So far 5 + 63 + 4 = 72
             # ============================================
             # Recent handover rate (handovers per minute) (1 dim)
-            handover_rate = self.handover_tracker.get_handover_rate(time_window=self.T_L)
+            handover_rate = self.handover_tracker.get_handover_rate(self.current_time, time_window=self.T_L)
             obs.append(handover_rate / 50.0)  # Normalize (assume max ~10/min)
             
             # Ping-pong rate (1 dim)
@@ -670,11 +677,42 @@ class NetworkSlicingEnv:
             for dir in ['N', 'E', 'S', 'W']:
                 obs.append(interference_dirs[dir] / max(1, self.num_uavs - 1))  # 4
 
+            if self.num_uavs > 1:
+                # Uncovered UEs in 4 directions: where this UAV could add coverage
+                uncovered_dirs = {'N': 0, 'E': 0, 'S': 0, 'W': 0}
+                for ue in self.ues.values():
+                    if not ue.is_active or ue.assigned_uav is not None:
+                        continue
+                    dx = ue.position[0] - uav.position[0]
+                    dy = ue.position[1] - uav.position[1]
+
+                    if dx > 0:
+                        uncovered_dirs['E' if dy > 0 else 'S'] += 1
+                    else:
+                        uncovered_dirs['W' if dy > 0 else 'N'] += 1
+
+                for dir in ['N', 'E', 'S', 'W']:
+                    obs.append(uncovered_dirs[dir] / num_total_ues)  # 4
+
+                # The other UAVs, in id order
+                for other_id in sorted(self.uavs.keys()):
+                    if other_id == uav_id:
+                        continue
+                    other_uav = self.uavs[other_id]
+                    obs.append((other_uav.position[0] - uav.position[0]) / (self.uav_fly_range_x[1] - self.uav_fly_range_x[0]))
+                    obs.append((other_uav.position[1] - uav.position[1]) / (self.uav_fly_range_y[1] - self.uav_fly_range_y[0]))
+                    obs.append((other_uav.position[2] - uav.position[2]) / (self.uav_fly_range_h[1] - self.uav_fly_range_h[0]))
+                    obs.append(other_uav.current_power / other_uav.max_power)  # 4 per other UAV
+
+            if self.backhaul is not None:
+                obs.append(min(self.backhaul_load[uav_id], 2.0) / 2.0)
+
             observations[uav_id] = np.array(obs, dtype=np.float32)
             # print(f"UAV {uav_id} observations: {obs}")
             
             # Sanity check
-            expected_dims = 80 
+            expected_dims = 80 if self.num_uavs == 1 else 30 + 4 * (self.num_uavs - 1)
+            expected_dims += self.backhaul is not None
             assert len(obs) == expected_dims, f"Expected {expected_dims} dims, got {len(obs)}"
 
         return observations
@@ -682,7 +720,8 @@ class NetworkSlicingEnv:
     def step(self, actions: Dict[int, np.ndarray]) -> Tuple[Dict[int, np.ndarray], float, bool, Dict]:
         """Execute actions and return next observations, reward, done, info"""
 
-        # Parse and apply actions for each UAV
+        # Parse actions for each UAV: all moves are decided before any energy is counted
+        new_positions = {}
         for uav_id, action in actions.items():
             # print(f"UAV {uav_id} action: {action}")
             uav = self.uavs[uav_id]
@@ -698,7 +737,22 @@ class NetworkSlicingEnv:
             new_pos[0] = np.clip(new_pos[0], self.uav_fly_range_x[0], self.uav_fly_range_x[1])
             new_pos[1] = np.clip(new_pos[1], self.uav_fly_range_y[0], self.uav_fly_range_y[1])
             new_pos[2] = np.clip(new_pos[2], self.uav_fly_range_h[0], self.uav_fly_range_h[1])
-            
+            new_positions[uav_id] = new_pos
+
+        if self._separation_active():
+            # UAVs without an action in this call hold their position
+            all_positions = np.array([new_positions.get(uav_id, uav.position) for uav_id, uav in self.uavs.items()])
+            separated = self._separate_uavs(all_positions)
+            for uav_id, pos in zip(self.uavs.keys(), separated):
+                if uav_id in actions:
+                    new_positions[uav_id] = pos
+                else:
+                    self.uavs[uav_id].position = pos
+
+        for uav_id, action in actions.items():
+            uav = self.uavs[uav_id]
+            new_pos = new_positions[uav_id]
+
             # Calculate movement energy cost
             v_x = (new_pos[0] - uav.position[0]) / self.T_L
             v_y = (new_pos[1] - uav.position[1]) / self.T_L
@@ -743,7 +797,7 @@ class NetworkSlicingEnv:
                 
                 for i, da in enumerate(uav_das):
                     da.raw_allocated_action = bandwidth_actions[i]
-                    da.allocated_bandwidth = bandwidth_actions[i] * uav.max_bandwidth
+                    da.allocated_bandwidth = bandwidth_actions[i] * self.uavs[uav_id].max_bandwidth
 
         # Bandwidth allocation to DAs
         self._allocate_rbs_fairly()
@@ -762,8 +816,9 @@ class NetworkSlicingEnv:
         # print("Is throughput cache valid?", self.throughput_cache_valid)
         reward, reward_breakdown = self.calculate_global_reward()
 
-        # Calculate vector reward for MORL (backward compatible, added to info)
-        reward_vector = self.calculate_vector_reward()
+        # Vector reward for MORL (backward compatible, added to info), from the same computation
+        reward_vector = np.array([reward_breakdown['qos_reward'], -reward_breakdown['energy_penalty'],
+                                  reward_breakdown['fairness_reward']], dtype=np.float32)
 
         # Update time
         self.current_time += self.T_L
@@ -782,18 +837,71 @@ class NetworkSlicingEnv:
         self.stats['avg_delay_sat'] = reward_breakdown.get('avg_delay_sat', np.inf)
         self.stats['avg_reliability_sat'] = reward_breakdown.get('avg_reliability_sat', 0.0)
 
+        active_ues = [ue for ue in self.ues.values() if ue.is_active]
         info = {
             'qos_satisfaction': reward_breakdown['qos_reward'],
             'energy_usage_level': reward_breakdown['energy_penalty'],
             'fairness_level': reward_breakdown['fairness_reward'],
-            'active_ues': len([ue for ue in self.ues.values() if ue.is_active]),
+            'active_ues': len(active_ues),
             'ue_arrivals': self.stats['arrivals'],
             'ue_departures': self.stats['departures'],
             # MORL: vector reward [qos, -energy, fairness] for multi-objective agents
             'reward_vector': reward_vector,
+            # Team diagnostics. min_uav_distance is inf when there is only one UAV
+            'coverage': sum(ue.assigned_uav is not None for ue in active_ues) / max(1, len(active_ues)),
+            'handovers': self.stats['handovers'],
+            'min_uav_distance': self._min_uav_distance(),
+            # Share of UAVs whose traffic exceeds their backhaul
+            'backhaul_limited': sum(load > 1.0 for load in self.backhaul_load.values()) / self.num_uavs,
         }
         
         return observations, reward, done, info
+
+    # ============================================
+    # UAV SEPARATION METHODS
+    # ============================================
+
+    def _separation_active(self) -> bool:
+        return self.num_uavs > 1 and self.min_uav_separation > 0
+
+    def _separate_uavs(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Push UAV pairs apart until every 3D distance reaches min_uav_separation, staying
+        in the fly ranges. Deterministic, so it uses no random numbers: UAVs at the same
+        point split along a horizontal direction set by their ids.
+        """
+        lower = np.array([self.uav_fly_range_x[0], self.uav_fly_range_y[0], self.uav_fly_range_h[0]], dtype=float)
+        upper = np.array([self.uav_fly_range_x[1], self.uav_fly_range_y[1], self.uav_fly_range_h[1]], dtype=float)
+        margin = 1e-6  # A pair stopped at the fly range closes half its gap per pass; this makes it finish
+        positions = positions.astype(float)
+        n = len(positions)
+        for _ in range(100):
+            moved = False
+            for i in range(n):
+                for j in range(i + 1, n):
+                    delta = positions[j] - positions[i]
+                    distance = np.linalg.norm(delta)
+                    if distance >= self.min_uav_separation:
+                        continue
+                    if distance > 1e-9:
+                        direction = delta / distance
+                    else:
+                        angle = 2.0 * np.pi * (i + 1) * (j + 1) / (n * n + 1)
+                        direction = np.array([np.cos(angle), np.sin(angle), 0.0])
+                    gap = self.min_uav_separation - distance + margin
+                    positions[i] = np.clip(positions[i] - direction * gap / 2.0, lower, upper)
+                    positions[j] = np.clip(positions[j] + direction * gap / 2.0, lower, upper)
+                    moved = True
+            if not moved:
+                break
+        return positions
+
+    def _min_uav_distance(self) -> float:
+        """Smallest 3D distance between two UAVs, inf with a single UAV"""
+        positions = [uav.position for uav in self.uavs.values()]
+        distances = [np.linalg.norm(positions[i] - positions[j])
+                     for i in range(len(positions)) for j in range(i + 1, len(positions))]
+        return float(min(distances)) if distances else float('inf')
 
     # ============================================
     # UEs DYNAMIC METHODS
@@ -1123,10 +1231,18 @@ class NetworkSlicingEnv:
             # Cummulative service rate (packets/sec)
             througputs_of_ues_in_uav = [self._get_cached_throughput(ue) for ue in self.ues.values() if ue.assigned_uav == uav.id and ue.is_active]  # in bps
             uav_throughput_bps = np.sum(througputs_of_ues_in_uav) if througputs_of_ues_in_uav else 0.0
-            uav_service_rate = uav_throughput_bps / (1e3 + avg_packet_size * 8)  # packets per second
+            if self.backhaul is not None:
+                # Packets leave the UAV over the backhaul, so it sets the service rate as well
+                uav_throughput_bps = min(uav_throughput_bps, self.backhaul_capacity[uav.id])
+            packet_bits = 1e3 + avg_packet_size * 8
+            if self.backhaul is not None and uav_arrival_rate > 0:
+                # Mean over packets, not UEs, so that rho is offered bits over service bits and follows the
+                # backhaul load. Only with a backhaul: without one, results must stay comparable with earlier runs
+                packet_bits = 8.0 * np.dot(packet_sizes, arrival_rates) / uav_arrival_rate
+            uav_service_rate = uav_throughput_bps / packet_bits  # packets per second
 
             # Buffer size in packets
-            uav_buffer_size = uav.buffer_size / (1e3 + avg_packet_size * 8) # in packets
+            uav_buffer_size = uav.buffer_size / packet_bits # in packets
 
             # CALCULATE QUEUING DELAY
             rho = uav_arrival_rate / max(uav_service_rate, 1)  # Utilization
@@ -1136,17 +1252,25 @@ class NetworkSlicingEnv:
                 uav.avg_queuing_delay_ms = 999.0
             else:
                 uav.avg_queuing_delay_ms = rho / (2 * uav_service_rate * (1 - rho)) * 1000  # in ms, M/D/1 formula
+                if self.backhaul is not None:
+                    # The overload value caps it, so delay doesn't fall as load passes rho = 1.
+                    # Only with a backhaul: without one, results must stay comparable with earlier runs
+                    uav.avg_queuing_delay_ms = min(uav.avg_queuing_delay_ms, 99.0)
 
             # CALCULATE DROP RATE (M/M/1/K blocking probability)
             if uav_service_rate == 0:
                 uav.avg_drop_rate = 1.0 if uav_arrival_rate > 0 else 0.0
-            elif rho > 1:
-                # Limit for an overloaded queue; the finite-K formula overflows here
+            elif rho > 1 and (self.backhaul is None or (uav_buffer_size + 1) * np.log(rho) > 700.0):
+                # Limit for an overloaded queue; the finite-K formula overflows here.
+                # With a backhaul the formula runs up to that point, so the drop rate is continuous at rho = 1
                 uav.avg_drop_rate = 1.0 - 1.0 / rho
             elif rho == 1:
                 uav.avg_drop_rate = 1 / (uav_buffer_size + 1)
             else:
-                uav.avg_drop_rate = ( (rho**(uav_buffer_size + 1)) * (1 - rho) ) / (1 - rho**(uav_buffer_size + 1))
+                # The textbook numerator is rho^K. The one rho too many is harmless below rho = 1,
+                # and stays without a backhaul so that results remain comparable with earlier runs
+                numerator_power = uav_buffer_size + 1 if self.backhaul is None else uav_buffer_size
+                uav.avg_drop_rate = ( (rho**numerator_power) * (1 - rho) ) / (1 - rho**(uav_buffer_size + 1))
             uav.avg_drop_rate = np.clip(uav.avg_drop_rate, 0.0, 1.0)
 
             # print(f"UAV {uav.id} - Arrival rate: {uav_arrival_rate:<10.2f} pkt/s | Service rate: {uav_service_rate:<12.2f} pkt/s | Rho: {rho:<10.4f} | Buffer size: {uav_buffer_size:<5.0f} pkts | Avg Delay: {uav.avg_queuing_delay_ms:<10.6f} ms | Drop Rate: {uav.avg_drop_rate:<10.4f}")
@@ -1451,9 +1575,16 @@ class NetworkSlicingEnv:
         ue_positions = np.array([ue.position for ue in calculation_list], dtype=np.float32)
         uav_positions = np.array([uav.position for uav in self.uavs.values()], dtype=np.float32)
         # Each UAV splits its transmit power equally across the RBs it actually uses
+        rbs_in_use = [sum(rb.allocated_ue_id != -1 for rb in uav.RBs) for uav in self.uavs.values()]
         uav_powers = np.array([
-            uav.current_power / max(1, sum(rb.allocated_ue_id != -1 for rb in uav.RBs))
-            for uav in self.uavs.values()
+            uav.current_power / max(1, n_rbs)
+            for uav, n_rbs in zip(self.uavs.values(), rbs_in_use)
+        ], dtype=np.float32)
+        # Expected power on another UAV's RB: (P / n_rbs) per RB, on n_rbs / total_rbs of the band.
+        # This is P / total_rbs however many RBs the UAV uses, and nothing if it transmits on none
+        interference_powers = np.array([
+            uav.current_power / self.total_rbs if n_rbs > 0 else 0.0
+            for uav, n_rbs in zip(self.uavs.values(), rbs_in_use)
         ], dtype=np.float32)
 
         # Map serving UAV IDs to indices
@@ -1468,7 +1599,8 @@ class NetworkSlicingEnv:
         #     serving_indices, self.noise_power, self.path_loss_exponent
         # )
         sinr_db = calculate_sinr_batch_numba_a2g(ue_positions, uav_positions, uav_powers,
-            serving_indices, self.noise_power, self.carrier_frequency)
+            serving_indices, self.noise_power, self.carrier_frequency,
+            interference_powers, self.sidelobe_gain)
         
         # Fill cache
         for i, (ue_id, uav_id) in enumerate(zip(ue_ids, serving_uav_ids)):
@@ -1533,7 +1665,10 @@ class NetworkSlicingEnv:
         # Handover delays
         # ========================
 
-        t_handover = np.array([getattr(ue, 'handover_penalty_ms', 0.0) for _, ue in active_ues], dtype=np.float32)
+        # A handover interrupts D ms of the T_L: that share of packets waits D/2 on average, so the
+        # mean added delay is D^2 / (2 T_L). The full D would apply to every packet of the step
+        t_handover = np.array([getattr(ue, 'handover_penalty_ms', 0.0) ** 2 / (2.0 * self.T_L * 1000.0)
+                               for _, ue in active_ues], dtype=np.float32)
 
         # ========================
         # Processing delays
@@ -1588,7 +1723,49 @@ class NetworkSlicingEnv:
             
             self.throughput_cache[ue.id] = ue_throughput
 
+        if self.backhaul is not None:
+            self._apply_backhaul_limit()
+
         self.throughput_cache_valid = True
+
+    def _backhaul_capacity(self, uav: UAV) -> float:
+        """Capacity (bps) of the UAV's own band to the gateway, with the access link's A2G and rate models"""
+        delta = uav.position - self.backhaul_gateway
+        distance_2d = max(np.hypot(delta[0], delta[1]), 1e-6)
+        distance_3d = max(np.linalg.norm(delta), 1.0)
+        elevation_deg = np.degrees(np.arctan(abs(delta[2]) / distance_2d))
+
+        p_los = 1.0 / (1.0 + a * np.exp(np.clip(-b * (elevation_deg - a), -20.0, 20.0)))
+        fspl_db = 20.0 * np.log10(distance_3d) + 20.0 * np.log10(self.carrier_frequency / 1e6) - 27.55
+        path_loss_db = fspl_db + eta_los * p_los + eta_nlos * (1.0 - p_los)
+
+        gain_db = self.backhaul.antenna_gain_db - path_loss_db
+        snr = self.backhaul.tx_power * 10.0 ** (gain_db / 10.0) / self.backhaul_noise_power
+        spectral_efficiency = min(self.shannon_attenuation * np.log2(1.0 + snr), self.max_spectral_efficiency)
+        return self.backhaul.bandwidth * spectral_efficiency
+
+    def _apply_backhaul_limit(self):
+        """
+        The backhaul carries what the UEs send, min(access rate, offered load), not the spare access capacity.
+        If that exceeds the capacity, all the UAV's UEs slow down by the same factor. This is continuous at
+        load 1 and leaves the shares within a UAV as they were. The queue is limited by the capacity at
+        any load, see _update_uavs_queuing_stats.
+        """
+        carried = defaultdict(dict)
+        for ue in self.ues.values():
+            if ue.is_active and ue.assigned_uav is not None:
+                pattern = self.traffic_patterns[ue.slice_type]
+                offered = pattern['packet_size'] * 8.0 * pattern['avg_arrival_rate']
+                carried[ue.assigned_uav][ue.id] = min(self.throughput_cache[ue.id], offered)
+
+        for uav_id, uav in self.uavs.items():
+            total = sum(carried[uav_id].values())
+            capacity = self._backhaul_capacity(uav)
+            self.backhaul_capacity[uav_id] = capacity
+            self.backhaul_load[uav_id] = total / capacity
+            if total > capacity:
+                for ue_id in carried[uav_id]:
+                    self.throughput_cache[ue_id] *= capacity / total
 
     def _update_per_cache(self):
         """Update PER cache for all UE-RB pairs"""
@@ -1879,11 +2056,11 @@ class NetworkSlicingEnv:
             self._update_sinr_cache()
         
 
-        slice_weight_per_ue = np.array([])
-        throughput_sats = np.array([])
-        delay_sats = np.array([])
-        reliability_sats = np.array([])
-        overall_satisfactions = np.array([])
+        slice_weight_per_ue = []
+        throughput_sats = []
+        delay_sats = []
+        reliability_sats = []
+        overall_satisfactions = []
 
         # ============================================
         # Collect metrics for all active UEs
@@ -1893,16 +2070,16 @@ class NetworkSlicingEnv:
                 continue
             
             # Slice weight of UE
-            slice_weight_per_ue = np.append(slice_weight_per_ue, self.slice_weights[ue.slice_type])
+            slice_weight_per_ue.append(self.slice_weights[ue.slice_type])
 
             # Calculate individual QoS components
             throughput_sat, ue_throughput = self._calculate_throughput_satisfaction(ue)
             delay_sat, total_delay_ms = self._calculate_delay_satisfaction(ue)
             reliability_sat, ue_reliability = self._calculate_reliability_satisfaction(ue)
 
-            throughput_sats = np.append(throughput_sats, throughput_sat)
-            delay_sats = np.append(delay_sats, delay_sat)
-            reliability_sats = np.append(reliability_sats, reliability_sat)
+            throughput_sats.append(throughput_sat)
+            delay_sats.append(delay_sat)
+            reliability_sats.append(reliability_sat)
 
             # Combine using slice-specific weights
             ue_qos_weights = self.qos_weights[ue.slice_type]
@@ -1912,12 +2089,14 @@ class NetworkSlicingEnv:
                 ue_qos_weights['reliability'] * reliability_sat
             )
 
-            overall_satisfactions = np.append(overall_satisfactions, overall_satisfaction)
+            overall_satisfactions.append(overall_satisfaction)
 
         # ============================================
         # Aggregate QoS reward across all DAs
         # ============================================
 
+        slice_weight_per_ue = np.array(slice_weight_per_ue, dtype=np.float64)
+        overall_satisfactions = np.array(overall_satisfactions, dtype=np.float64)
         qos_reward = np.sum(slice_weight_per_ue * overall_satisfactions) / np.sum(slice_weight_per_ue)
 
         breakdown = {
@@ -1999,7 +2178,9 @@ class NetworkSlicingEnv:
         drop_rate = self.uavs[ue.assigned_uav].avg_drop_rate if ue.assigned_uav in self.uavs else 0.0
         
         # Handover loss
-        handover_loss = 0.01 if getattr(ue, 'handover_penalty_ms', 0) > 0 else 0.0
+        # Only the packets in the interruption are at risk, not the whole T_L
+        interrupted_share = getattr(ue, 'handover_penalty_ms', 0) / (self.T_L * 1000.0)
+        handover_loss = self.handover_tracker.handover_failure_rate * interrupted_share
         
         # Transmission success based on PER
         per = self._get_cached_per(ue)

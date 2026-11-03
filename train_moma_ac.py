@@ -1,11 +1,13 @@
 """
 train_moma_ac.py
 ================
-Training loop cho MOMA-AC (Random, GPI-LS va GPI-PD sampling variants).
+Training loop cho MOMA-AC (Random, OLS, GPI-LS va GPI-PD sampling variants).
 Chay:
   py train_moma_ac.py --config config/train/moma_ac_random.yaml
+  py train_moma_ac.py --config config/train/moma_ac_ols.yaml
   py train_moma_ac.py --config config/train/moma_ac_gpi_ls.yaml
   py train_moma_ac.py --config config/train/moma_ac_gpi_pd.yaml
+  py train_moma_ac.py --config config/train/moma_ac_ma3.yaml      # 3 UAV, CTDE
 """
 
 import os
@@ -20,7 +22,7 @@ from tqdm import tqdm
 
 from utils import Configuration
 from environment import NetworkSlicingEnv
-from agents_moma_ac import MOMA_AC_Agent
+from agents_moma_ac import MOMA_AC_Agent, MOMA_CTDE_Agent, episode_diagnostics
 
 
 # Shared HV reference point
@@ -100,13 +102,15 @@ class MOMA_AC_Trainer:
     def __init__(
         self,
         train_config_path: str,
-        env_config_path:   str = "./config/environment/default.yaml",
+        env_config_path:   str = None,
         checkpoint_path:   str = None,
         seed:              int = None,
         resume:            bool = False,
         max_hours:         float = None,
     ):
         tcfg = Configuration(train_config_path)
+        # An explicit path wins, then the train config's env_config key
+        env_config_path = env_config_path or str(_get(tcfg, "env_config", "./config/environment/default.yaml"))
         ecfg = Configuration(env_config_path)
 
         if seed is not None:
@@ -168,7 +172,9 @@ class MOMA_AC_Trainer:
         self.env    = NetworkSlicingEnv(config_path=env_config_path)
         self.eval_env = NetworkSlicingEnv(config_path=env_config_path)
         obs_dict    = self.env.reset()
-        self.uav_id = sorted(obs_dict.keys())[0]
+        self.uav_ids = sorted(obs_dict.keys())
+        self.uav_id = self.uav_ids[0]
+        self.multi_uav = len(self.uav_ids) > 1
         self.obs_dim = len(obs_dict[self.uav_id])
 
         # Infer act_dim from env config
@@ -178,10 +184,13 @@ class MOMA_AC_Trainer:
         print(f"[MOMA-AC] obs_dim={self.obs_dim}, act_dim={self.act_dim}")
 
         # ── Agent ────────────────────────────────────────────────
-        self.agent = MOMA_AC_Agent(
+        agent_cls  = MOMA_CTDE_Agent if self.multi_uav else MOMA_AC_Agent
+        agent_args = {"n_agents": len(self.uav_ids)} if self.multi_uav else {}
+        self.agent = agent_cls(
             obs_dim   = self.obs_dim,
             act_dim   = self.act_dim,
             n_objectives = 3,
+            **agent_args,
             actor_lr  = self.cfg["actor_lr"],
             critic_lr = self.cfg["critic_lr"],
             gamma     = self.cfg["gamma"],
@@ -224,6 +233,10 @@ class MOMA_AC_Trainer:
 
     # ── Main Training Loop ──────────────────────────────────────
 
+    def _joint_obs(self, obs_dict: dict) -> np.ndarray:
+        """Observations of all UAVs in id order, shape (n_uavs, obs_dim)."""
+        return np.stack([obs_dict[uid] for uid in self.uav_ids])
+
     def train(self):
         total    = self.cfg["total_steps"]
         pbar     = tqdm(total=total, initial=self.start_step, desc="MOMA-AC",
@@ -231,21 +244,29 @@ class MOMA_AC_Trainer:
 
         step          = self.start_step
         obs_dict      = self.env.reset()
-        obs           = obs_dict[self.uav_id]
+        obs           = self._joint_obs(obs_dict) if self.multi_uav else obs_dict[self.uav_id]
         ep_rvec       = []
+        ep_diag       = []
         ep_steps      = 0
         last_ep_val   = None
+        last_ep_diag  = None
         omega         = self.agent.sample_omega()
-        use_gpi       = self.agent.support is not None   # Follow GPI policy (GPI-PD Alg. 2, line 12)
+        use_gpi       = self.agent.use_gpi               # Follow GPI policy (GPI-PD Alg. 2, line 12)
         t0            = time.time()
 
         while step < total:
             # ── Environment step ─────────────────────────────────────
-            action = self.agent.select_action(obs, omega, explore=True, use_gpi=use_gpi)
             # Actor output: dims[0:3]=tanh[-1,1] (pos),
             #               dims[3:] =sigmoid[0,1] (power, BW) — no clipping needed
-            obs_dict_new, _, done, info = self.env.step({self.uav_id: action})
-            obs_next = obs_dict_new.get(self.uav_id, obs)
+            if self.multi_uav:
+                action = self.agent.select_joint_action(obs, omega, explore=True)
+                obs_dict_new, _, done, info = self.env.step(dict(zip(self.uav_ids, action)))
+                obs_next = self._joint_obs(obs_dict_new)
+                ep_diag.append((info["coverage"], info["handovers"], info["min_uav_distance"], info["backhaul_limited"]))
+            else:
+                action = self.agent.select_action(obs, omega, explore=True, use_gpi=use_gpi)
+                obs_dict_new, _, done, info = self.env.step({self.uav_id: action})
+                obs_next = obs_dict_new.get(self.uav_id, obs)
             r_vec    = np.array(info.get("reward_vector", [0., 0., 0.]),
                                 dtype=np.float32)
 
@@ -254,7 +275,7 @@ class MOMA_AC_Trainer:
             # all already in similar scale, no normalization needed
             ep_end = done or (ep_steps + 1 >= self.cfg["max_steps_per_episode"])
             # Store the env's done only: the time limit truncates, it isn't terminal
-            self.agent.buffer.add(obs, action, r_vec, obs_next, omega, done)
+            self.agent.buffer.add(np.ravel(obs), np.ravel(action), r_vec, np.ravel(obs_next), omega, done)
 
             ep_rvec.append(r_vec)
             obs      = obs_next
@@ -274,18 +295,20 @@ class MOMA_AC_Trainer:
                     len(self.agent.buffer) >= self.cfg["min_buffer_size"]):
                 self.last_dyna_info = self.agent.dyna_step()
 
-            # ── GPI-LS: grow the weight support ──────────────────
-            if (use_gpi and step % self.cfg["gpi_ls_interval"] == 0 and
+            # ── OLS / GPI-LS: grow the weight support ────────────
+            if (self.agent.support is not None and step % self.cfg["gpi_ls_interval"] == 0 and
                     len(self.agent.buffer) >= self.cfg["min_buffer_size"]):
                 self._gpi_ls_iteration(step)
 
             # ── Episode reset ────────────────────────────────────
             if ep_end:
                 last_ep_val = np.mean(ep_rvec, axis=0) if ep_rvec else None
+                last_ep_diag = episode_diagnostics(ep_diag) if ep_diag else None
                 omega       = self.agent.sample_omega()
                 obs_dict   = self.env.reset()
-                obs         = obs_dict[self.uav_id]
+                obs         = self._joint_obs(obs_dict) if self.multi_uav else obs_dict[self.uav_id]
                 ep_rvec     = []
+                ep_diag     = []
                 ep_steps    = 0
 
             # ── Logging ─────────────────────────────────────────
@@ -299,6 +322,8 @@ class MOMA_AC_Trainer:
                     "noise":   self.agent.expl_noise,
                     "elapsed": elapsed,
                 })
+                if last_ep_diag is not None:
+                    self.step_log[-1].update(last_ep_diag)
                 pbar.set_postfix({
                     "QoS":  f"{last_ep_val[0]:.3f}",
                     "Eng":  f"{last_ep_val[1]:.3f}",
@@ -396,7 +421,7 @@ class MOMA_AC_Trainer:
         self.gpi_log.append({"step": step, **info, **getattr(self, "last_dyna_info", {})})
         pd.DataFrame(self.gpi_log).to_csv(
             os.path.join(self.model_dir, "gpi_ls_metrics.csv"), index=False)
-        print(f"\n[GPI-LS] step={step}  {info}")
+        print(f"\n[{self.cfg['omega_sampling']}] step={step}  {info}")
 
     def _sweep_metrics(self, use_gpi: bool):
         results, omegas = self.agent.eval_pareto_front(
@@ -419,7 +444,7 @@ class MOMA_AC_Trainer:
     def _eval_and_log(self, step: int):
         # GPI variants report the GPI policy, and the plain actor as *_actor for
         # a like-for-like comparison with the random baseline
-        use_gpi = self.agent.support is not None
+        use_gpi = self.agent.use_gpi
         metrics, results, omegas = self._sweep_metrics(use_gpi)
         row = {
             "step":     step,
@@ -430,8 +455,11 @@ class MOMA_AC_Trainer:
             "best_qos": float(results[:, 0].max()),
             "best_fair":float(results[:, 2].max()),
         }
-        if use_gpi:
+        if self.agent.support is not None:
             row["support_size"] = len(self.agent.support.weights)
+        if self.multi_uav:
+            row.update(self.agent.pop_eval_diagnostics())
+        if use_gpi:
             actor_metrics, actor_results, _ = self._sweep_metrics(False)
             row.update({f"{k}_actor": v for k, v in actor_metrics.items()})
             self._log_pareto(step, "actor", actor_results, omegas)
@@ -489,8 +517,8 @@ if __name__ == "__main__":
                         default="config/train/moma_ac_random.yaml",
                         help="Training config yaml")
     parser.add_argument("--env_config",
-                        default="config/environment/default.yaml",
-                        help="Environment config yaml")
+                        default=None,
+                        help="Environment config yaml (default: the train config's env_config, else default.yaml)")
     parser.add_argument("--checkpoint",
                         default=None,
                         help="Path to checkpoint to resume from")

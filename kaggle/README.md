@@ -1,6 +1,6 @@
 # Train MOMA-AC trên Kaggle
 
-Train 3 variant (`random`, `gpi_ls`, `gpi_pd`), 1M bước, với 1 UAV. Notebook mặc định chạy 1 seed trên GPU; thêm seed bằng cách sửa `SEEDS`. Kaggle giới hạn mỗi session khoảng 12 giờ, nên bộ này tự dừng trước khi hết giờ, lưu trạng thái, và chạy tiếp ở session sau.
+Train 4 variant (`random`, `ols`, `gpi_ls`, `gpi_pd`), 1M bước, với 1 UAV. Notebook mặc định chạy 1 seed trên GPU; thêm seed bằng cách sửa `SEEDS`. Kaggle giới hạn mỗi session khoảng 12 giờ, nên bộ này tự dừng trước khi hết giờ, lưu trạng thái, và chạy tiếp ở session sau.
 
 ## Chuẩn bị
 
@@ -84,7 +84,8 @@ Bảng tổng kết ở mốc cuối nằm ở cuối log. Muốn tính lại tr
 
 - So `hv`, `eum`, `eu_front` của các variant, và phải nhìn cả độ lệch giữa các seed. 3 seed chỉ đủ để thấy xu hướng. Paper MOMA-AC dùng 10 seed.
 - Hai variant GPI còn có cột `*_actor` là actor thường không dùng GPI. So `hv_actor` với `hv` của `random` để tách tác dụng của cách chọn omega khỏi tác dụng của suy luận GPI.
-- `gpi_ls_metrics.csv`: `support_size` (số omega trong M), `max_gap` (cải thiện GPI đo được), và `model_val_nll` với GPI-PD.
+- `ols` chọn omega theo support M như GPI-LS nhưng luôn hành động bằng actor thường, nên chỉ có cột `hv`, không có `*_actor`. So `hv` của `ols` với `random` để xem tác dụng của việc chọn omega, và với `hv` của `gpi_ls` để xem có GPI thì tốt hơn hay kém đi.
+- `gpi_ls_metrics.csv`: `support_size` (số omega trong M), `max_gap` (với GPI là cải thiện đo được, với `ols` là khoảng cách tới cận trên lạc quan, nên không so được giữa hai loại), và `model_val_nll` với GPI-PD.
 
 ## CPU hay GPU
 
@@ -98,7 +99,25 @@ Bảng tổng kết ở mốc cuối nằm ở cuối log. Muốn tính lại tr
 
 GPU tiết kiệm thời gian rõ rệt, nhưng tốn quota khoảng 30 giờ mỗi tuần, còn CPU thì không. Khi hết quota hoặc muốn chạy thêm seed bằng CPU: đặt `DEVICE = "cpu"`, `PARALLEL = None` và Accelerator `None`. Nếu đặt `"cuda"` mà không có GPU, run tự chuyển sang CPU và log in `WARNING: no GPU found`.
 
-Số trên đo ở máy này. Máy Kaggle có thể khác, hãy xem tiến độ ở log của session đầu.
+Số trên đo ở máy này. Máy Kaggle có thể khác, hãy xem tiến độ ở log của session đầu. `ols` chưa được đo riêng. Nó update bằng cùng cách với `gpi_ls` nhưng không tính GPI khi chọn hành động và chỉ eval một lần mỗi mốc, nên không chậm hơn `gpi_ls`.
+
+## Thêm variant cho seed đã chạy
+
+Cập nhật code trước: chạy `py kaggle/build_bundle.py`, rồi vào Dataset `moma-uav-code` → **New Version** → upload `moma_uav_code.zip` mới. Sau đó trong notebook:
+
+1. **Add Input** → output của version đã train, để run cũ không bị train lại.
+2. Giữ đủ các variant trong `VARIANTS`, để `comparison.csv` có đủ bảng so sánh. Run đã có `DONE` sẽ được bỏ qua.
+3. Đầu log phải có `[Restore] ...: DONE` cho từng run cũ.
+
+## Chạy 3 UAV (`ma3`)
+
+`ma3` là MOMA-TD3 của paper trên 3 UAV, 50 UE, chỉ lấy mẫu omega đều. Nó không nằm trong variant mặc định.
+
+1. Trong notebook, đặt `VARIANTS = ["ma3"]` và `SEEDS` theo nhu cầu. Config `moma_ac_ma3.yaml` đã tự trỏ tới `config/environment/ma3.yaml`.
+2. Kết quả nằm ở `runs/saved_models_moma_ac_ma3/seed_<n>/`. `eval_metrics.csv` và `step_metrics.csv` có thêm `coverage`, `handovers`, `backhaul_limited` (tỷ lệ UAV vượt dung lượng backhaul), `min_uav_distance` (khoảng cách nhỏ nhất thực sự giữa hai UAV) và `mean_uav_distance` (trung bình theo step của cặp gần nhất).
+3. So với baseline không cần train: chạy `py eval_formation.py` để được một dòng kết quả của 3 UAV đứng yên thành tam giác, dùng cùng seed eval.
+
+Run `ma3` chưa được đo tốc độ trên Kaggle. Hãy xem tiến độ ở log của session đầu. Mỗi run chưa xong chiếm nhiều đĩa hơn run 1 UAV, vì buffer lưu quan sát và hành động chung của cả đội.
 
 ## Chia việc nếu chạy không kịp
 

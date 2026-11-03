@@ -108,7 +108,7 @@ def tail(path: str, n: int = 25) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Run MOMA-AC variants in a Kaggle session")
-    parser.add_argument("--variants", nargs="+", default=["random", "gpi_ls", "gpi_pd"])
+    parser.add_argument("--variants", nargs="+", default=["random", "ols", "gpi_ls", "gpi_pd"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3])
     parser.add_argument("--max_hours", type=float, default=10.5, help="Training time budget of this session")
     parser.add_argument("--parallel", type=int, default=None, help="Runs at once (default: CPU count)")

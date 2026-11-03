@@ -1,0 +1,166 @@
+# ENVIRONMENT CONFIGURATION FOR UAV NETWORK SIMULATION
+# ----------------------------------------------------
+
+# Physical entities parameters
+system:
+    num_uavs: 3   # MOMA-AC CTDE (config/train/moma_ac_ma3.yaml)
+    num_ues: 50  # Steady-state UE population (see ue_dynamics.arrival_rate)
+    service_area: [2000, 2000] # [width, height] in meters
+    uav_fly_range_x: [0, 2000] # [min, max] radius from center in meters
+    uav_fly_range_y: [0, 2000] # [min, max] radius from center in meters
+    uav_fly_range_h: [100, 400] # [min, max] height in meters (above the 120 m civil limit: assumes a dedicated-airspace UAV-BS)
+    num_das_per_slice: 3
+    min_uav_separation: 50.0 # meters, enforced in step (no reward penalty); absent or 0 = off
+
+# Time parameters
+time:
+    T_L: 60.0 # Long-term period (seconds)
+    T_S: 0.01 # Short-term period (seconds)
+
+# Channel and propagation parameters
+channel:
+    noise_psd_dbm_hz: -174.0 # Thermal noise density
+    noise_figure_db: 7.0 # UE receiver noise figure; noise per RB = PSD + NF + 10log10(rb_bandwidth)
+    carrier_frequency: 3.5e+9 # Hz (NR band n78, the band that carries 100 MHz at 30 kHz SCS)
+    rb_bandwidth: 360e3 # Hz (12 subcarriers x 30 kHz)
+    total_bandwidth: 98280000.0 # Hz per UAV (273 PRBs, the NR maximum for 100 MHz at 30 kHz SCS)
+    shannon_attenuation: 0.75 # Attenuated Shannon: SE = min(alpha * log2(1 + SINR), se_max)
+    max_spectral_efficiency: 7.4 # bps/Hz (256-QAM, CQI 15 of NR table 2)
+
+# Quality of Service profiles for network slices
+qos_profiles:
+    embb: # Enhanced Mobile Broadband (slice_type: 1)
+        min_rate: 10e6 # bps
+        max_latency: 10.0 # ms
+        min_reliability: 0.99
+    urllc: # Ultra-Reliable Low-Latency Communications (slice_type: 2)
+        min_rate: 2e6
+        max_latency: 5.0 # end-to-end over the UAV hop (1 ms would be below the processing delay)
+        min_reliability: 0.9999
+    mmtc: # Massive Machine-Type Communications (slice_type: 3)
+        min_rate: 1e5
+        max_latency: 100.0
+        min_reliability: 0.95
+
+# Network slice parameters
+slicing:
+    slice_probabilities:
+        embb: 0.4
+        urllc: 0.3
+        mmtc: 0.3
+    slice_weights:
+        embb: 0.4
+        urllc: 0.4
+        mmtc: 0.2
+
+qos_weights:
+    embb:
+        throughput: 0.7
+        delay: 0.2
+        reliability: 0.1
+    urllc:
+        throughput: 0.1
+        delay: 0.5      # CRITICAL
+        reliability: 0.4  # CRITICAL
+    mmtc:
+        throughput: 0.2
+        delay: 0.1
+        reliability: 0.7
+
+# UAV constraints and capabilities
+uav_params:
+    max_power: 10.0 # Watts (40 dBm, shared across the allocated RBs)
+    battery_capacity: 800000.0 # Joules (~222 Wh, about one hour at hover + full power)
+    velocity_max: 15.0 # m/s maximum horizontal speed
+    velocity_max_vertical: 5.0 # m/s maximum climb/descent rate
+    initial_power: 5.0 # Initial power setting
+    initial_battery: 800000.0 # Initial battery level
+    beam_angle: 60.0 # degrees - Maximum beam angle (half-angle from vertical)
+    sidelobe_attenuation_db: 20.0 # dB, interference at UEs outside the interfering UAV's beam (assumed value)
+    buffer_size: 1000000  # bits
+    processing_delay_ms: 1.0 # gNB + UE processing per packet
+
+# User Equipment dynamics
+ue_dynamics:
+    arrival_rate: 0.167 # New UEs per second (num_ues / session_duration_avg keeps the population near num_ues)
+    max_ues_multiplier: 1.5 # max_ues = num_ues * multiplier
+    session_duration_avg: 300 # Average session duration in seconds (sets the per-step departure probability)
+    max_initial_velocity: 2.0 # m/s
+    patterns:
+        walk:
+            speed: 0.1 # m/s
+            probability: 0.5
+        vehicle:
+            speed: 1.0 # m/s
+            probability: 0.3
+        stationary:
+            speed: 0.0 # m/s
+            probability: 0.2
+    change_direction_prob: 0.3 # Probability of changing direction per large time-scale step
+
+# Traffic model of slices (offered load sits just under the slice's min_rate)
+traffic_patterns:
+    embb:
+        packet_size: 1500
+        avg_arrival_rate: 800 # 9.6 Mbps
+    urllc:
+        packet_size: 200
+        avg_arrival_rate: 1000 # 1.6 Mbps
+    mmtc:
+        packet_size: 200
+        avg_arrival_rate: 60 # 96 kbps
+
+# Distance-based classification thresholds (used for DA formation)
+da_distance_thresholds:
+    near_max: 300.0 # meters - "Near" SINR level externally
+    medium_max: 600.0 # meters - "Medium" SINR level externally
+        # > 600m is "Far" SINR level externally
+
+# SINR thresholds for quality assessment
+sinr_thresholds:
+    low_max: 10.0 # dB
+    medium_max:
+        20.0 # dB
+        # > 20 dB is high quality
+
+# Environment behavior settings
+behavior:
+    print_stats: true # Print initialization statistics
+    boundary_handling: "bounce" # How UEs handle boundaries: "bounce", "wrap", "stop"
+    periodic_cleanup: true # Remove inactive UEs periodically
+
+# Reward function weights
+reward_weights:
+    qos: 2.0 # QoS satisfaction weight
+    energy: 0.8 # Energy efficiency weight
+    fairness: 0.5 # Fairness weight
+
+# Energy consumption models
+energy_models:
+    # Rotary-wing propulsion power (Zeng, Xu & Zhang 2019)
+    blade_profile_power: 79.86 # W, P0
+    induced_power: 88.63 # W, Pi
+    rotor_tip_speed: 120.0 # m/s
+    mean_induced_velocity: 4.03 # m/s, hover
+    fuselage_drag_ratio: 0.6
+    air_density: 1.225 # kg/m^3
+    rotor_solidity: 0.05
+    rotor_disc_area: 0.503 # m^2
+    uav_weight: 20.0 # N, sets the climb power W * v_z
+    # Transmit chain
+    pa_efficiency: 0.25 # Drawn power = P_tx / pa_efficiency
+
+# Air to ground channel model
+a2g:
+    a: 4.88
+    b: 0.43
+    eta_los: 0.1 # dB
+    eta_nlos: 21.0 # dB
+
+# Wireless backhaul: each UAV has its own band to one ground gateway, out of band with the access links.
+# Assumed values, picked by sweep: the limit binds for spread-out teams without choking the network
+backhaul:
+    gateway_position: [1000.0, 0.0, 30.0] # meters, x y h: edge of the service area
+    bandwidth: 20000000.0 # Hz per UAV
+    tx_power: 1.0 # Watts (not added to the energy objective)
+    antenna_gain_db: 0.0 # dB, total of both ends

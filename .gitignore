@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Training outputs: keep the CSV tables in results/, not weights or replay buffers
+/saved_models_*/
+/runs/
+*.pth
+*.npz
+resume/
