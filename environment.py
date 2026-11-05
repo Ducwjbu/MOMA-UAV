@@ -2371,6 +2371,9 @@ class NetworkSlicingEnv:
             
             # Allocate using cumulative sum
             cumsum = np.concatenate([[0], np.cumsum(target_rbs)])
+            # UAVs do not coordinate their RBs: each uses a random subset of the band, which is what the
+            # interference model assumes (expected power P_j / total_rbs on any RB of another UAV)
+            rb_order = np.random.permutation(total_rbs)
             
             # ============================================
             # STEP 4: Assign RBs to DAs (vectorized)
@@ -2380,7 +2383,7 @@ class NetworkSlicingEnv:
                 end_idx = min(cumsum[i + 1], total_rbs)
                 
                 # Batch assign RBs to this DA
-                for rb_id in range(start_idx, end_idx):
+                for rb_id in rb_order[start_idx:end_idx]:
                     rb = uav.RBs[rb_id]
                     rb.allocated_da_id = da.id
                     da.RB_ids_list.append(rb_id)
