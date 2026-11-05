@@ -2,6 +2,7 @@
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from utils import Configuration
+from city import City
 from dataclasses import dataclass, field
 from numba import jit, prange
 from collections import defaultdict, deque
@@ -410,9 +411,30 @@ class NetworkSlicingEnv:
         # Without the key there are no sidelobes: UEs outside a beam get no interference from it
         sidelobe_db = getattr(env_config.uav_params, 'sidelobe_attenuation_db', None)
         self.sidelobe_gain = 0.0 if sidelobe_db is None else 10.0 ** (-sidelobe_db / 10.0)
+        # A2G parameters of this config (the numba path still reads default.yaml's at import)
+        self.a2g = env_config.a2g
+        # 3GPP TR 38.901 antenna element pointing down. With it, a UE associates to the UAV with the
+        # strongest reference signal and is covered above a minimum SNR, instead of a hard beam cone
+        self.antenna = getattr(env_config.uav_params, 'antenna', None)
+        # Log-normal shadowing of TR 36.777 (UMa-AV), with the LoS state drawn per UE-UAV link and step
+        self.shadowing = getattr(env_config.channel, 'shadowing', None)
+        self.channel_draws = {}  # {ue_id: (uniform for the LoS state, standard normal)}, one per UAV
+        # Explicit ITU-R P.1410 city (city.py), regenerated each episode. With it, LoS is geometric, UEs inside
+        # a footprint are indoor (O2I loss), and shadowing is correlated in space. Absent: the statistical model
+        self.city_params = getattr(env_config, 'city', None)
+        self.city = None
+        self.o2i = getattr(env_config.channel, 'o2i', None)
+        self.fast_fading = getattr(env_config.channel, 'fast_fading', None)
+        self._se_table = self._build_fading_table() if self.fast_fading is not None else None
+        # Horizontal wind of Dai et al. (arXiv:2304.06909), drawn once per episode. Absent: no wind
+        self.wind_params = getattr(env_config, 'wind', None)
+        self.wind_ref = np.zeros(2)  # wind vector at the reference height, m/s (x east, y north)
+        self.wind_ceiling = None  # highest altitude where the wind stays within the UAV's limit
+        self.wind_rejections = 0  # episodes redrawn because the wind exceeded the limit even at the lowest altitude
         self.energy_models = env_config.energy_models
         self.uav_buffer_size = env_config.uav_params.buffer_size  # bits
-        self.velocity_max_vertical = env_config.uav_params.velocity_max_vertical  # m/s
+        self.velocity_max_vertical = env_config.uav_params.velocity_max_vertical  # m/s, climb
+        self.velocity_max_descent = getattr(env_config.uav_params, 'velocity_max_descent', self.velocity_max_vertical)
         self.processing_delay_ms = env_config.uav_params.processing_delay_ms
         self.min_power_ratio = 0.05  # Lowest transmit power, as a fraction of max_power
         self._init_energy_bounds()
@@ -446,6 +468,9 @@ class NetworkSlicingEnv:
 
         # Reward weights
         self.reward_weights = env_config.reward_weights
+        # Allocation metric of Jain's index: 'min_rate' (throughput / slice min_rate, uncapped) or
+        # 'fraction_of_demand' (Jain et al. 1984: throughput / offered load, capped at 1)
+        self.fairness_metric = getattr(env_config, 'fairness_metric', 'min_rate')
 
         # Statistics tracking
         self.stats = {
@@ -479,8 +504,15 @@ class NetworkSlicingEnv:
         self.cache_hits = 0
         self.cache_misses = 0
         
-    def reset(self) -> Dict[int, np.ndarray]:   
+    def reset(self) -> Dict[int, np.ndarray]:
         """Reset environment to initial state"""
+        # A new city and a new wind every episode, from the seeded global RNG
+        if self.city_params is not None:
+            cp = self.city_params
+            self.city = City(self.service_area, cp['built_up_ratio'], cp['buildings_per_km2'], cp['height_scale'])
+        if self.wind_params is not None:
+            self._draw_wind()
+
         # Initialize UAVs at random positions within service area
         self.uavs = {}
         for i in range(self.num_uavs):
@@ -509,6 +541,8 @@ class NetworkSlicingEnv:
             positions = self._separate_uavs(np.array([uav.position for uav in self.uavs.values()]))
             for uav, pos in zip(self.uavs.values(), positions):
                 uav.position = pos
+        for uav in self.uavs.values():
+            uav.position = self._apply_height_bounds(uav.position)
 
         # Episodes start with two active hotspots, so UEs are clustered from step 0
         self.hotspots = []
@@ -532,7 +566,10 @@ class NetworkSlicingEnv:
         self.demand_areas = {}
         self.da_counter = 0
         self.backhaul_load = {uav_id: 0.0 for uav_id in self.uavs}
-        
+        self.channel_draws = {}
+        self._sf_uav_positions = None
+        self._update_channel_state()
+
         # Perform initial UAV-UE association and DA formation
         self._associate_ues_to_uavs()
         self._form_demand_areas()
@@ -707,12 +744,17 @@ class NetworkSlicingEnv:
             if self.backhaul is not None:
                 obs.append(min(self.backhaul_load[uav_id], 2.0) / 2.0)
 
+            if self.wind_params is not None:
+                # Wind at the UAV's altitude, which the flight controller estimates
+                obs.extend(self._wind_at(uav.position[2]) / self.wind_params['max_speed'])
+
             observations[uav_id] = np.array(obs, dtype=np.float32)
             # print(f"UAV {uav_id} observations: {obs}")
-            
+
             # Sanity check
             expected_dims = 80 if self.num_uavs == 1 else 30 + 4 * (self.num_uavs - 1)
             expected_dims += self.backhaul is not None
+            expected_dims += 2 * (self.wind_params is not None)
             assert len(obs) == expected_dims, f"Expected {expected_dims} dims, got {len(obs)}"
 
         return observations
@@ -731,7 +773,12 @@ class NetworkSlicingEnv:
             delta_xy = action[:2] * uav.velocity_max * self.T_L
             max_delta_xy = uav.velocity_max * self.T_L
             delta_xy = delta_xy * min(1.0, max_delta_xy / max(np.linalg.norm(delta_xy), 1e-9))
-            delta_h = action[2] * self.velocity_max_vertical * self.T_L
+            if self.wind_params is not None:
+                # The commanded ground velocity is cut back so that the airspeed stays within velocity_max
+                delta_xy = self._limit_airspeed(delta_xy / self.T_L, self._wind_at(uav.position[2]),
+                                                uav.velocity_max) * self.T_L
+            vertical_rate = self.velocity_max_vertical if action[2] > 0 else self.velocity_max_descent
+            delta_h = action[2] * vertical_rate * self.T_L
             new_pos = uav.position + np.array([delta_xy[0], delta_xy[1], delta_h])
             # Constrain to service area
             new_pos[0] = np.clip(new_pos[0], self.uav_fly_range_x[0], self.uav_fly_range_x[1])
@@ -749,6 +796,10 @@ class NetworkSlicingEnv:
                 else:
                     self.uavs[uav_id].position = pos
 
+        # Rooftop clearance and the wind ceiling, after the separation push
+        for uav_id in new_positions:
+            new_positions[uav_id] = self._apply_height_bounds(new_positions[uav_id])
+
         for uav_id, action in actions.items():
             uav = self.uavs[uav_id]
             new_pos = new_positions[uav_id]
@@ -758,7 +809,12 @@ class NetworkSlicingEnv:
             v_y = (new_pos[1] - uav.position[1]) / self.T_L
             v_z = (new_pos[2] - uav.position[2]) / self.T_L
 
-            movement_energy = self._propulsion_power(np.hypot(v_x, v_y), v_z) * self.T_L
+            if self.wind_params is not None:
+                wind = self._wind_at((uav.position[2] + new_pos[2]) / 2.0)
+                airspeed = np.hypot(v_x - wind[0], v_y - wind[1])
+                movement_energy = self._propulsion_power(np.hypot(v_x, v_y), v_z, airspeed) * self.T_L
+            else:
+                movement_energy = self._propulsion_power(np.hypot(v_x, v_y), v_z) * self.T_L
 
             uav.position = new_pos
 
@@ -767,7 +823,7 @@ class NetworkSlicingEnv:
             uav.current_power = np.clip(action[3], self.min_power_ratio, 1) * uav.max_power
 
             # Energy consumption
-            transmission_energy = uav.current_power / self.energy_models['pa_efficiency'] * self.T_L
+            transmission_energy = self._radio_power(uav.current_power) * self.T_L
             uav.energy_used = {"movement": movement_energy, "transmission": transmission_energy}
             uav.current_battery -= sum(uav.energy_used.values())
             uav.current_battery = max(0, uav.current_battery)
@@ -780,6 +836,10 @@ class NetworkSlicingEnv:
 
         # Update UE dynamics
         self._update_ue_dynamics()
+
+        # New shadowing and LoS states for this step, shared by association and SINR
+        self.channel_draws = {}
+        self._update_channel_state()
 
         # Update associations and DAs (every long-term period)
         self._associate_ues_to_uavs()
@@ -853,9 +913,77 @@ class NetworkSlicingEnv:
             'min_uav_distance': self._min_uav_distance(),
             # Share of UAVs whose traffic exceeds their backhaul
             'backhaul_limited': sum(load > 1.0 for load in self.backhaul_load.values()) / self.num_uavs,
+            # Wind speed at the reference height (0 without wind)
+            'wind_speed': float(np.linalg.norm(self.wind_ref)),
         }
         
         return observations, reward, done, info
+
+    # ============================================
+    # WIND AND FLIGHT LIMITS
+    # ============================================
+
+    def _draw_wind(self):
+        """
+        Dai et al. (arXiv:2304.06909) Eq. 1-3: speed at the reference height from Weibull(scale, shape), power
+        law in height, direction from von Mises. The config gives the direction the wind blows FROM, clockwise
+        from north (as wind atlases do). A wind above the UAV's limit even at the lowest altitude is a no-fly
+        day: it is redrawn and counted in wind_rejections
+        """
+        w = self.wind_params
+        h_min = self.uav_fly_range_h[0]
+        while True:
+            v_ref = w['weibull_scale'] * np.random.weibull(w['weibull_shape'])
+            if 'direction_frequencies' in w:
+                # Measured wind rose: equal sectors clockwise from north, uniform within the drawn sector
+                freq = np.asarray(w['direction_frequencies'], dtype=np.float64)
+                width = 360.0 / len(freq)
+                sector = np.random.choice(len(freq), p=freq / freq.sum())
+                from_deg = sector * width + np.random.uniform(-width / 2.0, width / 2.0)
+            else:
+                from_deg = np.degrees(np.random.vonmises(np.radians(w['direction_from_deg']), w['direction_kappa']))
+            if v_ref * (h_min / w['reference_height']) ** w['exponent'] <= w['max_speed']:
+                break
+            self.wind_rejections += 1
+        to_rad = np.radians(from_deg + 180.0)  # bearing it blows towards
+        self.wind_ref = v_ref * np.array([np.sin(to_rad), np.cos(to_rad)])
+        if v_ref > 0:
+            self.wind_ceiling = w['reference_height'] * (w['max_speed'] / v_ref) ** (1.0 / w['exponent'])
+        else:
+            self.wind_ceiling = np.inf
+
+    def _wind_at(self, height: float) -> np.ndarray:
+        """Horizontal wind vector at a height, m/s; zero without a wind section"""
+        if self.wind_params is None:
+            return np.zeros(2)
+        w = self.wind_params
+        return self.wind_ref * (max(height, 1.0) / w['reference_height']) ** w['exponent']
+
+    @staticmethod
+    def _limit_airspeed(ground_velocity: np.ndarray, wind: np.ndarray, max_airspeed: float) -> np.ndarray:
+        """Shortest cut of the commanded ground velocity, same heading, with |v - wind| <= max_airspeed"""
+        speed = np.linalg.norm(ground_velocity)
+        if speed < 1e-9 or np.linalg.norm(ground_velocity - wind) <= max_airspeed:
+            return ground_velocity
+        u = ground_velocity / speed
+        along = u @ wind
+        reach = along + np.sqrt(max(along ** 2 - wind @ wind + max_airspeed ** 2, 0.0))
+        return u * min(speed, max(reach, 0.0))
+
+    def _apply_height_bounds(self, position: np.ndarray) -> np.ndarray:
+        """
+        Keep the UAV above max(min height, roof + clearance) at its spot, and below the wind ceiling (where the
+        wind reaches the UAV's limit). Rooftop clearance wins if the two conflict
+        """
+        lower, upper = self.uav_fly_range_h
+        if self.city is not None:
+            roof = self.city.roof_height(position[np.newaxis, :2])[0]
+            lower = max(lower, roof + self.city_params['roof_clearance'])
+        if self.wind_ceiling is not None:
+            upper = min(upper, self.wind_ceiling)
+        position = position.copy()
+        position[2] = max(min(position[2], upper), lower)
+        return position
 
     # ============================================
     # UAV SEPARATION METHODS
@@ -1279,7 +1407,7 @@ class NetworkSlicingEnv:
     # ============================================
 
     def _associate_ues_to_uavs(self):
-        """VECTORIZED: Associate UEs to nearest UAV with beam constraint"""
+        """Associate UEs to UAVs, by reference SNR with the 3GPP antenna, else to the nearest UAV in beam"""
         self.stats['handovers'] = 0
         self.stats['uncovered_ues'] = 0
         self.stats['covered_ues'] = 0
@@ -1292,6 +1420,46 @@ class NetworkSlicingEnv:
         if not active_ues:
             return
         
+        if self.antenna is not None:
+            self._associate_by_reference_snr(active_ues)
+        else:
+            self._associate_by_beam(active_ues)
+
+        # Handover tracking (existing code)
+        for ue in active_ues:
+            old_uav = previous_assignments.get(ue.id)
+            new_uav = ue.assigned_uav
+            if new_uav is None:
+                self.stats['uncovered_ues'] += 1
+            else:
+                self.stats['covered_ues'] += 1
+
+            handover_info = self.handover_tracker.check_handover(
+                ue.id, old_uav, new_uav, self.current_time
+            )
+
+            if not hasattr(ue, 'handover_penalty_ms'):
+                ue.handover_penalty_ms = 0.0
+
+            if handover_info['handover']:
+                ue.handover_penalty_ms = handover_info['delay_penalty_ms']
+                self.stats['handovers'] += 1
+            else:
+                ue.handover_penalty_ms = handover_info['delay_penalty_ms']
+
+    def _associate_by_reference_snr(self, active_ues: List[UE]):
+        """Strongest reference signal, covered if its SNR per RB at the UAV's power reaches the minimum"""
+        gains_db = self._link_gains_db(active_ues)  # (num_ues, num_uavs)
+        ref_power_dbw = 10.0 * np.log10([uav.current_power / self.total_rbs for uav in self.uavs.values()])
+        ref_snr_db = gains_db + ref_power_dbw[np.newaxis, :] - 10.0 * np.log10(self.noise_power)
+        best = np.argmax(ref_snr_db, axis=1)
+        uav_ids_list = list(self.uavs.keys())
+        min_snr_db = self.antenna['min_association_snr_db']
+        for i, ue in enumerate(active_ues):
+            ue.assigned_uav = uav_ids_list[best[i]] if ref_snr_db[i, best[i]] >= min_snr_db else None
+
+    def _associate_by_beam(self, active_ues: List[UE]):
+        """Nearest UAV whose beam cone contains the UE"""
         # Prepare arrays
         ue_positions = np.array([ue.position for ue in active_ues], dtype=np.float32)
         uav_positions = np.array([uav.position for uav in self.uavs.values()], dtype=np.float32)
@@ -1334,28 +1502,6 @@ class NetworkSlicingEnv:
                 ue.assigned_uav = uav_ids_list[best_uav_indices[i]]
             else:
                 ue.assigned_uav = None
-        
-        # Handover tracking (existing code)
-        for ue in active_ues:
-            old_uav = previous_assignments.get(ue.id)
-            new_uav = ue.assigned_uav
-            if new_uav is None:
-                self.stats['uncovered_ues'] += 1
-            else:
-                self.stats['covered_ues'] += 1
-
-            handover_info = self.handover_tracker.check_handover(
-                ue.id, old_uav, new_uav, self.current_time
-            )
-            
-            if not hasattr(ue, 'handover_penalty_ms'):
-                ue.handover_penalty_ms = 0.0
-            
-            if handover_info['handover']:
-                ue.handover_penalty_ms = handover_info['delay_penalty_ms']
-                self.stats['handovers'] += 1
-            else:
-                ue.handover_penalty_ms = handover_info['delay_penalty_ms']
 
     def _form_demand_areas(self):
         """OPTIMIZED: Cache UE-to-DA mapping to avoid repeated lookups"""
@@ -1598,16 +1744,176 @@ class NetworkSlicingEnv:
         #     ue_positions, uav_positions, uav_powers,
         #     serving_indices, self.noise_power, self.path_loss_exponent
         # )
-        sinr_db = calculate_sinr_batch_numba_a2g(ue_positions, uav_positions, uav_powers,
-            serving_indices, self.noise_power, self.carrier_frequency,
-            interference_powers, self.sidelobe_gain)
+        if self.antenna is not None:
+            sinr_db = self._sinr_db(calculation_list, uav_powers, serving_indices, interference_powers)
+        else:
+            sinr_db = calculate_sinr_batch_numba_a2g(ue_positions, uav_positions, uav_powers,
+                serving_indices, self.noise_power, self.carrier_frequency,
+                interference_powers, self.sidelobe_gain)
         
         # Fill cache
         for i, (ue_id, uav_id) in enumerate(zip(ue_ids, serving_uav_ids)):
             self.sinr_cache[(ue_id, uav_id)] = sinr_db[i]
         
         self.sinr_cache_valid = True
-    
+
+    def _link_gains_db(self, ues: List[UE]) -> np.ndarray:
+        """
+        Gain in dB of every UE-UAV link: UAV antenna gain minus path loss, shape (num_ues, num_uavs).
+        Path loss is Al-Hourani's A2G model (FSPL plus eta). With shadowing, the LoS state is drawn
+        from P_LoS and a log-normal term of TR 36.777 UMa-AV is added; without it, eta is its expectation.
+        """
+        ue_positions = np.array([ue.position for ue in ues], dtype=np.float64)
+        uav_positions = np.array([uav.position for uav in self.uavs.values()], dtype=np.float64)
+        diff = uav_positions[np.newaxis, :, :] - ue_positions[:, np.newaxis, :]
+        distance_2d = np.maximum(np.hypot(diff[..., 0], diff[..., 1]), 1e-6)
+        distance_3d = np.maximum(np.linalg.norm(diff, axis=2), 1.0)
+        elevation_deg = np.degrees(np.arctan(uav_positions[np.newaxis, :, 2] / distance_2d))
+
+        a2g = self.a2g
+        p_los = 1.0 / (1.0 + a2g['a'] * np.exp(np.clip(-a2g['b'] * (elevation_deg - a2g['a']), -20.0, 20.0)))
+        fspl_db = 20.0 * np.log10(distance_3d) + 20.0 * np.log10(self.carrier_frequency / 1e6) - 27.55
+        if self.city is not None:
+            # Geometric LoS state, correlated shadowing and O2I loss from _update_channel_state
+            los = np.array([ue.los for ue in ues])
+            shadow_db = np.array([ue.shadow_db for ue in ues])
+            o2i_db = np.array([ue.o2i_db for ue in ues])[:, np.newaxis]
+            path_loss_db = fspl_db + np.where(los, a2g['eta_los'], a2g['eta_nlos']) + shadow_db + o2i_db
+        elif self.shadowing is None:
+            path_loss_db = fspl_db + a2g['eta_los'] * p_los + a2g['eta_nlos'] * (1.0 - p_los)
+        else:
+            draws = [self._channel_draw(ue.id) for ue in ues]
+            uniform = np.array([d[0] for d in draws])
+            normal = np.array([d[1] for d in draws])
+            los = uniform < p_los
+            heights = uav_positions[np.newaxis, :, 2]
+            sigma_los = self.shadowing['sigma_los_scale'] * np.exp(-self.shadowing['sigma_los_decay'] * heights)
+            sigma = np.where(los, sigma_los, self.shadowing['sigma_nlos'])
+            path_loss_db = fspl_db + np.where(los, a2g['eta_los'], a2g['eta_nlos']) + sigma * normal
+
+        if self.antenna is None:
+            return -path_loss_db
+        # Element pattern of TR 38.901 Table 7.3-1 around the downward boresight
+        off_axis_deg = np.degrees(np.arccos(np.clip(diff[..., 2] / distance_3d, -1.0, 1.0)))
+        attenuation_db = np.minimum(12.0 * (off_axis_deg / self.antenna['beamwidth_3db']) ** 2,
+                                    self.antenna['max_attenuation_db'])
+        return self.antenna['max_gain_dbi'] - attenuation_db - path_loss_db
+
+    def _update_channel_state(self):
+        """
+        Per active UE and UAV, once a step, with the explicit city:
+        - LoS: the UE-UAV segment clears every building (City.line_of_sight).
+        - Indoor: the UE stands in a footprint. O2I loss of TR 38.901 Table 7.4.3-3 (single frequency < 6 GHz):
+          wall 20 dB plus 0.5 dB/m over d_2D-in ~ U(0, 25 m), drawn once per UE, with no extra spread.
+        - Shadowing: N(0, sigma^2) with sigma by state (TR 38.901 Table 7.4.1-1 UMa: LoS 4, NLoS 6 dB; Table
+          7.4.3-3: 7 dB indoor), exponentially correlated (ITU-R P.1816, TR 38.901 7.4.4) over the distance the
+          UE and the UAV moved since the last step, with the decorrelation distances of Table 7.5-6 (UMa).
+        - Rician K-factor of the LoS link, N(mean, std) dB (TR 38.901 Table 7.5-6 UMa), drawn once per UE.
+        """
+        if self.city is None:
+            return
+        active = [ue for ue in self.ues.values() if ue.is_active]
+        uav_positions = np.array([uav.position for uav in self.uavs.values()], dtype=np.float64)
+        n_uavs = len(uav_positions)
+        if self._sf_uav_positions is None:
+            self._sf_uav_positions = uav_positions.copy()
+        uav_moved = np.linalg.norm(uav_positions - self._sf_uav_positions, axis=1)
+        self._sf_uav_positions = uav_positions.copy()
+        if not active:
+            return
+
+        ue_positions = np.array([ue.position for ue in active], dtype=np.float64)
+        indoor = self.city.is_indoor(ue_positions[:, :2])
+        starts = np.repeat(ue_positions, n_uavs, axis=0)
+        ends = np.tile(uav_positions, (len(active), 1))
+        los = self.city.line_of_sight(starts, ends).reshape(len(active), n_uavs)
+
+        sh, o2i, ff = self.shadowing, self.o2i, self.fast_fading
+        for i, ue in enumerate(active):
+            if not hasattr(ue, 'shadow_z'):
+                ue.shadow_z = np.random.standard_normal(n_uavs)
+                ue.shadow_anchor = ue.position.copy()
+                ue.depth_in = np.random.uniform(0.0, o2i['max_indoor_distance'])
+                ue.k_factor_db = np.random.normal(ff['k_factor_mean_db'], ff['k_factor_std_db'], n_uavs) \
+                    if ff is not None else np.zeros(n_uavs)
+            else:
+                moved = np.linalg.norm(ue.position - ue.shadow_anchor) + uav_moved
+                ue.shadow_anchor = ue.position.copy()
+                if indoor[i]:
+                    d_cor = np.full(n_uavs, sh['decorrelation_o2i'])
+                else:
+                    d_cor = np.where(los[i], sh['decorrelation_los'], sh['decorrelation_nlos'])
+                rho = np.exp(-moved / d_cor)
+                ue.shadow_z = rho * ue.shadow_z + np.sqrt(1.0 - rho ** 2) * np.random.standard_normal(n_uavs)
+            if indoor[i]:
+                sigma = np.full(n_uavs, sh['sigma_o2i'])
+            else:
+                sigma = np.where(los[i], sh['sigma_los'], sh['sigma_nlos'])
+            ue.los = los[i]
+            ue.indoor = bool(indoor[i])
+            ue.shadow_db = sigma * ue.shadow_z
+            ue.o2i_db = o2i['wall_loss_db'] + o2i['indoor_loss_per_m'] * ue.depth_in if indoor[i] else 0.0
+
+    def _build_fading_table(self) -> Dict:
+        """
+        Mean spectral efficiency over fast fading, E[min(att * log2(1 + g * SINR), se_max)], tabulated over
+        the mean SINR and the Rician K-factor (unit-mean power gain g). Row K = -inf is Rayleigh. A step lasts
+        far longer than the coherence time, so the step's rate is this ergodic mean. Fixed-seed samples, so
+        the table is the same in every run and does not touch the global RNG
+        """
+        rng = np.random.default_rng(20261105)
+        n = 20000
+        scatter = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / np.sqrt(2.0)
+        sinr_db = np.arange(-10.0, 50.0 + 1e-9, 0.25)
+        k_db = np.arange(-10.0, 40.0 + 1e-9, 1.0)
+        sinr = 10.0 ** (sinr_db / 10.0)
+
+        def mean_se(gain):
+            se = np.minimum(self.shannon_attenuation * np.log2(1.0 + sinr[:, np.newaxis] * gain[np.newaxis, :]),
+                            self.max_spectral_efficiency)
+            return se.mean(axis=1)
+
+        rician = np.empty((len(k_db), len(sinr_db)))
+        for j, k in enumerate(10.0 ** (k_db / 10.0)):
+            gain = np.abs(np.sqrt(k / (k + 1.0)) + np.sqrt(1.0 / (k + 1.0)) * scatter) ** 2
+            rician[j] = mean_se(gain)
+        return {'sinr_db': sinr_db, 'k_db': k_db, 'rician': rician, 'rayleigh': mean_se(np.abs(scatter) ** 2)}
+
+    def _spectral_efficiency(self, sinr_db: float, ue: UE) -> float:
+        """Attenuated Shannon, capped; with fast fading, its mean over Rician (LoS outdoor) or Rayleigh fading"""
+        if self._se_table is None or self.city is None:
+            return min(self.shannon_attenuation * np.log2(1.0 + 10.0 ** (sinr_db * 0.1)),
+                       self.max_spectral_efficiency)
+        table = self._se_table
+        j = list(self.uavs.keys()).index(ue.assigned_uav)
+        if ue.los[j] and not ue.indoor:
+            k_db = table['k_db']
+            pos = (np.clip(ue.k_factor_db[j], k_db[0], k_db[-1]) - k_db[0]) / (k_db[1] - k_db[0])
+            lo = min(int(pos), len(k_db) - 2)
+            w = pos - lo
+            se_lo = np.interp(sinr_db, table['sinr_db'], table['rician'][lo])
+            se_hi = np.interp(sinr_db, table['sinr_db'], table['rician'][lo + 1])
+            return float((1.0 - w) * se_lo + w * se_hi)
+        return float(np.interp(sinr_db, table['sinr_db'], table['rayleigh']))
+
+    def _channel_draw(self, ue_id: int) -> Tuple[np.ndarray, np.ndarray]:
+        """This step's random numbers for the UE's links, drawn on first use"""
+        if ue_id not in self.channel_draws:
+            self.channel_draws[ue_id] = (np.random.uniform(size=self.num_uavs),
+                                         np.random.standard_normal(self.num_uavs))
+        return self.channel_draws[ue_id]
+
+    def _sinr_db(self, ues: List[UE], uav_powers: np.ndarray, serving_indices: np.ndarray,
+                 interference_powers: np.ndarray) -> np.ndarray:
+        """SINR per RB with the link gains of _link_gains_db, clipped like the numba path"""
+        gains = 10.0 ** (self._link_gains_db(ues) / 10.0)  # (num_ues, num_uavs)
+        rows = np.arange(len(ues))
+        signal = gains[rows, serving_indices] * uav_powers[serving_indices]
+        received = gains * interference_powers[np.newaxis, :]
+        interference = received.sum(axis=1) - received[rows, serving_indices]
+        sinr_db = 10.0 * np.log10(signal / (interference + self.noise_power) + 1e-10)
+        return np.clip(sinr_db, -10.0, 50.0).astype(np.float32)
+
     def _update_delay_cache(self):
         """
         Calculate ALL delays at once
@@ -1716,9 +2022,7 @@ class NetworkSlicingEnv:
             ue_throughput = 0.0
 
             sinr_db = self._get_cached_sinr(ue, self.uavs[ue.assigned_uav])
-            sinr_linear = 10.0 ** (sinr_db * 0.1)
-            spectral_efficiency = min(self.shannon_attenuation * np.log2(1.0 + sinr_linear),
-                                      self.max_spectral_efficiency)
+            spectral_efficiency = self._spectral_efficiency(sinr_db, ue)
             ue_throughput += self.rb_bandwidth * spectral_efficiency * len(ue.assigned_rb)  # in bps
             
             self.throughput_cache[ue.id] = ue_throughput
@@ -1729,20 +2033,53 @@ class NetworkSlicingEnv:
         self.throughput_cache_valid = True
 
     def _backhaul_capacity(self, uav: UAV) -> float:
-        """Capacity (bps) of the UAV's own band to the gateway, with the access link's A2G and rate models"""
+        """Capacity (bps) of the UAV's own band to the gateway"""
         delta = uav.position - self.backhaul_gateway
         distance_2d = max(np.hypot(delta[0], delta[1]), 1e-6)
         distance_3d = max(np.linalg.norm(delta), 1.0)
-        elevation_deg = np.degrees(np.arctan(abs(delta[2]) / distance_2d))
+        if getattr(self.backhaul, 'model', None) == 'mmwave':
+            p_los = None
+            if self.city is not None:
+                # Geometric LoS between the gateway (on a street at the area's edge) and the UAV
+                p_los = float(self.city.line_of_sight(self.backhaul_gateway[np.newaxis, :],
+                                                      uav.position[np.newaxis, :])[0])
+            return self._mmwave_backhaul_capacity(distance_2d, distance_3d, uav.position[2], p_los)
 
-        p_los = 1.0 / (1.0 + a * np.exp(np.clip(-b * (elevation_deg - a), -20.0, 20.0)))
+        # The access link's A2G and rate models
+        elevation_deg = np.degrees(np.arctan(abs(delta[2]) / distance_2d))
+        a2g = self.a2g
+        p_los = 1.0 / (1.0 + a2g['a'] * np.exp(np.clip(-a2g['b'] * (elevation_deg - a2g['a']), -20.0, 20.0)))
         fspl_db = 20.0 * np.log10(distance_3d) + 20.0 * np.log10(self.carrier_frequency / 1e6) - 27.55
-        path_loss_db = fspl_db + eta_los * p_los + eta_nlos * (1.0 - p_los)
+        path_loss_db = fspl_db + a2g['eta_los'] * p_los + a2g['eta_nlos'] * (1.0 - p_los)
 
         gain_db = self.backhaul.antenna_gain_db - path_loss_db
         snr = self.backhaul.tx_power * 10.0 ** (gain_db / 10.0) / self.backhaul_noise_power
         spectral_efficiency = min(self.shannon_attenuation * np.log2(1.0 + snr), self.max_spectral_efficiency)
         return self.backhaul.bandwidth * spectral_efficiency
+
+    def _mmwave_backhaul_capacity(self, distance_2d: float, distance_3d: float, uav_height: float,
+                                  p_los: Optional[float] = None) -> float:
+        """
+        mmWave backhaul of Galkin, Kibilda & DaSilva (arXiv:1710.10807): path loss c * d^-alpha with
+        alpha by LoS state, LoS probability of their Eq. 3 (ITU-R P.1410 buildings, both ends elevated).
+        The capacity is the mean over the LoS state of the attenuated Shannon rate. No fading, no interference.
+        """
+        bh = self.backhaul
+        h_gw = self.backhaul_gateway[2]
+        # Eq. 3: product over the buildings crossed, d_i = floor(r * sqrt(beta * delta)), r in km
+        n_buildings = int(np.floor(distance_2d / 1000.0 * np.sqrt(bh.buildings_per_km2 * bh.built_up_ratio)))
+        n = np.arange(max(0, n_buildings - 1) + 1) if n_buildings > 0 else np.arange(0)
+        clearance = max(uav_height, h_gw) - (n + 0.5) * abs(uav_height - h_gw) / max(n_buildings, 1)
+        if p_los is None:
+            p_los = float(np.prod(1.0 - np.exp(-clearance ** 2 / (2.0 * bh.building_height_scale ** 2))))
+
+        capacity = 0.0
+        for prob, alpha in ((p_los, bh.path_loss_exponent_los), (1.0 - p_los, bh.path_loss_exponent_nlos)):
+            path_loss_db = bh.path_loss_constant_db + 10.0 * alpha * np.log10(distance_3d)
+            snr = bh.tx_power * 10.0 ** ((bh.antenna_gain_db - path_loss_db) / 10.0) / bh.noise_power
+            spectral_efficiency = min(self.shannon_attenuation * np.log2(1.0 + snr), self.max_spectral_efficiency)
+            capacity += prob * bh.bandwidth * spectral_efficiency
+        return capacity
 
     def _apply_backhaul_limit(self):
         """
@@ -2241,23 +2578,54 @@ class NetworkSlicingEnv:
         }
         return weights[slice_type]
 
-    def _propulsion_power(self, v_h: float, v_z: float) -> float:
-        """Rotary-wing propulsion power in Watts (Zeng, Xu & Zhang 2019) plus climb power"""
+    def _propulsion_power(self, v_h: float, v_z: float, airspeed: Optional[float] = None) -> float:
+        """
+        Rotary-wing propulsion power in Watts plus climb power. Without airspeed: Zeng, Xu & Zhang 2019, Eq. 12.
+        With it (a wind section): Dai et al. Eq. 8 at zero acceleration. The drag 0.5 rho S_FP |v - v_w|^2,
+        with S_FP = d0 s A, adds to the thrust, T = |drag - m g|, and the parasite term uses the airspeed.
+        Blade-profile and induced power use the ground speed as in Dai et al., or the airspeed if
+        wind.rotor_speed is 'air'. With T = W they reduce to Zeng's P0 and Pi terms
+        """
         m = self.energy_models
         v0 = m['mean_induced_velocity']
-        blade = m['blade_profile_power'] * (1 + 3 * v_h**2 / m['rotor_tip_speed']**2)
-        induced = m['induced_power'] * np.sqrt(np.sqrt(1 + v_h**4 / (4 * v0**4)) - v_h**2 / (2 * v0**2))
-        parasite = 0.5 * m['fuselage_drag_ratio'] * m['air_density'] * m['rotor_solidity'] * m['rotor_disc_area'] * v_h**3
+        drag_coef = 0.5 * m['fuselage_drag_ratio'] * m['air_density'] * m['rotor_solidity'] * m['rotor_disc_area']
+        if airspeed is None:
+            thrust_ratio, v_rotor, v_air = 1.0, v_h, v_h
+        else:
+            v_air = airspeed
+            thrust_ratio = np.sqrt(1.0 + (drag_coef * v_air ** 2 / m['uav_weight']) ** 2)
+            rotor_on_air = 'rotor_speed' in self.wind_params and self.wind_params['rotor_speed'] == 'air'
+            v_rotor = v_air if rotor_on_air else v_h
+        r = thrust_ratio
+        blade = m['blade_profile_power'] * (r + 3 * v_rotor**2 / m['rotor_tip_speed']**2) * np.sqrt(r)
+        induced = m['induced_power'] * r * np.sqrt(np.sqrt(r**2 + v_rotor**4 / (4 * v0**4)) - v_rotor**2 / (2 * v0**2))
+        parasite = drag_coef * v_air**3
         climb = m['uav_weight'] * max(v_z, 0.0)  # Descent is not credited back
         return blade + induced + parasite + climb
 
+    def _radio_power(self, tx_power: float) -> float:
+        """
+        Power drawn by the radio for a total transmit power in Watts. With radio_static_power, the EARTH
+        linear model N_TRX * (P0 + dp * P_out) with the load shared by the TRXs: N_TRX * P0 + dp * P_tx.
+        Otherwise only the PA, P_tx / pa_efficiency
+        """
+        m = self.energy_models
+        if 'radio_static_power' in m:
+            return m['radio_static_power'] + m['radio_power_slope'] * tx_power
+        return tx_power / m['pa_efficiency']
+
     def _init_energy_bounds(self):
         """Lowest and highest total power draw, used to normalize the energy objective"""
-        level_flight = [self._propulsion_power(v, 0.0) for v in np.linspace(0.0, self.uav_params.velocity_max, 151)]
-        pa = self.energy_models['pa_efficiency']
-        self.min_total_power = min(level_flight) + self.min_power_ratio * self.uav_params.max_power / pa
+        speeds = np.linspace(0.0, self.uav_params.velocity_max, 69)
+        if self.wind_params is None:
+            level_flight = [self._propulsion_power(v, 0.0) for v in speeds]
+        else:
+            # Every ground speed and airspeed the wind limit allows: |ground - air| <= max wind speed
+            max_wind = self.wind_params['max_speed']
+            level_flight = [self._propulsion_power(v, 0.0, a) for v in speeds for a in speeds if abs(v - a) <= max_wind]
+        self.min_total_power = min(level_flight) + self._radio_power(self.min_power_ratio * self.uav_params.max_power)
         self.max_total_power = (max(level_flight) + self._propulsion_power(0.0, self.velocity_max_vertical)
-                                - self._propulsion_power(0.0, 0.0) + self.uav_params.max_power / pa)
+                                - self._propulsion_power(0.0, 0.0) + self._radio_power(self.uav_params.max_power))
 
     def _calculate_energy_consumption_penalty(self) -> float:
         """Average UAV power draw over T_L, min-max normalized to [0, 1]"""
@@ -2283,7 +2651,7 @@ class NetworkSlicingEnv:
         
         # Collect normalized throughputs
         throughputs = []
-        
+
         for ue in self.ues.values():
             if not ue.is_active:
                 continue
@@ -2291,8 +2659,14 @@ class NetworkSlicingEnv:
             # Uncovered UEs count with zero throughput, so dropping UEs can't raise fairness
             ue_throughput = self._get_cached_throughput(ue)
 
-            # Normalize
-            throughputs.append(ue_throughput / min_rates[ue.slice_type])
+            if self.fairness_metric == 'fraction_of_demand':
+                # Jain, Chiu & Hawe 1984, Sec. 5 item 6: x_i = min(a_i / d_i, 1), with the UE's offered
+                # load as its demand. Allocating more than the demand does not make the user any happier
+                pattern = self.traffic_patterns[ue.slice_type]
+                demand = pattern['packet_size'] * 8.0 * pattern['avg_arrival_rate']
+                throughputs.append(min(ue_throughput / demand, 1.0))
+            else:
+                throughputs.append(ue_throughput / min_rates[ue.slice_type])
         
         if not throughputs:
             return 0.0

@@ -4,11 +4,11 @@
 # Physical entities parameters
 system:
     num_uavs: 3   # MOMA-AC CTDE (config/train/moma_ac_ma3.yaml)
-    num_ues: 50  # Steady-state UE population (see ue_dynamics.arrival_rate)
+    num_ues: 150  # Steady-state UE population, 50 per UAV (see ue_dynamics.arrival_rate)
     service_area: [2000, 2000] # [width, height] in meters
     uav_fly_range_x: [0, 2000] # [min, max] radius from center in meters
     uav_fly_range_y: [0, 2000] # [min, max] radius from center in meters
-    uav_fly_range_h: [100, 400] # [min, max] height in meters (above the 120 m civil limit: assumes a dedicated-airspace UAV-BS)
+    uav_fly_range_h: [50, 120] # [min, max] height in meters: 120 m civil limit; 50 m clears dense-urban rooftops (Rayleigh scale 20 m)
     num_das_per_slice: 3
     min_uav_separation: 50.0 # meters, enforced in step (no reward penalty); absent or 0 = off
 
@@ -20,12 +20,36 @@ time:
 # Channel and propagation parameters
 channel:
     noise_psd_dbm_hz: -174.0 # Thermal noise density
-    noise_figure_db: 7.0 # UE receiver noise figure; noise per RB = PSD + NF + 10log10(rb_bandwidth)
+    noise_figure_db: 9.0 # UE receiver noise figure (3GPP TR 38.864 Table B-1, FR1); noise per RB = PSD + NF + 10log10(rb_bandwidth)
     carrier_frequency: 3.5e+9 # Hz (NR band n78, the band that carries 100 MHz at 30 kHz SCS)
     rb_bandwidth: 360e3 # Hz (12 subcarriers x 30 kHz)
     total_bandwidth: 98280000.0 # Hz per UAV (273 PRBs, the NR maximum for 100 MHz at 30 kHz SCS)
     shannon_attenuation: 0.75 # Attenuated Shannon: SE = min(alpha * log2(1 + SINR), se_max)
     max_spectral_efficiency: 7.4 # bps/Hz (256-QAM, CQI 15 of NR table 2)
+    # Log-normal shadowing, dB, by link state: 3GPP TR 38.901 Table 7.4.1-1 (UMa: LoS 4, NLoS 6) and Table 7.4.3-3
+    # (O2I < 6 GHz: 7). Exponentially correlated over the distance the UE and UAV move (TR 38.901 7.4.4, ITU-R
+    # P.1816), decorrelation distances of Table 7.5-6 (UMa). Measured A2G at 2.85 GHz, UAV at 150 m (Ao et al.,
+    # arXiv:2607.00541, Table IV): 4.54 / 5.43 dB. Used with the city section; without it, TR 36.777 UMa-AV
+    shadowing:
+        sigma_los: 4.0
+        sigma_nlos: 6.0
+        sigma_o2i: 7.0
+        decorrelation_los: 37.0 # m
+        decorrelation_nlos: 50.0 # m
+        decorrelation_o2i: 7.0 # m
+        sigma_los_scale: 4.64 # TR 36.777 Table B-3, only without the city section
+        sigma_los_decay: 0.0066 # 1/m
+    # Outdoor-to-indoor loss for UEs inside a footprint: TR 38.901 Table 7.4.3-3, the model for single-frequency
+    # simulations below 6 GHz: wall 20 dB, 0.5 dB per m of d_2D-in ~ U(0, 25 m), no extra spread
+    o2i:
+        wall_loss_db: 20.0
+        indoor_loss_per_m: 0.5
+        max_indoor_distance: 25.0 # m
+    # Fast fading, averaged over each step: Rician on outdoor LoS links with K ~ N(9, 3.5) dB (TR 38.901 Table
+    # 7.5-6 UMa LoS; measured A2G 9.16 +- 5.55 dB at 2.85 GHz, Ao et al. Table IV), Rayleigh otherwise (K N/A)
+    fast_fading:
+        k_factor_mean_db: 9.0
+        k_factor_std_db: 3.5
 
 # Quality of Service profiles for network slices
 qos_profiles:
@@ -69,20 +93,27 @@ qos_weights:
 
 # UAV constraints and capabilities
 uav_params:
-    max_power: 10.0 # Watts (40 dBm, shared across the allocated RBs)
-    battery_capacity: 800000.0 # Joules (~222 Wh, about one hour at hover + full power)
-    velocity_max: 15.0 # m/s maximum horizontal speed
-    velocity_max_vertical: 5.0 # m/s maximum climb/descent rate
-    initial_power: 5.0 # Initial power setting
-    initial_battery: 800000.0 # Initial battery level
-    beam_angle: 60.0 # degrees - Maximum beam angle (half-angle from vertical)
-    sidelobe_attenuation_db: 20.0 # dB, interference at UEs outside the interfering UAV's beam (assumed value)
+    max_power: 6.3 # Watts (38 dBm, Medium Range BS of 3GPP TS 38.104; EARTH micro BS), shared across the allocated RBs
+    battery_capacity: 1972800.0 # Joules (548 Wh: two DJI TB60 of the Matrice 300 RTK, about 22 min at hover + radio)
+    velocity_max: 17.0 # m/s maximum horizontal speed (DJI Matrice 300 RTK, P-mode)
+    velocity_max_vertical: 5.0 # m/s maximum climb rate (DJI Matrice 300 RTK, P-mode)
+    velocity_max_descent: 4.0 # m/s maximum descent rate (same)
+    initial_power: 3.15 # Watts, half of max_power until the first action
+    initial_battery: 1972800.0 # Initial battery level
+    beam_angle: 60.0 # degrees, only used without the antenna section
+    # Antenna element of 3GPP TR 38.901 Table 7.3-1, pointing down: G = 8 - min(12 (theta/65)^2, 30) dBi.
+    # A UE joins the UAV with the strongest reference signal if its SNR per RB reaches the minimum
+    antenna:
+        max_gain_dbi: 8.0
+        beamwidth_3db: 65.0 # degrees
+        max_attenuation_db: 30.0
+        min_association_snr_db: -6.0 # assumed, about the lowest NR CQI
     buffer_size: 1000000  # bits
     processing_delay_ms: 1.0 # gNB + UE processing per packet
 
 # User Equipment dynamics
 ue_dynamics:
-    arrival_rate: 0.167 # New UEs per second (num_ues / session_duration_avg keeps the population near num_ues)
+    arrival_rate: 0.5 # New UEs per second (num_ues / session_duration_avg keeps the population near num_ues)
     max_ues_multiplier: 1.5 # max_ues = num_ues * multiplier
     session_duration_avg: 300 # Average session duration in seconds (sets the per-step departure probability)
     max_initial_velocity: 2.0 # m/s
@@ -129,6 +160,10 @@ behavior:
     boundary_handling: "bounce" # How UEs handle boundaries: "bounce", "wrap", "stop"
     periodic_cleanup: true # Remove inactive UEs periodically
 
+# Fairness: Jain's index over active UEs with x_i = min(throughput / offered load, 1), the "fraction of
+# demand" metric of Jain, Chiu & Hawe 1984 (Sec. 5). Absent means throughput / slice min_rate, uncapped
+fairness_metric: fraction_of_demand
+
 # Reward function weights
 reward_weights:
     qos: 2.0 # QoS satisfaction weight
@@ -137,30 +172,72 @@ reward_weights:
 
 # Energy consumption models
 energy_models:
-    # Rotary-wing propulsion power (Zeng, Xu & Zhang 2019)
-    blade_profile_power: 79.86 # W, P0
-    induced_power: 88.63 # W, Pi
-    rotor_tip_speed: 120.0 # m/s
-    mean_induced_velocity: 4.03 # m/s, hover
-    fuselage_drag_ratio: 0.6
+    # Rotary-wing propulsion power (Zeng, Xu & Zhang 2019, Eq. 6), Table I of arXiv:1804.02238:
+    # W = 100 N, R = 0.5 m, Omega = 400 rad/s, delta = 0.012, k = 0.1. P0 and Pi follow from Eq. 61
+    blade_profile_power: 580.65 # W, P0
+    induced_power: 790.67 # W, Pi
+    rotor_tip_speed: 200.0 # m/s
+    mean_induced_velocity: 7.2 # m/s, hover
+    fuselage_drag_ratio: 0.3
     air_density: 1.225 # kg/m^3
     rotor_solidity: 0.05
-    rotor_disc_area: 0.503 # m^2
-    uav_weight: 20.0 # N, sets the climb power W * v_z
-    # Transmit chain
-    pa_efficiency: 0.25 # Drawn power = P_tx / pa_efficiency
+    rotor_disc_area: 0.79 # m^2
+    uav_weight: 100.0 # N, sets the climb power W * v_z
+    # Radio: EARTH D2.3 micro BS (Eq. 4-3, Table 8), N_TRX = 2, P0 = 56 W, dp = 2.6, load shared by the TRXs
+    radio_static_power: 112.0 # W, N_TRX * P0
+    radio_power_slope: 2.6 # dp
 
-# Air to ground channel model
+# Air to ground channel model: Al-Hourani et al. 2014, dense urban (alpha 0.5, beta 300, gamma 20).
+# a and b from the polynomials of Tables I-II, eta from Section III (measured at 2 GHz)
 a2g:
-    a: 4.88
-    b: 0.43
-    eta_los: 0.1 # dB
-    eta_nlos: 21.0 # dB
+    a: 12.08
+    b: 0.11
+    eta_los: 1.6 # dB
+    eta_nlos: 23.0 # dB
 
 # Wireless backhaul: each UAV has its own band to one ground gateway, out of band with the access links.
-# Assumed values, picked by sweep: the limit binds for spread-out teams without choking the network
+# mmWave of Galkin, Kibilda & DaSilva (arXiv:1710.10807, Table I). One gateway, not their network of them
 backhaul:
-    gateway_position: [1000.0, 0.0, 30.0] # meters, x y h: edge of the service area
-    bandwidth: 20000000.0 # Hz per UAV
-    tx_power: 1.0 # Watts (not added to the energy objective)
-    antenna_gain_db: 0.0 # dB, total of both ends
+    model: mmwave
+    gateway_position: [1000.0, 0.0, 30.0] # meters, x y h: edge of the service area, GS height 30 m
+    bandwidth: 1000000000.0 # Hz per UAV
+    tx_power: 10.0 # Watts (not added to the energy objective)
+    antenna_gain_db: 64.2 # dB: UAV 16 pi / omega^2 at omega = 10 deg (32.2) plus ground station (32)
+    path_loss_constant_db: 69.7 # c at 73 GHz
+    path_loss_exponent_los: 2.0
+    path_loss_exponent_nlos: 3.5
+    noise_power: 4.0e-11 # Watts over the band
+    buildings_per_km2: 300.0 # beta
+    built_up_ratio: 0.5 # delta
+    building_height_scale: 20.0 # m, kappa (Rayleigh)
+
+# Explicit city of ITU-R P.1410-6 (Sec. 2.1.4-2.1.5), the parameters of the a2g section (dense urban): grid pitch
+# 1000/sqrt(beta) = 57.7 m, footprint 1000 sqrt(alpha/beta) = 40.8 m, streets 16.9 m, Rayleigh heights (mode
+# gamma). Regenerated each episode. LoS of access and backhaul links is geometric; UAVs keep roof_clearance
+# (assumed) above the roof under them
+city:
+    built_up_ratio: 0.5 # alpha
+    buildings_per_km2: 300.0 # beta
+    height_scale: 20.0 # m, gamma
+    roof_clearance: 10.0 # m, assumed
+
+# Horizontal wind, drawn once per episode (Dai et al., arXiv:2304.06909, Eq. 1-3): speed at reference_height from
+# Weibull(scale, shape), times (h / reference_height)^exponent (city range 0.4-0.6; Dai uses 0.5 and 50 m).
+# Hanoi: Global Wind Atlas (globalwindatlas.info), Tay Ho district, whole-area mean at 50 m: 4.35 m/s and
+# 85 W/m^2, giving shape ~2.2 and scale ~4.9 m/s from the energy pattern factor (rho 1.18-1.225). Check: 4.35 m/s
+# brought down to 10 m with exponent 0.5 is 1.95 m/s, the 1.9 m/s annual mean measured at Lang station.
+# Direction: the annual wind rose of Lang station (Hanoi), 1957-2000, 16 sectors the wind blows FROM, N first,
+# clockwise; occurrence % without calms (19.5 %), JICA Study Team, Appendix 14 Table A14.2.2.
+# max_speed is the DJI M300 RTK's wind resistance: the UAV stays below the height where the wind reaches it,
+# and an episode whose wind exceeds it even at the lowest altitude is redrawn. Airspeed is capped at velocity_max
+wind:
+    weibull_scale: 4.9 # m/s at reference_height
+    weibull_shape: 2.2
+    reference_height: 50.0 # m
+    exponent: 0.5
+    direction_frequencies: [5.88, 4.65, 11.76, 2.16, 6.73, 6.17, 21.92, 3.86, 3.75, 0.68, 1.74, 0.32, 2.45, 1.55, 5.22, 1.64]
+    max_speed: 12.0 # m/s
+    # Rotor (blade-profile and induced) power at the airspeed: aerodynamics depend on the air-relative velocity
+    # (wind-tunnel tests hold the vehicle still in the flow, Russell et al., AHS Forum 2016). Dai et al. Eq. 8 uses
+    # the ground speed ('ground'), so that hovering in wind costs almost nothing extra
+    rotor_speed: air

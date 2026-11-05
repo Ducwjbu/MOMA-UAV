@@ -28,14 +28,15 @@ def formation_positions(env, radius: float) -> np.ndarray:
                      np.full(3, float(env.uav_fly_range_h[1]))], axis=1)
 
 
-def evaluate(env, positions: np.ndarray, power: float, n_episodes: int, steps: int, n_omega: int) -> dict:
+def evaluate(env, positions: np.ndarray, power: float, n_episodes: int, steps: int, n_omega: int,
+             seed_base: int = EVAL_SEED) -> dict:
     # No movement, one power level, bandwidth split evenly across the 9 DAs
     action = np.concatenate([np.zeros(3), [power], np.full(9, 1.0 / 9.0)]).astype(np.float32)
 
     rng_state = np.random.get_state()
     rewards, episodes = [], []
     for ep in range(n_episodes):
-        np.random.seed(EVAL_SEED + ep)
+        np.random.seed(seed_base + ep)
         env.reset()
         for uav, pos in zip(env.uavs.values(), positions):
             uav.position = pos.copy()
@@ -75,7 +76,7 @@ if __name__ == "__main__":
     parser.add_argument("--radius", type=float, default=600.0, help="Distance from the center to each UAV (m)")
     parser.add_argument("--power", type=float, default=0.5, help="Transmit power as a fraction of max_power")
     parser.add_argument("--n_episodes", type=int, default=3)
-    parser.add_argument("--steps", type=int, default=60)
+    parser.add_argument("--steps", type=int, default=20, help="Episode length, eval_steps of moma_ac_ma3.yaml")
     parser.add_argument("--n_omega", type=int, default=30)
     parser.add_argument("--out", default="formation_baseline.csv")
     args = parser.parse_args()
