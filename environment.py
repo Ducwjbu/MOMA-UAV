@@ -1198,7 +1198,7 @@ class NetworkSlicingEnv:
         for i, ue in enumerate(active_ues):
             current_speed = np.linalg.norm(ue.velocity[:2])
             
-            if current_speed > 0 and np.any(hotspot_pulls[i]):
+            if current_speed > 0 and np.any(hotspot_pulls[i]) and self.city is None:
                 # Blend velocity with hotspot pull
                 ue.velocity[:2] = (
                     (1 - self.hotspot_attraction_strength) * ue.velocity[:2] +
@@ -1229,7 +1229,16 @@ class NetworkSlicingEnv:
         
         # Apply direction changes
         for i, ue in enumerate(active_ues):
-            if direction_changes[i]:
+            if direction_changes[i] and self.city is not None:
+                speed = np.linalg.norm(ue.velocity[:2])
+                if speed > 0:
+                    # Turn into another street: a perpendicular one is entered at the nearest crossing
+                    d = [np.array([1.0, 0.0]), np.array([-1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.0, -1.0])][np.random.randint(4)]
+                    if not any(np.allclose(d, a) for a in self._street_directions(ue.position[:2])):
+                        ue.position[:2] = np.clip(np.round(ue.position[:2] / self.city.pitch) * self.city.pitch,
+                                                  0.0, self.service_area)
+                    ue.velocity[:2] = speed * d
+            elif direction_changes[i]:
                 speed = np.linalg.norm(ue.velocity[:2])
                 if speed > 0:
                     new_direction = np.random.uniform(0, 2 * np.pi)
@@ -1393,15 +1402,38 @@ class NetworkSlicingEnv:
         # ============================================
         # Create UE with reused/new ID
         # ============================================
+        z = 0.0
+        if self.city is not None:
+            # A UE in a footprint is indoor and stays put; outdoors it is a pedestrian walking along the street
+            # at pedestrian_speed (TR 38.901 Table 7.2-1: 3 km/h). Height ue_height (Table 7.4.1-1: 1.5 m)
+            z = self.ue_dynamics['ue_height']
+            directions = self._street_directions(np.array([x, y]))
+            if not directions:
+                velocity_x = velocity_y = 0.0
+            else:
+                d = directions[np.random.randint(len(directions))]
+                velocity_x, velocity_y = self.ue_dynamics['pedestrian_speed'] * d
         new_ue = UE(
             id=new_ue_id,  # Reused or new ID
-            position=np.array([x, y, 0.0]),
+            position=np.array([x, y, z]),
             slice_type=slice_type,
             velocity=np.array([velocity_x, velocity_y, 0.0]),
             is_active=True
         )
         
         self.ues[new_ue_id] = new_ue
+
+    def _street_directions(self, xy: np.ndarray) -> List[np.ndarray]:
+        """Unit directions a pedestrian at xy can walk: along a north-south street +-y, along an east-west street
+        +-x, all four at a crossing, none inside a footprint"""
+        local = xy - np.floor(xy / self.city.pitch) * self.city.pitch
+        in_street = (local < self.city.offset) | (local >= self.city.offset + self.city.width)
+        directions = []
+        if in_street[0]:  # x lies in a north-south street
+            directions += [np.array([0.0, 1.0]), np.array([0.0, -1.0])]
+        if in_street[1]:
+            directions += [np.array([1.0, 0.0]), np.array([-1.0, 0.0])]
+        return directions
 
     def _update_uavs_queuing_stats(self):
         '''Calculate the average queuing delay that UEs experience at their associated UAVs at each T_L period'''

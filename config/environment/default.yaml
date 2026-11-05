@@ -127,6 +127,9 @@ ue_dynamics:
         stationary:
             speed: 0.0 # m/s
             probability: 0.2
+    # With the city section: outdoor UEs walk along the streets, indoor UEs are stationary
+    pedestrian_speed: 0.833 # m/s, 3 km/h, TR 38.901 Table 7.2-1 (UMa)
+    ue_height: 1.5 # m, TR 38.901 Table 7.4.1-1 default h_UT
     change_direction_prob: 0.3 # Probability of changing direction per large time-scale step
 
 # Traffic per slice, as the mean over each 60 s step:
