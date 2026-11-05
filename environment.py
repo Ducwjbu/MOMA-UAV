@@ -459,6 +459,17 @@ class NetworkSlicingEnv:
 
         #Traffic model
         self.traffic_patterns = env_config.traffic_patterns
+        tp = self.traffic_patterns
+        # Mean mMTC packet: Pareto(shape, min) payload capped at payload_cap (TR 45.820 Annex E), plus overhead.
+        # E[min(X, c)] = E[X] - E[(X - c)+] with E[X] = a m / (a - 1), E[(X - c)+] = m^a / ((a - 1) c^(a - 1))
+        a, m, c = tp.mmtc.pareto_shape, tp.mmtc.payload_min, tp.mmtc.payload_cap
+        mmtc_payload = a * m / (a - 1.0) - m ** a / ((a - 1.0) * c ** (a - 1.0))
+        self.packet_bytes = {'embb': tp.embb.packet_size, 'urllc': tp.urllc.packet_size,
+                             'mmtc': mmtc_payload + tp.mmtc.overhead}
+        # Reports per second per device: mix of periodicities
+        self.mmtc_report_rate = float(np.dot(tp.mmtc.report_interval_probs, 1.0 / np.array(tp.mmtc.report_intervals_s)))
+        # Road-side units (URLLC): fixed, at intersections of a road grid (TR 36.885 Annex A.1.2-A.1.3)
+        self.rsu_params = getattr(env_config, 'rsu', None)
 
         # Distance thresholds for forming Demand Areas
         self.da_distance_thresholds = env_config.da_distance_thresholds
@@ -561,7 +572,8 @@ class NetworkSlicingEnv:
 
         for i in range(self.num_ues):
             self._add_new_ue()
-        
+        self._add_rsus()
+
         # Initialize demand areas
         self.demand_areas = {}
         self.da_counter = 0
@@ -1229,7 +1241,7 @@ class NetworkSlicingEnv:
         # ============================================
         departed_ues = []
         for i, ue in enumerate(active_ues):
-            if departures[i]:
+            if departures[i] and not getattr(ue, 'fixed', False):
                 ue.is_active = False
                 self.stats['departures'] += 1
                 departed_ues.append(ue.id)
@@ -1246,25 +1258,60 @@ class NetworkSlicingEnv:
         self._handle_arrivals()
 
     def _update_ue_traffic_patterns(self):
-
-        for ue_id, ue in self.ues.items():
+        """
+        This step's offered traffic of every active UE, as the mean over the step (the packet-level models of
+        TR 38.812 are far finer than a 60 s step):
+        - eMBB: active with probability activity_factor, then peak_rate (TS 22.261 Table 7.1-1, urban macro:
+          50 Mbps experienced rate, activity factor 20 %); otherwise no demand this step.
+        - URLLC (road-side units): rate continuously (TS 22.261 Table 7.2.3.2-1: 10 Mbps, small packets).
+        - mMTC: periodic reports (TR 45.820 Annex E), a mean of mmtc_report_rate packets per second.
+        A UE without demand gets no RBs and does not count in QoS or fairness
+        """
+        tp = self.traffic_patterns
+        for ue in self.ues.values():
             if not ue.is_active:
-                ue.traffic_pattern = None
                 continue
+            ue.packet_bytes = self.packet_bytes[ue.slice_type]
+            if ue.slice_type == 'embb':
+                ue.demand_bps = tp.embb.peak_rate if np.random.random() < tp.embb.activity_factor else 0.0
+            elif ue.slice_type == 'urllc':
+                ue.demand_bps = tp.urllc.rate
+            else:
+                ue.demand_bps = self.mmtc_report_rate * ue.packet_bytes * 8.0
+            ue.packet_rate = ue.demand_bps / (ue.packet_bytes * 8.0)
 
-            elif ue.assigned_uav is None: # UE not assigned to any UAV
-                ue.traffic_pattern = [0 for _ in range(int(self.T_L))]
-                continue
-
-            elif ue.traffic_pattern is not None:
-                continue  # Already has a traffic pattern
-            
-            avg_arrival_rate = self.traffic_patterns[ue.slice_type]['avg_arrival_rate']
-            ue.traffic_pattern = [np.random.poisson(avg_arrival_rate) for _ in range(int(self.T_L))]
+    def _add_rsus(self):
+        """
+        URLLC users are road-side infrastructure of an ITS (TS 22.261 Sec. 7.2.3.2, wireless road-side
+        infrastructure backhaul): stationary, "deployed alongside streets ... every 1-2 km". The streets are the
+        TR 36.885 urban road grid (Annex A.1.2: blocks of 433 m x 250 m), centred in the area; RSUs sit every
+        `spacing` m along it, antenna at 5 m (TR 36.885 A.1.4). With the city, each RSU moves to the nearest
+        street crossing of the building grid
+        """
+        if self.rsu_params is None:
+            return
+        rp = self.rsu_params
+        gx, gy = rp['block_size']
+        width, height = self.service_area
+        # Road segments as (start, direction, length): north-south roads at x = gx/2 + k gx, east-west at y = ...
+        roads = [(np.array([x, 0.0]), np.array([0.0, 1.0]), height) for x in np.arange(gx / 2.0, width, gx)]
+        roads += [(np.array([0.0, y]), np.array([1.0, 0.0]), width) for y in np.arange(gy / 2.0, height, gy)]
+        total = sum(length for _, _, length in roads)
+        spacing = rp['spacing']
+        targets = np.arange(spacing / 2.0, total, spacing)  # arc-length positions along the joined roads
+        start_of = np.cumsum([0.0] + [length for _, _, length in roads])
+        for s in targets:
+            k = np.searchsorted(start_of, s, side='right') - 1
+            origin, direction, _ = roads[k]
+            pos = np.array([*(origin + direction * (s - start_of[k])), rp['antenna_height']])
+            if self.city is not None:
+                pos[:2] = np.clip(np.round(pos[:2] / self.city.pitch) * self.city.pitch, 0.0, self.service_area)
+            self._add_new_ue(slice_type='urllc', position=pos, fixed=True)
 
     def _handle_arrivals(self):
         """Separate function for handling arrivals (cleaner code)"""
-        active_ue_count = len([ue for ue in self.ues.values() if ue.is_active])
+        # RSUs are fixed infrastructure, outside the arriving and departing population
+        active_ue_count = len([ue for ue in self.ues.values() if ue.is_active and not getattr(ue, 'fixed', False)])
         expected_arrivals = self.ue_arrival_rate * self.T_L
         num_arrivals = min(
             np.random.poisson(expected_arrivals),
@@ -1275,8 +1322,21 @@ class NetworkSlicingEnv:
             self._add_new_ue()
             self.stats['arrivals'] += 1
 
-    def _add_new_ue(self):
-        """Add a new UE to the network - spawn near active hotspots WITH ID REUSE"""
+    def _add_new_ue(self, slice_type: Optional[str] = None, position: Optional[np.ndarray] = None,
+                    fixed: bool = False):
+        """Add a new UE to the network - spawn near active hotspots WITH ID REUSE. A fixed UE (an RSU) is
+        placed at `position`, never moves and never departs"""
+        if fixed:
+            if self.ue_id_pool:
+                new_ue_id = self.ue_id_pool.pop()
+            else:
+                new_ue_id = self.next_ue_id
+                self.next_ue_id += 1
+            ue = UE(id=new_ue_id, position=np.asarray(position, dtype=np.float64), slice_type=slice_type,
+                    velocity=np.zeros(3), is_active=True)
+            ue.fixed = True
+            self.ues[new_ue_id] = ue
+            return
         
         # ============================================
         # Get UE ID (reuse from pool if available)
@@ -1348,12 +1408,14 @@ class NetworkSlicingEnv:
         for uav in self.uavs.values():
 
             # Average packet size (bytes)
-            packet_sizes = [self.traffic_patterns[ue.slice_type]['packet_size'] for ue in self.ues.values() if ue.assigned_uav == uav.id and ue.is_active]
+            served = [ue for ue in self.ues.values()
+                      if ue.assigned_uav == uav.id and ue.is_active and getattr(ue, 'packet_rate', 0.0) > 0]
+            packet_sizes = [ue.packet_bytes for ue in served]
             avg_packet_size = np.mean(packet_sizes) if packet_sizes else 0.0
 
             
             # Cummulative arrival rate (packets/sec)
-            arrival_rates = [self.traffic_patterns[ue.slice_type]['avg_arrival_rate'] for ue in self.ues.values() if ue.assigned_uav == uav.id and ue.is_active]
+            arrival_rates = [ue.packet_rate for ue in served]
             uav_arrival_rate = np.sum(arrival_rates) if arrival_rates else 0.0
             
             # Cummulative service rate (packets/sec)
@@ -1944,7 +2006,7 @@ class NetworkSlicingEnv:
         # Transmission delays
         # ========================
 
-        packet_size_bits = np.array([self.traffic_patterns[ue.slice_type]['packet_size'] * 8 for _, ue in active_ues], dtype=np.float32)
+        packet_size_bits = np.array([ue.packet_bytes * 8 for _, ue in active_ues], dtype=np.float32)
         throughputs = np.array([np.clip(self._get_cached_throughput(ue), 0.1, None) for _, ue in active_ues], dtype=np.float32)
         t_trans = packet_size_bits / throughputs * 1000  # ms
 
@@ -2091,9 +2153,7 @@ class NetworkSlicingEnv:
         carried = defaultdict(dict)
         for ue in self.ues.values():
             if ue.is_active and ue.assigned_uav is not None:
-                pattern = self.traffic_patterns[ue.slice_type]
-                offered = pattern['packet_size'] * 8.0 * pattern['avg_arrival_rate']
-                carried[ue.assigned_uav][ue.id] = min(self.throughput_cache[ue.id], offered)
+                carried[ue.assigned_uav][ue.id] = min(self.throughput_cache[ue.id], getattr(ue, 'demand_bps', 0.0))
 
         for uav_id, uav in self.uavs.items():
             total = sum(carried[uav_id].values())
@@ -2182,7 +2242,7 @@ class NetworkSlicingEnv:
 
         uav = self.uavs[ue.assigned_uav]
         avg_sinr_db = self._get_cached_sinr(ue, uav)
-        packet_size_bytes = self.traffic_patterns[ue.slice_type]['packet_size']
+        packet_size_bytes = ue.packet_bytes
 
 
         # Approximate BLER curve
@@ -2284,15 +2344,18 @@ class NetworkSlicingEnv:
         active_ues = {ue_id: ue for ue_id, ue in self.ues.items() if ue.is_active}
         
         for da in self.demand_areas.values():
-            if not da.user_ids or not da.RB_ids_list:
+            # The scheduler serves only UEs with traffic this step (an idle eMBB UE gets nothing)
+            users = [ue_id for ue_id in da.user_ids
+                     if ue_id in active_ues and getattr(active_ues[ue_id], 'demand_bps', 0.0) > 0]
+            if not users or not da.RB_ids_list:
                 continue
             
-            num_users = len(da.user_ids)
+            num_users = len(users)
             uav = self.uavs[da.uav_id]
             
             # Round-robin assignment
             for i, rb_id in enumerate(da.RB_ids_list):
-                ue_id = da.user_ids[i % num_users]
+                ue_id = users[i % num_users]
                 rb = uav.RBs[rb_id]
                 rb.allocated_ue_id = ue_id
                 
@@ -2402,12 +2465,14 @@ class NetworkSlicingEnv:
         # ============================================
         # Collect metrics for all active UEs
         # ============================================
+        slice_of_ue = []
         for ue in self.ues.values():
-            if not ue.is_active:
-                continue
+            if not ue.is_active or getattr(ue, 'demand_bps', 0.0) <= 0:
+                continue  # an idle eMBB UE has no demand this step
             
             # Slice weight of UE
             slice_weight_per_ue.append(self.slice_weights[ue.slice_type])
+            slice_of_ue.append(ue.slice_type)
 
             # Calculate individual QoS components
             throughput_sat, ue_throughput = self._calculate_throughput_satisfaction(ue)
@@ -2432,9 +2497,16 @@ class NetworkSlicingEnv:
         # Aggregate QoS reward across all DAs
         # ============================================
 
-        slice_weight_per_ue = np.array(slice_weight_per_ue, dtype=np.float64)
+        # Mean within each slice, then the slice weights over the slices present: how many UEs a slice has
+        # sets its load, not its share of the objective
         overall_satisfactions = np.array(overall_satisfactions, dtype=np.float64)
-        qos_reward = np.sum(slice_weight_per_ue * overall_satisfactions) / np.sum(slice_weight_per_ue)
+        slice_of_ue = np.array(slice_of_ue)
+        present = [st for st in ('embb', 'urllc', 'mmtc') if np.any(slice_of_ue == st)]
+        if present:
+            qos_reward = sum(self.slice_weights[st] * overall_satisfactions[slice_of_ue == st].mean() for st in present)
+            qos_reward /= sum(self.slice_weights[st] for st in present)
+        else:
+            qos_reward = 0.0
 
         breakdown = {
             'avg_throughput_sat': np.mean(throughput_sats) if len(throughput_sats) > 0 else 0.0,
@@ -2458,9 +2530,10 @@ class NetworkSlicingEnv:
         # Calculate total throughput across all RBs
         ue_throughput = self._get_cached_throughput(ue)
         
-        # Normalize by minimum required rate
+        # Normalize by minimum required rate. mMTC reports (tens of bytes every hour or so) need no rate:
+        # its throughput term is whether the device is served at all
         min_rate = self.qos_profiles[ue.slice_type].min_rate
-        satisfaction = min(ue_throughput / min_rate, 1.0)
+        satisfaction = 1.0 if min_rate <= 0 else min(ue_throughput / min_rate, 1.0)
 
         ue.throughput_satisfaction = satisfaction
         ue.throughput = ue_throughput
@@ -2653,8 +2726,8 @@ class NetworkSlicingEnv:
         throughputs = []
 
         for ue in self.ues.values():
-            if not ue.is_active:
-                continue
+            if not ue.is_active or getattr(ue, 'demand_bps', 0.0) <= 0:
+                continue  # an idle eMBB UE has no demand this step
 
             # Uncovered UEs count with zero throughput, so dropping UEs can't raise fairness
             ue_throughput = self._get_cached_throughput(ue)
@@ -2662,9 +2735,7 @@ class NetworkSlicingEnv:
             if self.fairness_metric == 'fraction_of_demand':
                 # Jain, Chiu & Hawe 1984, Sec. 5 item 6: x_i = min(a_i / d_i, 1), with the UE's offered
                 # load as its demand. Allocating more than the demand does not make the user any happier
-                pattern = self.traffic_patterns[ue.slice_type]
-                demand = pattern['packet_size'] * 8.0 * pattern['avg_arrival_rate']
-                throughputs.append(min(ue_throughput / demand, 1.0))
+                throughputs.append(min(ue_throughput / ue.demand_bps, 1.0))
             else:
                 throughputs.append(ue_throughput / min_rates[ue.slice_type])
         

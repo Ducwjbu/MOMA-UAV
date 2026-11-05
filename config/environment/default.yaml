@@ -4,10 +4,10 @@
 # Physical entities parameters
 system:
     num_uavs: 1   # Single UAV: the sampling variants. config/environment/ma3.yaml is the same env with 3 UAVs
-    num_ues: 50  # Steady-state UE population (see ue_dynamics.arrival_rate)
-    service_area: [2000, 2000] # [width, height] in meters
-    uav_fly_range_x: [0, 2000] # [min, max] radius from center in meters
-    uav_fly_range_y: [0, 2000] # [min, max] radius from center in meters
+    num_ues: 32  # Arriving/departing UEs: 12 eMBB + 20 mMTC (slicing.slice_probabilities); RSUs come on top
+    service_area: [1155, 1155] # [width, height] in meters: a third of ma3's area, so load per UAV matches
+    uav_fly_range_x: [0, 1155] # [min, max] radius from center in meters
+    uav_fly_range_y: [0, 1155] # [min, max] radius from center in meters
     uav_fly_range_h: [50, 120] # [min, max] height in meters: 120 m civil limit; 50 m clears dense-urban rooftops (Rayleigh scale 20 m)
     num_das_per_slice: 3
 
@@ -53,25 +53,26 @@ channel:
 # Quality of Service profiles for network slices
 qos_profiles:
     embb: # Enhanced Mobile Broadband (slice_type: 1)
-        min_rate: 10e6 # bps
-        max_latency: 10.0 # ms
-        min_reliability: 0.99
-    urllc: # Ultra-Reliable Low-Latency Communications (slice_type: 2)
-        min_rate: 2e6
-        max_latency: 5.0 # end-to-end over the UAV hop (1 ms would be below the processing delay)
-        min_reliability: 0.9999
+        min_rate: 50e6 # bps, experienced DL rate, TS 22.261 Table 7.1-1 (urban macro)
+        max_latency: 10.0 # ms, kept from v0 (design)
+        min_reliability: 0.99 # kept from v0 (design)
+    urllc: # Road-side units of an ITS, TS 22.261 Table 7.2.3.2-1 (wireless road-side infrastructure backhaul)
+        min_rate: 10e6
+        max_latency: 30.0 # ms
+        min_reliability: 0.99999
     mmtc: # Massive Machine-Type Communications (slice_type: 3)
-        min_rate: 1e5
-        max_latency: 100.0
-        min_reliability: 0.95
+        min_rate: 0.0 # no rate requirement: the throughput term is whether the device is served
+        max_latency: 10000.0 # ms, TR 38.913 Sec. 7.6 (infrequent small packets: 10 s uplink)
+        min_reliability: 0.95 # kept from v0 (design)
 
-# Network slice parameters
+# Network slice parameters. URLLC users are the fixed RSUs of the rsu section, so arriving UEs are eMBB or mMTC.
+# The QoS objective averages within each slice and then weights the slices, so counts set load, not priority
 slicing:
     slice_probabilities:
-        embb: 0.4
-        urllc: 0.3
-        mmtc: 0.3
-    slice_weights:
+        embb: 0.375 # 12 eMBB UEs: with the 90 Mbps of the RSUs, mean offered load = fleet capacity
+        urllc: 0.0 # (208 Mbps, 1 UAV hovering at full power, all RBs to a mean covered UE). Sensitivity: eMBB x0.5, x1.5; rsu.spacing 2000
+        mmtc: 0.625 # 20 mMTC: 20 per UAV, enough points to measure coverage (design)
+    slice_weights: # design
         embb: 0.4
         urllc: 0.4
         mmtc: 0.2
@@ -112,7 +113,7 @@ uav_params:
 
 # User Equipment dynamics
 ue_dynamics:
-    arrival_rate: 0.167 # New UEs per second (num_ues / session_duration_avg keeps the population near num_ues)
+    arrival_rate: 0.1067 # New UEs per second: num_ues / session_duration_avg keeps the population near num_ues
     max_ues_multiplier: 1.5 # max_ues = num_ues * multiplier
     session_duration_avg: 300 # Average session duration in seconds (sets the per-step departure probability)
     max_initial_velocity: 2.0 # m/s
@@ -128,17 +129,34 @@ ue_dynamics:
             probability: 0.2
     change_direction_prob: 0.3 # Probability of changing direction per large time-scale step
 
-# Traffic model of slices (offered load sits just under the slice's min_rate)
+# Traffic per slice, as the mean over each 60 s step:
+# eMBB: TS 22.261 Table 7.1-1 (urban macro): 50 Mbps experienced rate, activity factor 20 %
+# URLLC: TS 22.261 Table 7.2.3.2-1: 10 Mbps, payload small (<= 256 B) to big; 256 B chosen
+# mMTC: TR 45.820 Annex E (MAR periodic reports): payload Pareto(2.5, 20 B) capped at 200 B, report every 1 day /
+# 2 h / 1 h / 30 min with probability 40 / 40 / 15 / 5 %; TR 38.812 A.3.2: 29 B higher-layer overhead
 traffic_patterns:
     embb:
-        packet_size: 1500
-        avg_arrival_rate: 800 # 9.6 Mbps
+        packet_size: 1500 # bytes
+        peak_rate: 50e6 # bps while active
+        activity_factor: 0.2
     urllc:
-        packet_size: 200
-        avg_arrival_rate: 1000 # 1.6 Mbps
+        packet_size: 256 # TS 22.261 allows small (<= 256 B) to big; small chosen
+        rate: 10e6 # Note 4 of the table: every application needs the experienced rate
     mmtc:
-        packet_size: 200
-        avg_arrival_rate: 60 # 96 kbps
+        payload_min: 20.0
+        payload_cap: 200.0
+        pareto_shape: 2.5
+        overhead: 29.0
+        report_intervals_s: [86400.0, 7200.0, 3600.0, 1800.0]
+        report_interval_probs: [0.4, 0.4, 0.15, 0.05]
+
+# Road-side infrastructure (URLLC): TS 22.261 Sec. 7.2.3.2: "deployed alongside streets ... every 1-2 km", on the
+# TR 36.885 urban road grid (Annex A.1.2: 433 m x 250 m blocks), antenna 5 m (A.1.4), snapped to the city's street
+# crossings. spacing 1000 m is the dense end (base); 2000 m the low-load scenario
+rsu:
+    block_size: [433.0, 250.0] # m
+    spacing: 1000.0 # m along the streets
+    antenna_height: 5.0 # m
 
 # Distance-based classification thresholds (used for DA formation)
 da_distance_thresholds:
@@ -198,7 +216,7 @@ a2g:
 # mmWave of Galkin, Kibilda & DaSilva (arXiv:1710.10807, Table I). One gateway, not their network of them
 backhaul:
     model: mmwave
-    gateway_position: [1000.0, 0.0, 30.0] # meters, x y h: edge of the service area, GS height 30 m
+    gateway_position: [577.5, 0.0, 30.0] # meters, x y h: edge of the service area, GS height 30 m
     bandwidth: 1000000000.0 # Hz per UAV
     tx_power: 10.0 # Watts (not added to the energy objective)
     antenna_gain_db: 64.2 # dB: UAV 16 pi / omega^2 at omega = 10 deg (32.2) plus ground station (32)
