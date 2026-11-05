@@ -14,6 +14,7 @@ Ghi ra:
   <out>.csv  mot dong moi policy (actor, va gpi voi bien the GPI): hv, eum, eu_front, n_pareto,
              CI, reward vector o 3 goc, va delta so voi --baseline neu co
   <out>_<policy>.npy  reward vector tung episode, shape (n_episodes, n_omega, 3)
+  <out>_<policy>_sla.npy  ty le UE dat du SLA theo slice (eMBB, URLLC, mMTC), cung shape, nan neu slice khong co tai
 
 Chay:
   py eval_checkpoint.py --config config/train/moma_ac_random.yaml --checkpoint <dir>/checkpoints/checkpoint_step_1000000.pth --out eval_random
@@ -35,7 +36,7 @@ import yaml
 os.environ.setdefault("MOMA_DEVICE", "cpu")   # Truoc khi import agent: CPU cho ket qua lap lai tren moi may
 
 import agents_moma_ac
-from agents_moma_ac import EVAL_SEED
+from agents_moma_ac import EVAL_SEED, SLA_KEYS, nan_mean
 from train_moma_ac import HV_REF_POINT, MOMA_AC_Trainer, _hv_3d
 
 
@@ -78,9 +79,10 @@ def load_trainer(config: str, checkpoint: str, env_config: str = None) -> MOMA_A
     return trainer
 
 
-def run_agent(agent, env, omegas: np.ndarray, n_episodes: int, seed_base: int, steps: int, use_gpi: bool) -> np.ndarray:
-    """Reward vector of every (episode, omega), with the episode seeded by seed_base + k."""
+def run_agent(agent, env, omegas: np.ndarray, n_episodes: int, seed_base: int, steps: int, use_gpi: bool):
+    """Reward vector and per-slice SLA share of every (episode, omega), with the episode seeded by seed_base + k."""
     results = np.zeros((n_episodes, len(omegas), 3))
+    sla = np.zeros((n_episodes, len(omegas), len(SLA_KEYS)))
     default_seed = agents_moma_ac.EVAL_SEED
     try:
         for k in range(n_episodes):
@@ -88,27 +90,30 @@ def run_agent(agent, env, omegas: np.ndarray, n_episodes: int, seed_base: int, s
             agents_moma_ac.EVAL_SEED = seed_base + k
             for i, w in enumerate(omegas):
                 results[k, i] = agent.eval_omega(env, w, 1, steps, use_gpi=use_gpi)
+                sla[k, i] = agent.last_sla
     finally:
         agents_moma_ac.EVAL_SEED = default_seed
-    return results
+    return results, sla
 
 
 def run_formation(env_config: str, n_omega: int, n_episodes: int, seed_base: int, steps: int,
-                  radius: float, power: float) -> np.ndarray:
+                  radius: float, power: float):
     import eval_formation
     from environment import NetworkSlicingEnv
     with contextlib.redirect_stdout(io.StringIO()):
         env = NetworkSlicingEnv(config_path=env_config)
     positions = eval_formation.formation_positions(env, radius)
     results = np.zeros((n_episodes, n_omega, 3))
+    sla = np.zeros((n_episodes, n_omega, len(SLA_KEYS)))
     for k in range(n_episodes):
         row = eval_formation.evaluate(env, positions, power, 1, steps, n_omega, seed_base=seed_base + k)
         results[k, :] = [row["qos"], row["energy"], row["fair"]]   # The same action for every omega
-    return results
+        sla[k, :] = [row[key] for key in SLA_KEYS]
+    return results, sla
 
 
 def summarize(results: np.ndarray, omegas: np.ndarray, baseline: np.ndarray = None,
-              n_boot: int = 1000, seed: int = 0) -> dict:
+              n_boot: int = 1000, seed: int = 0, sla: np.ndarray = None) -> dict:
     """Metrics of the mean front, bootstrap CIs over episodes, and the paired difference to a baseline."""
     n = len(results)
     row = front_metrics(results.mean(axis=0), omegas)
@@ -133,6 +138,11 @@ def summarize(results: np.ndarray, omegas: np.ndarray, baseline: np.ndarray = No
     for c, name in enumerate(("qos", "energy", "fair")):
         for o, obj in enumerate(("qos", "energy", "fair")):
             row[f"w_{name}_{obj}"] = float(results[:, c, o].mean())   # Corner weight c, objective o
+    if sla is not None:
+        # Share of UEs meeting their full SLA: over all weights, and at each corner weight
+        row.update({f"avg_{k}": float(v) for k, v in zip(SLA_KEYS, nan_mean(sla.reshape(-1, len(SLA_KEYS))))})
+        for c, name in enumerate(("qos", "energy", "fair")):
+            row.update({f"w_{name}_{k}": float(v) for k, v in zip(SLA_KEYS, nan_mean(sla[:, c]))})
     return {k: float(v) if isinstance(v, np.floating) else v for k, v in row.items()}
 
 
@@ -169,14 +179,15 @@ if __name__ == "__main__":
                     for label, use_gpi in modes}
 
     baseline = np.load(args.baseline) if args.baseline else None
-    if baseline is not None and baseline.shape != next(iter(policies.values())).shape:
+    if baseline is not None and baseline.shape != next(iter(policies.values()))[0].shape:
         parser.error(f"--baseline has shape {baseline.shape}, expected the same episodes and omegas")
     rows = []
-    for label, results in policies.items():
+    for label, (results, sla) in policies.items():
         np.save(f"{args.out}_{label}.npy", results)
+        np.save(f"{args.out}_{label}_sla.npy", sla)
         rows.append({"policy": label, "checkpoint": args.checkpoint or "formation",
                      "n_episodes": args.n_episodes, "seed_base": args.seed_base,
-                     **summarize(results, omegas, baseline)})
+                     **summarize(results, omegas, baseline, sla=sla)})
     pd.DataFrame(rows).to_csv(f"{args.out}.csv", index=False)
     for row in rows:
         print({k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()})

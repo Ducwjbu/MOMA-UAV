@@ -31,6 +31,20 @@ DEVICE = torch.device(os.environ.get("MOMA_DEVICE")
 # Evaluation episodes reuse these seeds (common random numbers), so values stay
 # comparable across omegas, checkpoints and sampling variants.
 EVAL_SEED = 12345
+SLA_KEYS = ("sla_embb", "sla_urllc", "sla_mmtc")   # info: share of UEs meeting their full SLA, per slice
+
+
+def sla_of(info: dict) -> list:
+    return [info.get(k, np.nan) for k in SLA_KEYS]
+
+
+def nan_mean(rows) -> np.ndarray:
+    """Column means that skip nan (a slice with no demand that step); nan where a column has no value."""
+    a = np.asarray(rows, dtype=np.float64)
+    a = a.reshape(len(a), -1) if a.size else np.full((0, len(SLA_KEYS)), np.nan)
+    ok = ~np.isnan(a)
+    n = ok.sum(axis=0)
+    return np.where(n > 0, np.where(ok, a, 0.0).sum(axis=0) / np.maximum(n, 1), np.nan)
 
 
 # ============================================================
@@ -794,11 +808,13 @@ class MOMA_AC_Agent:
         rng_state = np.random.get_state()
         uid    = sorted(env.uavs.keys())[0]
         all_rv = []
+        all_sla = []
         for ep in range(n_episodes):
             np.random.seed(EVAL_SEED + ep)
             obs_dict = env.reset()
             obs      = obs_dict[uid]
             ep_rv    = []
+            ep_sla   = []
             done     = False
             t        = 0
             while not done and t < steps:
@@ -808,10 +824,13 @@ class MOMA_AC_Agent:
                 rv  = info.get("reward_vector", None)
                 if rv is not None:
                     ep_rv.append(np.array(rv, dtype=np.float32))
+                ep_sla.append(sla_of(info))
                 t += 1
             if ep_rv:
                 all_rv.append(np.mean(ep_rv, axis=0))
+                all_sla.append(nan_mean(ep_sla))
         np.random.set_state(rng_state)
+        self.last_sla = nan_mean(all_sla)   # Per slice: mean over episodes of the episode's mean SLA share
         return np.mean(all_rv, axis=0) if all_rv else np.zeros(self.n_obj, dtype=np.float32)
 
     def eval_pareto_front(self, env, n_omega: int = 30,
@@ -823,9 +842,11 @@ class MOMA_AC_Agent:
             np.ones(self.n_obj), n_omega - self.n_obj).astype(np.float32)
         omegas   = np.vstack([corners, interior])
         results  = []
+        self.sweep_sla = []   # SLA shares per omega, read by the trainer
         for i, w in enumerate(omegas):
             rv = self.eval_omega(env, w, n_episodes, steps, use_gpi=use_gpi)
             results.append(rv)
+            self.sweep_sla.append(self.last_sla)
             print(f"  eval {i+1}/{len(omegas)}: w={np.round(w,2)} "
                   f"QoS={rv[0]:.3f} Eng={rv[1]:.3f} Fair={rv[2]:.3f}")
         return np.array(results), omegas
@@ -1035,11 +1056,13 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         rng_state = np.random.get_state()
         uids   = sorted(env.uavs.keys())
         all_rv = []
+        all_sla = []
         for ep in range(n_episodes):
             np.random.seed(EVAL_SEED + ep)
             obs_dict = env.reset()
             ep_rv    = []
             ep_diag  = []
+            ep_sla   = []
             done     = False
             t        = 0
             while not done and t < steps:
@@ -1047,11 +1070,14 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
                 obs_dict, _, done, info = env.step({u: action[i] for i, u in enumerate(uids)})
                 ep_rv.append(np.array(info["reward_vector"], dtype=np.float32))
                 ep_diag.append((info["coverage"], info["handovers"], info["min_uav_distance"], info["backhaul_limited"]))
+                ep_sla.append(sla_of(info))
                 t += 1
             if ep_rv:
                 all_rv.append(np.mean(ep_rv, axis=0))
+                all_sla.append(nan_mean(ep_sla))
                 self.eval_diagnostics.append(episode_diagnostics(ep_diag))
         np.random.set_state(rng_state)
+        self.last_sla = nan_mean(all_sla)
         return np.mean(all_rv, axis=0) if all_rv else np.zeros(self.n_obj, dtype=np.float32)
 
     def pop_eval_diagnostics(self) -> dict:

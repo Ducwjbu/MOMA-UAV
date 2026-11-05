@@ -13,7 +13,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from agents_moma_ac import EVAL_SEED, average_diagnostics, episode_diagnostics
+from agents_moma_ac import EVAL_SEED, SLA_KEYS, average_diagnostics, episode_diagnostics, nan_mean, sla_of
 from environment import NetworkSlicingEnv
 from train_moma_ac import HV_REF_POINT, _hv_3d
 
@@ -34,7 +34,7 @@ def evaluate(env, positions: np.ndarray, power: float, n_episodes: int, steps: i
     action = np.concatenate([np.zeros(3), [power], np.full(9, 1.0 / 9.0)]).astype(np.float32)
 
     rng_state = np.random.get_state()
-    rewards, episodes = [], []
+    rewards, episodes, slas = [], [], []
     for ep in range(n_episodes):
         np.random.seed(seed_base + ep)
         env.reset()
@@ -45,15 +45,17 @@ def evaluate(env, positions: np.ndarray, power: float, n_episodes: int, steps: i
             ue.assigned_uav = None
         env._associate_ues_to_uavs()
         env._form_demand_areas()
-        ep_rv, ep_diag = [], []
+        ep_rv, ep_diag, ep_sla = [], [], []
         done = False
         t = 0
         while not done and t < steps:
             _, _, done, info = env.step({uid: action for uid in env.uavs})
             ep_rv.append(np.array(info["reward_vector"], dtype=np.float32))
             ep_diag.append((info["coverage"], info["handovers"], info["min_uav_distance"], info["backhaul_limited"]))
+            ep_sla.append(sla_of(info))
             t += 1
         rewards.append(np.mean(ep_rv, axis=0))
+        slas.append(nan_mean(ep_sla))
         episodes.append(episode_diagnostics(ep_diag))
     np.random.set_state(rng_state)
 
@@ -64,6 +66,7 @@ def evaluate(env, positions: np.ndarray, power: float, n_episodes: int, steps: i
     return {
         "qos": float(reward[0]), "energy": float(reward[1]), "fair": float(reward[2]),
         **average_diagnostics(episodes),
+        **{k: float(v) for k, v in zip(SLA_KEYS, nan_mean(slas))},
         "eum": float((omegas @ reward).mean()),
         "hv": float(_hv_3d(reward[np.newaxis], HV_REF_POINT)),
         "power": power,

@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from utils import Configuration
 from environment import NetworkSlicingEnv
-from agents_moma_ac import MOMA_AC_Agent, MOMA_CTDE_Agent, episode_diagnostics
+from agents_moma_ac import SLA_KEYS, MOMA_AC_Agent, MOMA_CTDE_Agent, episode_diagnostics, nan_mean
 
 
 # Shared HV reference point
@@ -439,13 +439,17 @@ class MOMA_AC_Trainer:
             "eu_front": float((omegas @ results.T).max(axis=1).mean()),
             "n_pareto": self._count_pareto(results),
         }
-        return metrics, results, omegas
+        sla = np.array(self.agent.sweep_sla)   # (n_omega, 3): share of UEs meeting their full SLA
+        # Mean over the sweep, like avg_qos, and at the QoS corner (omega index 0)
+        metrics.update({f"avg_{k}": float(v) for k, v in zip(SLA_KEYS, nan_mean(sla))})
+        metrics.update({f"wqos_{k}": float(v) for k, v in zip(SLA_KEYS, sla[0])})
+        return metrics, results, omegas, sla
 
     def _eval_and_log(self, step: int):
         # GPI variants report the GPI policy, and the plain actor as *_actor for
         # a like-for-like comparison with the random baseline
         use_gpi = self.agent.use_gpi
-        metrics, results, omegas = self._sweep_metrics(use_gpi)
+        metrics, results, omegas, sla = self._sweep_metrics(use_gpi)
         row = {
             "step":     step,
             **metrics,
@@ -460,23 +464,24 @@ class MOMA_AC_Trainer:
         if self.multi_uav:
             row.update(self.agent.pop_eval_diagnostics())
         if use_gpi:
-            actor_metrics, actor_results, _ = self._sweep_metrics(False)
+            actor_metrics, actor_results, _, actor_sla = self._sweep_metrics(False)
             row.update({f"{k}_actor": v for k, v in actor_metrics.items()})
-            self._log_pareto(step, "actor", actor_results, omegas)
-        self._log_pareto(step, "gpi" if use_gpi else "actor", results, omegas)
+            self._log_pareto(step, "actor", actor_results, omegas, actor_sla)
+        self._log_pareto(step, "gpi" if use_gpi else "actor", results, omegas, sla)
         self.eval_log.append(row)
         self._save_eval_csv()
         print(f"  HV={metrics['hv']:.4f}  EUM={metrics['eum']:.4f}  n_pareto={metrics['n_pareto']}  "
               f"best_QoS={results[:,0].max():.3f}  best_Fair={results[:,2].max():.3f}")
 
-    def _log_pareto(self, step: int, policy: str, results: np.ndarray, omegas: np.ndarray):
+    def _log_pareto(self, step: int, policy: str, results: np.ndarray, omegas: np.ndarray, sla: np.ndarray):
         """Keep each evaluated point, so the front can be analyzed without rerunning."""
-        for w, rv in zip(omegas, results):
+        for w, rv, sl in zip(omegas, results, sla):
             self.pareto_log.append({
                 "step":   step,
                 "policy": policy,
                 "w_qos":  float(w[0]), "w_energy": float(w[1]), "w_fair": float(w[2]),
                 "qos":    float(rv[0]), "energy":  float(rv[1]), "fair":  float(rv[2]),
+                **{k: float(v) for k, v in zip(SLA_KEYS, sl)},
             })
         pd.DataFrame(self.pareto_log).to_csv(
             os.path.join(self.model_dir, "pareto_points.csv"), index=False)

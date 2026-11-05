@@ -1,6 +1,6 @@
 # Train MOMA-AC trên Kaggle
 
-Train 4 variant (`random`, `ols`, `gpi_ls`, `gpi_pd`), 1M bước, với 1 UAV. Notebook mặc định chạy 1 seed trên GPU; thêm seed bằng cách sửa `SEEDS`. Kaggle giới hạn mỗi session khoảng 12 giờ, nên bộ này tự dừng trước khi hết giờ, lưu trạng thái, và chạy tiếp ở session sau.
+Train 4 variant (`random`, `ols`, `gpi_ls`, `gpi_pd`), 1M bước, với 1 UAV, và `ma3` (3 UAV, xem phần cuối). Notebook mặc định chạy 1 seed trên GPU; thêm seed bằng cách sửa `SEEDS`. Kaggle giới hạn mỗi session khoảng 12 giờ, nên bộ này tự dừng trước khi hết giờ, lưu trạng thái, và chạy tiếp ở session sau.
 
 ## Chuẩn bị
 
@@ -13,6 +13,8 @@ py kaggle/build_bundle.py
 ```
 
 Lệnh này tạo `kaggle/moma_uav_code.zip`.
+
+> **Đổi môi trường (tag `v1.0` trở đi).** Kết quả và trạng thái resume của môi trường cũ không dùng lại được: quan sát đổi chiều (83 với 1 UAV, 41 với `ma3`) và reward đổi thang. Khi chạy với code mới, upload Dataset mới (hoặc **New Version**) và dùng notebook mới, hoặc gỡ hết các Input là output notebook cũ. Lần chạy đầu, đầu log phải có `No earlier runs attached`. Nếu thấy `[Restore] ...` tức là đang gắn output cũ: dừng lại và gỡ Input đó.
 
 ## Bước 1: Upload code thành Dataset
 
@@ -74,7 +76,7 @@ Trang notebook, tab **Output** của version cuối:
 
 - `comparison.csv`: HV, EUM, EU và Cardinality của từng variant ở mọi mốc eval, mean và std qua các seed.
 - `runs/saved_models_moma_ac_<variant>/seed_<n>/eval_metrics.csv`: số liệu từng run.
-- `runs/.../pareto_points.csv`: từng điểm đã eval (omega và QoS, energy, fairness), có thể tự lọc Pareto front từ đây.
+- `runs/.../pareto_points.csv`: từng điểm đã eval (omega, QoS, energy, fairness, và `sla_embb`, `sla_urllc`, `sla_mmtc`: tỷ lệ UE đạt đủ SLA của slice), có thể tự lọc Pareto front từ đây.
 - `runs/.../checkpoints/`: trọng số mạng.
 - `runs/logs/`: log đầy đủ từng run.
 
@@ -85,11 +87,13 @@ Bảng tổng kết ở mốc cuối nằm ở cuối log. Muốn tính lại tr
 - So `hv`, `eum`, `eu_front` của các variant, và phải nhìn cả độ lệch giữa các seed. 3 seed chỉ đủ để thấy xu hướng. Paper MOMA-AC dùng 10 seed.
 - Hai variant GPI còn có cột `*_actor` là actor thường không dùng GPI. So `hv_actor` với `hv` của `random` để tách tác dụng của cách chọn omega khỏi tác dụng của suy luận GPI.
 - `ols` chọn omega theo support M như GPI-LS nhưng luôn hành động bằng actor thường, nên chỉ có cột `hv`, không có `*_actor`. So `hv` của `ols` với `random` để xem tác dụng của việc chọn omega, và với `hv` của `gpi_ls` để xem có GPI thì tốt hơn hay kém đi.
+- `eval_metrics.csv` có tỷ lệ UE đạt đủ SLA theo slice: `avg_sla_*` (trung bình qua các omega) và `wqos_sla_*` (ở omega = (1, 0, 0), chỉ ưu tiên QoS). Slice không có tải ở mọi bước thì ra `nan`.
+- Số liệu cuối cho bài báo: tải checkpoint 1M về và chạy `eval_checkpoint.py` (20 episode riêng, CI bootstrap, xem `CLAUDE.md`). Eval lúc train chỉ 3 episode, chỉ để xem đường học.
 - `gpi_ls_metrics.csv`: `support_size` (số omega trong M), `max_gap` (với GPI là cải thiện đo được, với `ols` là khoảng cách tới cận trên lạc quan, nên không so được giữa hai loại), và `model_val_nll` với GPI-PD.
 
 ## CPU hay GPU
 
-Đo trên laptop này (GTX 1650), 3 tiến trình cùng lúc, tốc độ mỗi tiến trình khi đang update, chưa tính eval:
+Đo trên laptop này (GTX 1650) với **môi trường cũ** (trước `v1.0`), 3 tiến trình cùng lúc, tốc độ mỗi tiến trình khi đang update, chưa tính eval. Môi trường `v1.0` có thành phố, fading và gió nên chậm hơn: riêng phần env khoảng 7 ms/bước với 1 UAV (khoảng 2 giờ cho 1M bước, CPU laptop), nên tổng thời gian sẽ dài hơn bảng này. Hãy xem tiến độ ở log của session đầu.
 
 | Variant | CPU | GPU | 1M bước trên GPU, chưa tính eval |
 |---|---|---|---|
@@ -111,13 +115,13 @@ Cập nhật code trước: chạy `py kaggle/build_bundle.py`, rồi vào Datas
 
 ## Chạy 3 UAV (`ma3`)
 
-`ma3` là MOMA-TD3 của paper trên 3 UAV, 50 UE, chỉ lấy mẫu omega đều. Nó không nằm trong variant mặc định.
+`ma3` là MOMA-TD3 của paper trên 3 UAV, chỉ lấy mẫu omega đều. Môi trường `config/environment/ma3.yaml`: khu 2 km, 31 UE eMBB, 60 UE mMTC và 26 trạm bên đường (RSU, slice URLLC), episode 20 bước. Nó không nằm trong variant mặc định.
 
-1. Trong notebook, đặt `VARIANTS = ["ma3"]` và `SEEDS` theo nhu cầu. Config `moma_ac_ma3.yaml` đã tự trỏ tới `config/environment/ma3.yaml`.
-2. Kết quả nằm ở `runs/saved_models_moma_ac_ma3/seed_<n>/`. `eval_metrics.csv` và `step_metrics.csv` có thêm `coverage`, `handovers`, `backhaul_limited` (tỷ lệ UAV vượt dung lượng backhaul), `min_uav_distance` (khoảng cách nhỏ nhất thực sự giữa hai UAV) và `mean_uav_distance` (trung bình theo step của cặp gần nhất).
-3. So với baseline không cần train: chạy `py eval_formation.py` để được một dòng kết quả của 3 UAV đứng yên thành tam giác, dùng cùng seed eval.
+1. Nên dùng một notebook riêng (cách tạo như Bước 2). Đặt `VARIANTS = ["ma3"]` và `SEEDS` theo nhu cầu. Config `moma_ac_ma3.yaml` đã tự trỏ tới `config/environment/ma3.yaml`. Có thể để chung với các variant 1 UAV, nhưng run `ma3` chậm hơn nhiều nên sẽ chiếm chỗ lâu.
+2. Kết quả nằm ở `runs/saved_models_moma_ac_ma3/seed_<n>/`. `eval_metrics.csv` và `step_metrics.csv` có thêm `coverage`, `handovers`, `backhaul_limited` (tỷ lệ UAV vượt dung lượng backhaul), `min_uav_distance` (khoảng cách nhỏ nhất thực sự giữa hai UAV) và `mean_uav_distance` (trung bình theo step của cặp gần nhất). Các cột SLA theo slice giống run 1 UAV.
+3. So với baseline không cần train: `py eval_checkpoint.py --formation --out eval_triangle` cho 3 UAV đứng yên thành tam giác trên cùng các episode eval với `eval_checkpoint.py` của checkpoint.
 
-Run `ma3` chưa được đo tốc độ trên Kaggle. Hãy xem tiến độ ở log của session đầu. Mỗi run chưa xong chiếm nhiều đĩa hơn run 1 UAV, vì buffer lưu quan sát và hành động chung của cả đội.
+Tốc độ: riêng phần env của `ma3` khoảng 24 ms/bước trên CPU laptop, tức khoảng 7 giờ cho 1M bước chưa tính cập nhật mạng, nên một run gần như chắc chắn cần 2 session (Bước 5). Chưa đo trên Kaggle, hãy xem tiến độ ở log của session đầu. Mỗi run chưa xong chiếm nhiều đĩa hơn run 1 UAV, vì buffer lưu quan sát và hành động chung của cả đội.
 
 ## Chia việc nếu chạy không kịp
 
