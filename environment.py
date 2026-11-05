@@ -385,6 +385,10 @@ class NetworkSlicingEnv:
         self.carrier_frequency = env_config.channel.carrier_frequency  # Hz
         self.shannon_attenuation = env_config.channel.shannon_attenuation
         self.max_spectral_efficiency = env_config.channel.max_spectral_efficiency  # bps/Hz
+        # Mogensen et al. 2007 Eq. 3: SE = att * log2(1 + SINR / SNR_eff); 0 dB (absent) is plain attenuated Shannon
+        self.snr_efficiency = 10.0 ** (getattr(env_config.channel, 'snr_efficiency_db', 0.0) / 10.0)
+        # Below the lowest CQI's efficiency no MCS decodes: the rate is 0 (absent: no floor)
+        self.min_spectral_efficiency = getattr(env_config.channel, 'min_spectral_efficiency', 0.0)
 
         # Noise power per RB (Watts)
         noise_dbm = (env_config.channel.noise_psd_dbm_hz + env_config.channel.noise_figure_db
@@ -1549,8 +1553,16 @@ class NetworkSlicingEnv:
         best = np.argmax(ref_snr_db, axis=1)
         uav_ids_list = list(self.uavs.keys())
         min_snr_db = self.antenna['min_association_snr_db']
+        # Event A3 (TS 38.331): hand over only when the best UAV beats the serving one by the hysteresis
+        hysteresis_db = self.antenna['handover_hysteresis_db'] if 'handover_hysteresis_db' in self.antenna else 0.0
         for i, ue in enumerate(active_ues):
-            ue.assigned_uav = uav_ids_list[best[i]] if ref_snr_db[i, best[i]] >= min_snr_db else None
+            target = best[i]
+            if ue.assigned_uav in uav_ids_list:
+                serving = uav_ids_list.index(ue.assigned_uav)
+                if (ref_snr_db[i, serving] >= min_snr_db
+                        and ref_snr_db[i, target] - ref_snr_db[i, serving] <= hysteresis_db):
+                    target = serving
+            ue.assigned_uav = uav_ids_list[target] if ref_snr_db[i, target] >= min_snr_db else None
 
     def _associate_by_beam(self, active_ues: List[UE]):
         """Nearest UAV whose beam cone contains the UE"""
@@ -1963,8 +1975,7 @@ class NetworkSlicingEnv:
         sinr = 10.0 ** (sinr_db / 10.0)
 
         def mean_se(gain):
-            se = np.minimum(self.shannon_attenuation * np.log2(1.0 + sinr[:, np.newaxis] * gain[np.newaxis, :]),
-                            self.max_spectral_efficiency)
+            se = self._se_from_sinr(sinr[:, np.newaxis] * gain[np.newaxis, :])
             return se.mean(axis=1)
 
         rician = np.empty((len(k_db), len(sinr_db)))
@@ -1973,11 +1984,16 @@ class NetworkSlicingEnv:
             rician[j] = mean_se(gain)
         return {'sinr_db': sinr_db, 'k_db': k_db, 'rician': rician, 'rayleigh': mean_se(np.abs(scatter) ** 2)}
 
+    def _se_from_sinr(self, sinr_linear):
+        """Attenuated Shannon with SNR_eff, capped at the top CQI, and 0 below the lowest CQI"""
+        se = np.minimum(self.shannon_attenuation * np.log2(1.0 + sinr_linear / self.snr_efficiency),
+                        self.max_spectral_efficiency)
+        return np.where(se >= self.min_spectral_efficiency, se, 0.0)
+
     def _spectral_efficiency(self, sinr_db: float, ue: UE) -> float:
         """Attenuated Shannon, capped; with fast fading, its mean over Rician (LoS outdoor) or Rayleigh fading"""
         if self._se_table is None or self.city is None:
-            return min(self.shannon_attenuation * np.log2(1.0 + 10.0 ** (sinr_db * 0.1)),
-                       self.max_spectral_efficiency)
+            return float(self._se_from_sinr(10.0 ** (sinr_db * 0.1)))
         table = self._se_table
         j = list(self.uavs.keys()).index(ue.assigned_uav)
         if ue.los[j] and not ue.indoor:

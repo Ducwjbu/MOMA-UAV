@@ -26,6 +26,12 @@ channel:
     total_bandwidth: 98280000.0 # Hz per UAV (273 PRBs, the NR maximum for 100 MHz at 30 kHz SCS)
     shannon_attenuation: 0.75 # Attenuated Shannon: SE = min(alpha * log2(1 + SINR), se_max)
     max_spectral_efficiency: 7.4 # bps/Hz (256-QAM, CQI 15 of NR table 2)
+    # Mogensen et al., "LTE Capacity Compared to the Shannon Bound", IEEE VTC2007-Spring, Eq. 3 and Fig. 1: the AWGN
+    # fit pairs 0.75 with SNR_eff 1.25 dB. Fast fading is modelled separately (fast_fading), so the AWGN pair applies
+    snr_efficiency_db: 1.25
+    # TS 38.214 Table 5.2.2.1-3 (CQI table 2): CQI 1 = 0.1523 bit/s/Hz. Below it the rate is 0; with the line above
+    # that is an SINR of -7.0 dB
+    min_spectral_efficiency: 0.1523
     # Log-normal shadowing, dB, by link state: 3GPP TR 38.901 Table 7.4.1-1 (UMa: LoS 4, NLoS 6) and Table 7.4.3-3
     # (O2I < 6 GHz: 7). Exponentially correlated over the distance the UE and UAV move (TR 38.901 7.4.4, ITU-R
     # P.1816), decorrelation distances of Table 7.5-6 (UMa). Measured A2G at 2.85 GHz, UAV at 150 m (Ao et al.,
@@ -108,7 +114,8 @@ uav_params:
         max_gain_dbi: 8.0
         beamwidth_3db: 65.0 # degrees
         max_attenuation_db: 30.0
-        min_association_snr_db: -6.0 # assumed, about the lowest NR CQI
+        min_association_snr_db: -7.0 # reference SNR where the rate model reaches CQI 1 (channel section)
+        handover_hysteresis_db: 3.0 # event A3 (TS 38.331) hysteresis, assumed: operators set it
     buffer_size: 1000000  # bits
     processing_delay_ms: 1.0 # gNB + UE processing per packet
 
