@@ -32,6 +32,24 @@ channel:
     # TS 38.214 Table 5.2.2.1-3 (CQI table 2): CQI 1 = 0.1523 bit/s/Hz. Below it the rate is 0; with the line above
     # that is an SINR of -7.0 dB
     min_spectral_efficiency: 0.1523
+    # Link adaptation per slice. TS 38.214 Sec. 5.2.2.1: the CQI is the highest MCS whose transport block error
+    # probability is <= 0.1 (CQI tables 1-2) or <= 1e-5 (table 3). eMBB and mMTC: table 2 with HARQ, up to
+    # max_transmissions (assumed 4); URLLC: table 3 (Table 5.2.2.1-4: 0.0586-4.5234 bit/s/Hz), one shot, rate scaled by
+    # the finite-blocklength normal approximation (Polyanskiy, Poor & Verdu 2010) for its packet.
+    # harq_rtt_ms: assumed 8 ms (the LTE FDD HARQ round trip), conservative for NR at 30 kHz
+    link_adaptation:
+        harq_rtt_ms: 8.0
+        embb:
+            bler_target: 0.1
+            max_transmissions: 4
+        mmtc:
+            bler_target: 0.1
+            max_transmissions: 4
+        urllc:
+            bler_target: 0.00001
+            max_transmissions: 1
+            min_spectral_efficiency: 0.0586
+            max_spectral_efficiency: 4.5234
     # Log-normal shadowing, dB, by link state: 3GPP TR 38.901 Table 7.4.1-1 (UMa: LoS 4, NLoS 6) and Table 7.4.3-3
     # (O2I < 6 GHz: 7). Exponentially correlated over the distance the UE and UAV move (TR 38.901 7.4.4, ITU-R
     # P.1816), decorrelation distances of Table 7.5-6 (UMa). Measured A2G at 2.85 GHz, UAV at 150 m (Ao et al.,
@@ -79,10 +97,10 @@ slicing:
         embb: 0.341 # 31 eMBB UEs: with the 260 Mbps of the RSUs, mean offered load = fleet capacity
         urllc: 0.0 # (566 Mbps, 3 UAVs hovering at full power, all RBs to a mean covered UE). Sensitivity: eMBB x0.5, x1.5; rsu.spacing 2000
         mmtc: 0.659 # 60 mMTC: 20 per UAV, enough points to measure coverage (design)
-    slice_weights: # design
-        embb: 0.4
-        urllc: 0.4
-        mmtc: 0.2
+    slice_weights: # equal: no operator priority assumed (policy, see Bellone et al.; Hossain & Ansari)
+        embb: 1.0
+        urllc: 1.0
+        mmtc: 1.0
 
 qos_weights:
     embb:
@@ -191,6 +209,11 @@ behavior:
 # Fairness: Jain's index over active UEs with x_i = min(throughput / offered load, 1), the "fraction of
 # demand" metric of Jain, Chiu & Hawe 1984 (Sec. 5). Absent means throughput / slice min_rate, uncapped
 fairness_metric: fraction_of_demand
+
+# Per-UE QoS is the worst of its KPI satisfactions (rate, delay, reliability in orders of magnitude of the failure
+# rate): 1 exactly when the SLA is met, without per-KPI weights. Bellone et al. (IEEE DCOSS-IoT 2023) optimise the
+# SLA-satisfaction ratio; info reports that ratio per slice (sla_embb, sla_urllc, sla_mmtc). qos_weights are unused
+qos_aggregation: min
 
 # Reward function weights
 reward_weights:

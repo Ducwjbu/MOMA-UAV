@@ -389,6 +389,9 @@ class NetworkSlicingEnv:
         self.snr_efficiency = 10.0 ** (getattr(env_config.channel, 'snr_efficiency_db', 0.0) / 10.0)
         # Below the lowest CQI's efficiency no MCS decodes: the rate is 0 (absent: no floor)
         self.min_spectral_efficiency = getattr(env_config.channel, 'min_spectral_efficiency', 0.0)
+        # Link adaptation per slice (absent: the older SINR-based PER curve): BLER target of the CQI table,
+        # HARQ transmissions, and for a 1e-5 target the finite-blocklength rate and the CQI table 3 range
+        self.link_adaptation = getattr(env_config.channel, 'link_adaptation', None)
 
         # Noise power per RB (Watts)
         noise_dbm = (env_config.channel.noise_psd_dbm_hz + env_config.channel.noise_figure_db
@@ -429,7 +432,6 @@ class NetworkSlicingEnv:
         self.city = None
         self.o2i = getattr(env_config.channel, 'o2i', None)
         self.fast_fading = getattr(env_config.channel, 'fast_fading', None)
-        self._se_table = self._build_fading_table() if self.fast_fading is not None else None
         # Horizontal wind of Dai et al. (arXiv:2304.06909), drawn once per episode. Absent: no wind
         self.wind_params = getattr(env_config, 'wind', None)
         self.wind_ref = np.zeros(2)  # wind vector at the reference height, m/s (x east, y north)
@@ -474,6 +476,11 @@ class NetworkSlicingEnv:
         self.mmtc_report_rate = float(np.dot(tp.mmtc.report_interval_probs, 1.0 / np.array(tp.mmtc.report_intervals_s)))
         # Road-side units (URLLC): fixed, at intersections of a road grid (TR 36.885 Annex A.1.2-A.1.3)
         self.rsu_params = getattr(env_config, 'rsu', None)
+        # Rate tables (need the packet sizes above)
+        self._fbl_ratio = self._build_fbl_ratio() if self.link_adaptation is not None else None
+        self._se_table = self._build_fading_table(self._se_from_sinr) if self.fast_fading is not None else None
+        self._se_table_urllc = (self._build_fading_table(self._se_urllc_from_sinr)
+                                if self.fast_fading is not None and self._fbl_ratio is not None else None)
 
         # Distance thresholds for forming Demand Areas
         self.da_distance_thresholds = env_config.da_distance_thresholds
@@ -486,6 +493,9 @@ class NetworkSlicingEnv:
         # Allocation metric of Jain's index: 'min_rate' (throughput / slice min_rate, uncapped) or
         # 'fraction_of_demand' (Jain et al. 1984: throughput / offered load, capped at 1)
         self.fairness_metric = getattr(env_config, 'fairness_metric', 'min_rate')
+        # Per-UE QoS: 'min' of the KPI satisfactions (SLA semantics) or 'weighted' with qos_weights
+        self.qos_aggregation = getattr(env_config, 'qos_aggregation', 'weighted')
+        self.sla_ratio = {'embb': float('nan'), 'urllc': float('nan'), 'mmtc': float('nan')}
 
         # Statistics tracking
         self.stats = {
@@ -931,6 +941,8 @@ class NetworkSlicingEnv:
             'backhaul_limited': sum(load > 1.0 for load in self.backhaul_load.values()) / self.num_uavs,
             # Wind speed at the reference height (0 without wind)
             'wind_speed': float(np.linalg.norm(self.wind_ref)),
+            # Share of UEs meeting their full SLA, per slice (nan when the slice has no demand this step)
+            'sla_embb': self.sla_ratio['embb'], 'sla_urllc': self.sla_ratio['urllc'], 'sla_mmtc': self.sla_ratio['mmtc'],
         }
         
         return observations, reward, done, info
@@ -1960,7 +1972,45 @@ class NetworkSlicingEnv:
             ue.shadow_db = sigma * ue.shadow_z
             ue.o2i_db = o2i['wall_loss_db'] + o2i['indoor_loss_per_m'] * ue.depth_in if indoor[i] else 0.0
 
-    def _build_fading_table(self) -> Dict:
+    def _build_fbl_ratio(self) -> Dict:
+        """
+        Rate at BLER 1e-5 over the rate at BLER 0.1 for a URLLC packet, from the normal approximation of the
+        finite-blocklength rate (Polyanskiy, Poor & Verdu, IEEE Trans. IT 2010):
+        r = C - sqrt(V / n) Q^-1(eps) + log2(n) / (2 n), C = log2(1 + g), V = (1 - (1 + g)^-2) log2(e)^2,
+        with n = L / r channel uses for an L-bit packet. The attenuated-Shannon rate is the link at BLER 0.1
+        (CQI tables 1-2); the ratio scales it to the 1e-5 target of CQI table 3
+        """
+        from scipy.stats import norm
+        bits = self.packet_bytes['urllc'] * 8.0
+        sinr_db = np.arange(-15.0, 50.0 + 1e-9, 0.25)
+        g = 10.0 ** (sinr_db / 10.0)
+        capacity = np.log2(1.0 + g)
+        dispersion = (1.0 - (1.0 + g) ** -2) * np.log2(np.e) ** 2
+
+        def rate(eps):
+            lo, hi = np.zeros_like(g), capacity.copy()
+            for _ in range(60):  # bisection on the largest r that the approximation supports
+                r = (lo + hi) / 2.0
+                n = bits / np.maximum(r, 1e-9)
+                ok = capacity - np.sqrt(dispersion / n) * norm.isf(eps) + np.log2(n) / (2.0 * n) >= r
+                lo, hi = np.where(ok, r, lo), np.where(ok, hi, r)
+            return lo
+
+        la = self.link_adaptation
+        ratio = rate(la['urllc']['bler_target']) / np.maximum(rate(la['embb']['bler_target']), 1e-12)
+        return {'sinr_db': sinr_db, 'ratio': np.clip(ratio, 0.0, 1.0)}
+
+    def _se_urllc_from_sinr(self, sinr_linear):
+        """URLLC: the BLER-0.1 rate scaled by the finite-blocklength ratio, within CQI table 3
+        (TS 38.214 Table 5.2.2.1-4: 0.0586 to 4.5234 bit/s/Hz), 0 below its lowest CQI"""
+        la = self.link_adaptation['urllc']
+        sinr_db = 10.0 * np.log10(np.maximum(sinr_linear, 1e-30))
+        ratio = np.interp(sinr_db, self._fbl_ratio['sinr_db'], self._fbl_ratio['ratio'])
+        se = np.minimum(self.shannon_attenuation * np.log2(1.0 + sinr_linear / self.snr_efficiency) * ratio,
+                        la['max_spectral_efficiency'])
+        return np.where(se >= la['min_spectral_efficiency'], se, 0.0)
+
+    def _build_fading_table(self, se_fn) -> Dict:
         """
         Mean spectral efficiency over fast fading, E[min(att * log2(1 + g * SINR), se_max)], tabulated over
         the mean SINR and the Rician K-factor (unit-mean power gain g). Row K = -inf is Rayleigh. A step lasts
@@ -1975,7 +2025,7 @@ class NetworkSlicingEnv:
         sinr = 10.0 ** (sinr_db / 10.0)
 
         def mean_se(gain):
-            se = self._se_from_sinr(sinr[:, np.newaxis] * gain[np.newaxis, :])
+            se = se_fn(sinr[:, np.newaxis] * gain[np.newaxis, :])
             return se.mean(axis=1)
 
         rician = np.empty((len(k_db), len(sinr_db)))
@@ -1992,9 +2042,11 @@ class NetworkSlicingEnv:
 
     def _spectral_efficiency(self, sinr_db: float, ue: UE) -> float:
         """Attenuated Shannon, capped; with fast fading, its mean over Rician (LoS outdoor) or Rayleigh fading"""
+        urllc = ue.slice_type == 'urllc' and self._fbl_ratio is not None
         if self._se_table is None or self.city is None:
-            return float(self._se_from_sinr(10.0 ** (sinr_db * 0.1)))
-        table = self._se_table
+            se_fn = self._se_urllc_from_sinr if urllc else self._se_from_sinr
+            return float(se_fn(10.0 ** (sinr_db * 0.1)))
+        table = self._se_table_urllc if urllc else self._se_table
         j = list(self.uavs.keys()).index(ue.assigned_uav)
         if ue.los[j] and not ue.indoor:
             k_db = table['k_db']
@@ -2062,8 +2114,14 @@ class NetworkSlicingEnv:
         # Retransmission delays
         # ========================
 
-        per_list = np.array([self._calculate_packet_error_rate(ue) for _, ue in active_ues], dtype=np.float32)
-        t_retx = per_list * 4 * 8.0  # ms
+        if self.link_adaptation is not None:
+            # Expected HARQ retransmissions per packet times the HARQ round trip
+            la = self.link_adaptation
+            bler = np.array([la[ue.slice_type]['bler_target'] for _, ue in active_ues], dtype=np.float32)
+            t_retx = bler / (1.0 - bler) * la['harq_rtt_ms']
+        else:
+            per_list = np.array([self._calculate_packet_error_rate(ue) for _, ue in active_ues], dtype=np.float32)
+            t_retx = per_list * 4 * 8.0  # ms
 
         # ========================
         # Queuing delays
@@ -2286,7 +2344,12 @@ class NetworkSlicingEnv:
             return self.throughput_cache[ue.id]
 
     def _calculate_packet_error_rate(self, ue: UE) -> float:
-        """Calculate PER based on SINR"""
+        """Residual packet error rate. With link adaptation, the MCS meets the slice's BLER target (TS 38.214
+        5.2.2.1: 0.1 for CQI tables 1-2, 1e-5 for table 3) and HARQ allows max_transmissions, so the residual is
+        bler_target ** max_transmissions. Otherwise the older SINR-based curve"""
+        if self.link_adaptation is not None:
+            la = self.link_adaptation[ue.slice_type]
+            return float(la['bler_target'] ** la['max_transmissions'])
 
         uav = self.uavs[ue.assigned_uav]
         avg_sinr_db = self._get_cached_sinr(ue, uav)
@@ -2517,6 +2580,7 @@ class NetworkSlicingEnv:
         # Collect metrics for all active UEs
         # ============================================
         slice_of_ue = []
+        sla_met = {'embb': [], 'urllc': [], 'mmtc': []}
         for ue in self.ues.values():
             if not ue.is_active or getattr(ue, 'demand_bps', 0.0) <= 0:
                 continue  # an idle eMBB UE has no demand this step
@@ -2534,13 +2598,19 @@ class NetworkSlicingEnv:
             delay_sats.append(delay_sat)
             reliability_sats.append(reliability_sat)
 
-            # Combine using slice-specific weights
-            ue_qos_weights = self.qos_weights[ue.slice_type]
-            overall_satisfaction = (
-                ue_qos_weights['throughput'] * throughput_sat +
-                ue_qos_weights['delay'] * delay_sat +
-                ue_qos_weights['reliability'] * reliability_sat
-            )
+            if self.qos_aggregation == 'min':
+                # Every KPI of the slice must hold (SLA): the UE scores its worst KPI, 1 exactly when the SLA is
+                # met. A smooth stand-in for the SLA indicator of Bellone et al. (DCOSS-IoT 2023), reported in info
+                overall_satisfaction = min(throughput_sat, delay_sat, reliability_sat)
+                sla_met[ue.slice_type].append(overall_satisfaction >= 1.0 - 1e-9)
+            else:
+                # Combine using slice-specific weights
+                ue_qos_weights = self.qos_weights[ue.slice_type]
+                overall_satisfaction = (
+                    ue_qos_weights['throughput'] * throughput_sat +
+                    ue_qos_weights['delay'] * delay_sat +
+                    ue_qos_weights['reliability'] * reliability_sat
+                )
 
             overall_satisfactions.append(overall_satisfaction)
 
@@ -2564,6 +2634,8 @@ class NetworkSlicingEnv:
             'avg_delay_sat': np.mean(delay_sats) if len(delay_sats) > 0 else np.inf,
             'avg_reliability_sat': np.mean(reliability_sats) if len(reliability_sats) > 0 else 0.0,
         }
+        # Share of UEs with demand whose SLA is met, per slice (nan if the slice has none this step)
+        self.sla_ratio = {st: float(np.mean(v)) if v else float('nan') for st, v in sla_met.items()}
 
         return qos_reward, breakdown
 
@@ -2645,14 +2717,22 @@ class NetworkSlicingEnv:
         
         # Transmission success based on PER
         per = self._get_cached_per(ue)
-        transmission_success = (1 - per) ** 4  # With 4 retransmissions
+        if self.link_adaptation is not None:
+            transmission_success = 1.0 - per  # per is already the residual after HARQ
+        else:
+            transmission_success = (1 - per) ** 4  # With 4 retransmissions
         
         # Overall reliability
         reliability = transmission_success * (1 - drop_rate) * (1 - handover_loss)
         
         # Normalize
         min_reliability = self.qos_profiles[ue.slice_type].min_reliability
-        satisfaction = min(reliability / min_reliability, 1.0)
+        if self.qos_aggregation == 'min':
+            # In orders of magnitude of the failure rate ("nines"): 1 at the target, 0.6 for 1e-3 against 1e-5
+            failure, target = max(1.0 - reliability, 1e-12), 1.0 - min_reliability
+            satisfaction = float(np.clip(np.log(failure) / np.log(target), 0.0, 1.0)) if failure > target else 1.0
+        else:
+            satisfaction = min(reliability / min_reliability, 1.0)
 
         ue.reliability = reliability
         ue.reliability_satisfaction = satisfaction
