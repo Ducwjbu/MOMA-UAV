@@ -5,7 +5,7 @@ Học tăng cường đa mục tiêu điều khiển UAV làm trạm gốc, cắ
 Repo có hai bài toán:
 
 - **1 UAV**: so sánh các cách chọn omega khi train. `random` là baseline (MOMA-AC gốc, lấy mẫu Dirichlet đều), so với `ols`, `gpi_ls` và `gpi_pd`.
-- **3 UAV (`ma3`)**: MOMA-TD3 của paper MOMA-AC, huấn luyện tập trung, thực thi phân tán (CTDE). Hiện chỉ có lấy mẫu omega đều.
+- **3 UAV (`ma3`)**: MOMA-TD3 của paper MOMA-AC, huấn luyện tập trung, thực thi phân tán (CTDE). Hiện chỉ có lấy mẫu omega đều. Bản cải tiến `ma3_prior` cho actor học phần lệch (residual) trên một đội hình nền cố định, với γ = 0,9; `ma3` giữ làm baseline.
 
 Mô tả kỹ thuật đầy đủ (môi trường, reward, agent, các lỗi đã biết) nằm trong [CLAUDE.md](CLAUDE.md). Hướng dẫn chạy trên Kaggle nằm trong [kaggle/README.md](kaggle/README.md).
 
@@ -70,7 +70,8 @@ Rồi chạy `python train_moma_ac.py --config smoke.yaml`. Tốc độ (it/s) t
 ## Train
 
 ```bash
-# 3 UAV (MOMA-TD3)
+# 3 UAV: bản cải tiến (đội hình nền + residual) và baseline MOMA-TD3
+python train_moma_ac.py --config config/train/moma_ac_ma3_prior.yaml --seed 1
 python train_moma_ac.py --config config/train/moma_ac_ma3.yaml --seed 1
 
 # 1 UAV, 4 cách chọn omega
@@ -82,7 +83,13 @@ python train_moma_ac.py --config config/train/moma_ac_gpi_pd.yaml --seed 1
 
 Mỗi config train 1M bước. Mỗi bước là 60 giây mô phỏng. Một episode là một lượt bay: 18 bước với `ma3`, 19 bước với 1 UAV. Đó là lượt bay dài nhất mà pin vẫn còn đủ để bay về trạm mặt đất (`return_home` trong config môi trường) kể cả khi hover hết công suất ở điểm xa nhất. Episode cũng kết thúc sớm nếu pin của một UAV chỉ còn đủ để bay về.
 
-Tùy chọn thử nghiệm cho `ma3`: `guide_prob` và `guide_until` trong config train bật bộ dẫn đội hình (`guide.py`). Nó lái phần di chuyển trong một tỉ lệ episode để agent được thấy các đội hình dàn đều. Mặc định tắt.
+**Đội hình nền (`formation_prior`, file `prior.py`), dùng trong `moma_ac_ma3_prior.yaml`.**
+- Mỗi UAV có một đỉnh cố định của tam giác đều bán kính `prior_radius` (600 m) quanh tâm vùng, ở độ cao tối đa. Đội hình này cách vị trí phủ đều tối ưu kiểu k-means chưa tới 0,4%.
+- Lệnh di chuyển gửi cho môi trường là lệnh bay về đỉnh cộng với output của actor. Actor chỉ học phần lệch đó, khởi tạo bằng 0, nên lúc đầu agent chính là đội hình (residual policy learning). Công suất và băng thông vẫn do actor quyết định.
+- Config này dùng γ = 0,9. Với γ = 0,99, giá trị của critic trôi xa giá trị thật và kéo actor rời đội hình.
+- Môi trường không đổi. Eval (`eval_checkpoint.py`) tự áp đội hình theo config train.
+
+Tùy chọn thử nghiệm khác cho `ma3`: `guide_prob` và `guide_until` bật bộ dẫn đội hình (`guide.py`). Nó lái phần di chuyển trong một tỉ lệ episode để agent được thấy các đội hình dàn đều. Mặc định tắt, chỉ giúp HV khoảng +0,01, và không dùng chung được với `formation_prior`.
 
 Các tham số:
 

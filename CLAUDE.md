@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-MOMA-AC: a preference-conditioned, multi-objective TD3 agent that controls a UAV base station in a simulated network-slicing environment (eMBB/URLLC/mMTC). It learns a Pareto front over three objectives: QoS, energy, and fairness. The research question is whether smarter weight selection (OLS, GPI-LS, GPI-PD) beats the original MOMA-AC's uniform omega sampling, which is the baseline. Those comparisons are on one UAV. `ma3` is the paper's multi-agent MOMA-TD3 on three UAVs, with uniform sampling only so far.
+MOMA-AC: a preference-conditioned, multi-objective TD3 agent that controls a UAV base station in a simulated network-slicing environment (eMBB/URLLC/mMTC). It learns a Pareto front over three objectives: QoS, energy, and fairness. The research question is whether smarter weight selection (OLS, GPI-LS, GPI-PD) beats the original MOMA-AC's uniform omega sampling, which is the baseline. Those comparisons are on one UAV. `ma3` is the paper's multi-agent MOMA-TD3 on three UAVs, with uniform sampling only so far. Since 2026-11-06 the three-UAV problem is the main one. Its proposed method is `ma3_prior`, a residual policy on a formation prior with gamma 0.9, and plain `ma3` is its baseline.
 
 ## Commands
 
@@ -19,6 +19,7 @@ py train_moma_ac.py --config config/train/moma_ac_ols.yaml
 py train_moma_ac.py --config config/train/moma_ac_gpi_ls.yaml
 py train_moma_ac.py --config config/train/moma_ac_gpi_pd.yaml
 py train_moma_ac.py --config config/train/moma_ac_ma3.yaml      # 3 UAVs, CTDE
+py train_moma_ac.py --config config/train/moma_ac_ma3_prior.yaml  # 3 UAVs, residual on the formation prior (proposed)
 
 # No-training reference for ma3: 3 UAVs hovering in a fixed triangle (18 steps, as the ma3 eval)
 py eval_formation.py
@@ -37,7 +38,7 @@ py compare_runs.py saved_models_moma_ac_random saved_models_moma_ac_ols saved_mo
 
 Use `py` on this machine; `python` is not on the PATH in Git Bash.
 
-Long runs go on Kaggle: see `kaggle/README.md`. Rebuild the upload with `py kaggle/build_bundle.py` after any code change; a new file the training needs must also be added to `FILES` there. `MOMA_DEVICE=cpu|cuda` overrides the device. `kaggle/run_kaggle.py` runs several training processes at once and pins each to the least busy GPU. `ma3` is not in its default variants: pass `--variants ma3`.
+Long runs go on Kaggle: see `kaggle/README.md`. Rebuild the upload with `py kaggle/build_bundle.py` after any code change; a new file the training needs must also be added to `FILES` there. `MOMA_DEVICE=cpu|cuda` overrides the device. `kaggle/run_kaggle.py` runs several training processes at once and pins each to the least busy GPU. `ma3` and `ma3_prior` are not in its default variants: pass `--variants ma3_prior ma3`.
 
 **Smoke test:** to check a change, copy a train config and set `total_training_steps: 1500`, `min_buffer_size: 100`, `batch_size: 32`, `max_steps_per_episode: 20`, `save_interval: 1500`, `eval_interval: 750`, `eval_n_omega: 5`, `eval_n_episodes: 1`, `eval_steps: 5`, and a throwaway `save_dir`. For the OLS and GPI variants also set `gpi_ls_interval: 300`, `gpi_ls_episodes: 1`, `dyna_interval: 100`, `dyna_rollouts: 100`, `model_fit_steps: 30`. This takes about a minute and exercises training, GPI-LS, Dyna, evaluation, and checkpointing. Keys left out fall back to the defaults in `MOMA_AC_Trainer.__init__`. A train config can name its environment with `env_config`; `--env_config` overrides it.
 
@@ -91,6 +92,14 @@ The actor uses tanh for the first 3 dims and sigmoid for the rest. `select_actio
 - `gpi_pd`: `gpi_ls` plus GPI-prioritized replay (`PrioritizedReplayBuffer`, Eq. 10 and 17, with a Huber critic loss) and Dyna (`DynamicsEnsemble`, every `dyna_interval` steps, one-step rollouts into `model_buffer`, mixed into batches by `dyna_beta`). The ensemble members are one batched network (`EnsembleLinear`), about 4x faster on GPU than separate nets, and each member still draws its own batch.
 
 **Several UAVs (`MOMA_CTDE_Agent`, chosen by the trainer when the env has more than one UAV).** MOMA-TD3, Alg. 1 of the MOMA-AC paper. `MultiHeadActor` has a shared trunk and one head per UAV, and `pi_i` sees only `o_i` and omega. Critics take the joint observation and joint action, flattened in UAV id order, and so does the one `buffer` (equivalent to the paper's per-agent buffers sampled in sync, since the reward is shared). The actor loss follows Eq. 10-12: for each UAV only `a_i` comes from the actor, the others keep their replay actions, and the per-UAV losses are summed. Only `omega_sampling: random` is supported; anything else raises `ValueError`. `expl_noise` decays as in the one-UAV runs, while the paper's Alg. 1 shows a fixed sigma; set `expl_noise_decay: 1.0` for that. `guide_prob` and `guide_until` turn on the formation guide (`guide.py`, any number of UAVs): in that share of episodes, falling linearly to 0 at `guide_until`, a random regular N-gon (held still or rotating) steers the movement for the first k steps (k uniform up to the episode length) while the actor keeps power and bandwidth. It only feeds exploration data, as in DDPGfD and Jump-Start RL; evaluation is always the actor. Off by default.
+
+**Formation prior (`formation_prior`, `prior.py`; on in `moma_ac_ma3_prior.yaml`).** It is a residual policy (Silver et al. arXiv:1812.06298 Sec. IV; Johannink et al. arXiv:1812.03201 Eq. 5).
+- `prior.attach` wraps `step` of both `env` and `eval_env`: UAV i's movement becomes `clip(move_to(vertex_i) + a_i[0:3], -1, 1)`. The vertex is UAV i's corner of a regular N-gon of radius `prior_radius` (600 m) around the middle of the fly range, at the top altitude (one UAV: the middle), assigned in UAV id order.
+- The buffer, critics and actor see `a_i`, the residual. `zero_movement_output` zeroes the movement rows of the actor's last layer, so the untrained policy is the formation; a loaded checkpoint overwrites that. Power and bandwidth have no prior.
+- Can't be combined with the guide (`ValueError`). `eval_checkpoint.py` gets the wrapped env through the trainer, so it applies the prior from the train config. `eval_formation.py` and `--formation` don't use it.
+- Why: on ma3 the UAV positions explain only about 17% of a step's QoS variance (supervised check), so MOMA-TD3 from scratch never finds spread formations and cruises at every weight. The r=600 triangle is within 0.4% of the RMS distance of the 3-means coverage placement of the 2 km area.
+- Why gamma 0.9: with 0.99 the vector critic drifts far below the true values, even negative for QoS and fairness at the energy corner (TD3 paper Sec. 5.1). That drift pulls the residual away from the formation; the prior with gamma 0.99 ends no better than plain MOMA-TD3.
+- At 100k steps on 20 held-out episodes the prior with gamma 0.9 reached HV 0.254 against 0.187 for `ma3`. It hovers in formation at QoS-heavy weights and cruises at the energy corner.
 
 There are no actor snapshots: the "policies" of GPI are the one conditioned network at each weight in M. `_gpi_action_batch` and `_gpi_td_errors` score each candidate only with its own `Q(s, a, w')` instead of the full K×K sweep, for speed.
 

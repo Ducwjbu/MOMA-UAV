@@ -23,6 +23,7 @@ from tqdm import tqdm
 from utils import Configuration
 from environment import NetworkSlicingEnv
 from guide import FormationGuide
+import prior
 from agents_moma_ac import SLA_KEYS, MOMA_AC_Agent, MOMA_CTDE_Agent, episode_diagnostics, nan_mean
 
 
@@ -131,6 +132,9 @@ class MOMA_AC_Trainer:
             # to 0 at guide_until steps (0: constant). guide_prob 0 turns it off
             "guide_prob":   float(_get(tcfg, "guide_prob",  0.0)),
             "guide_until":  int(  _get(tcfg, "guide_until", 0)),
+            # Formation prior (prior.py): the actor learns a residual on top of a fixed formation
+            "formation_prior": bool( _get(tcfg, "formation_prior", False)),
+            "prior_radius":    float(_get(tcfg, "prior_radius",    600.0)),
             # GPI-LS
             "gpi_ls_interval":  int(_get(tcfg, "gpi_ls_interval",  50_000)),
             "gpi_ls_episodes":  int(_get(tcfg, "gpi_ls_episodes",  3)),
@@ -219,6 +223,15 @@ class MOMA_AC_Trainer:
             model_fit_steps   = self.cfg["model_fit_steps"],
             model_buffer_size = self.cfg["model_buffer_size"],
         )
+
+        if self.cfg["formation_prior"]:
+            if self.cfg["guide_prob"] > 0:
+                raise ValueError("formation_prior and the formation guide (guide_prob > 0) can't be combined")
+            # Both envs, so that evaluation adds the same prior. The zero start is overwritten by a checkpoint
+            for env in (self.env, self.eval_env):
+                vertices = prior.attach(env, self.uav_ids, self.cfg["prior_radius"])
+            prior.zero_movement_output(self.agent)
+            print(f"[MOMA-AC] Formation prior, r={self.cfg['prior_radius']:.0f} m: {np.round(vertices, 1).tolist()}")
 
         if checkpoint_path and os.path.exists(checkpoint_path):
             self.agent.load(checkpoint_path)

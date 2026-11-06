@@ -12,7 +12,7 @@ import zipfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(REPO, "kaggle", "moma_uav_code.zip")
 FILES = [
-    "agents_moma_ac.py", "environment.py", "city.py", "guide.py", "train_moma_ac.py", "utils.py", "compare_runs.py",
+    "agents_moma_ac.py", "environment.py", "city.py", "guide.py", "prior.py", "train_moma_ac.py", "utils.py", "compare_runs.py",
     "eval_formation.py",
     "config/environment/default.yaml",
     "config/environment/ma3.yaml",
@@ -21,6 +21,7 @@ FILES = [
     "config/train/moma_ac_gpi_ls.yaml",
     "config/train/moma_ac_gpi_pd.yaml",
     "config/train/moma_ac_ma3.yaml",
+    "config/train/moma_ac_ma3_prior.yaml",
     "kaggle/run_kaggle.py",
 ]
 
