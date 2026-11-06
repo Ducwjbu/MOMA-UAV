@@ -261,6 +261,14 @@ backhaul:
     built_up_ratio: 0.5 # delta
     building_height_scale: 20.0 # m, kappa (Rayleigh)
 
+# Low Battery RTH as the DJI M300 RTK does it (User Manual v1.8, 2021.03, p. 22): "The thresholds for these warnings
+# are automatically determined based on the aircraft's current altitude and distance from the Home Point", the point
+# it took off from. An episode ends when a UAV's battery falls to the energy for flying back there: level flight at
+# velocity_max in the episode's wind (airspeed-limited), then the descent at velocity_max_descent, radio off. The
+# flight out from the Home Point to the starting position is charged at reset. Home Point: the gateway's ground station
+return_home:
+    position: [577.5, 0.0] # m, x y on the ground (backhaul.gateway_position)
+
 # Explicit city of ITU-R P.1410-6 (Sec. 2.1.4-2.1.5), the parameters of the a2g section (dense urban): grid pitch
 # 1000/sqrt(beta) = 57.7 m, footprint 1000 sqrt(alpha/beta) = 40.8 m, streets 16.9 m, Rayleigh heights (mode
 # gamma). Regenerated each episode. LoS of access and backhaul links is geometric; UAVs keep roof_clearance

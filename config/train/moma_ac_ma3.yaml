@@ -12,7 +12,7 @@ min_buffer_size: 5000
 train_frequency: 1
 train_iterations: 1
 batch_size: 256
-max_steps_per_episode: 20     # 20 min of flight at T_L = 60 s: one 548 Wh battery lasts about 22 min
+max_steps_per_episode: 18     # min on station at T_L = 60 s: the longest mission that, in the worst case (hovering at full power, farthest point), still leaves the energy to fly home (return_home)
 
 # Omega sampling
 omega_sampling: "random"
@@ -39,7 +39,7 @@ save_interval: 100000
 eval_interval: 50000
 eval_n_omega: 30
 eval_n_episodes: 3
-eval_steps: 20
+eval_steps: 18
 
 # Output
 save_dir: "saved_models_moma_ac_ma3"

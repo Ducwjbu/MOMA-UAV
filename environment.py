@@ -444,6 +444,10 @@ class NetworkSlicingEnv:
         self.processing_delay_ms = env_config.uav_params.processing_delay_ms
         self.min_power_ratio = 0.05  # Lowest transmit power, as a fraction of max_power
         self._init_energy_bounds()
+        # Low-battery return to the Home Point (DJI M300 RTK). Absent: an episode ends only at an empty battery
+        self.return_home = getattr(env_config, 'return_home', None)
+        if self.return_home is not None:
+            self.home_position = np.array([*self.return_home.position, 0.0], dtype=np.float64)
 
         # UE dynamics parameters
         self.ue_id_pool = set()  # Pool of available IDs for reuse
@@ -568,6 +572,9 @@ class NetworkSlicingEnv:
                 uav.position = pos
         for uav in self.uavs.values():
             uav.position = self._apply_height_bounds(uav.position)
+        if self.return_home is not None:
+            for uav in self.uavs.values():
+                self.charge_outbound_flight(uav)
 
         # Episodes start with two active hotspots, so UEs are clustered from step 0
         self.hotspots = []
@@ -909,8 +916,13 @@ class NetworkSlicingEnv:
         # Update time
         self.current_time += self.T_L
         
-        # Check termination conditions
-        done = any(uav.current_battery <= 0 for uav in self.uavs.values())
+        # Check termination conditions. With return_home, Low Battery RTH: the mission ends when a UAV has
+        # just the energy left to fly back to the Home Point
+        if self.return_home is None:
+            done = any(uav.current_battery <= 0 for uav in self.uavs.values())
+        else:
+            done = any(uav.current_battery <= self._home_leg_energy(uav.position, outbound=False)
+                       for uav in self.uavs.values())
 
         # Get new observations
         observations = self._get_observations()
@@ -997,6 +1009,46 @@ class NetworkSlicingEnv:
         along = u @ wind
         reach = along + np.sqrt(max(along ** 2 - wind @ wind + max_airspeed ** 2, 0.0))
         return u * min(speed, max(reach, 0.0))
+
+    def _home_leg_energy(self, position: np.ndarray, outbound: bool) -> float:
+        """
+        Joules for the flight between the Home Point (on the ground) and a position, radio off: the climb at the
+        Home Point, then level flight out at the position's height (outbound), or level flight back, then the
+        descent at the Home Point. Level flight at velocity_max, cut by the airspeed limit in the episode's
+        wind: the power still falls up to the energy-optimal speed (about 21 m/s), so velocity_max is also the
+        cheapest speed per metre. The wind on the vertical leg is the one at half the height. Descent is not
+        credited back, as in step
+        """
+        delta = position[:2] - self.home_position[:2]
+        if not outbound:
+            delta = -delta
+        dist = float(np.linalg.norm(delta))
+        v_max = self.uav_params.velocity_max
+        energy = 0.0
+        if dist > 1e-9:
+            if self.wind_params is None:
+                energy += self._propulsion_power(v_max, 0.0) * dist / v_max
+            else:
+                wind = self._wind_at(position[2])
+                ground = self._limit_airspeed(delta / dist * v_max, wind, v_max)
+                speed = float(np.linalg.norm(ground))
+                if speed < 1e-9:
+                    return np.inf
+                energy += self._propulsion_power(speed, 0.0, float(np.linalg.norm(ground - wind))) * dist / speed
+        height = float(position[2] - self.home_position[2])
+        if height > 0:
+            rate = self.velocity_max_vertical if outbound else self.velocity_max_descent
+            v_z = rate if outbound else -rate
+            if self.wind_params is None:
+                power = self._propulsion_power(0.0, v_z)
+            else:
+                power = self._propulsion_power(0.0, v_z, float(np.linalg.norm(self._wind_at(height / 2.0))))
+            energy += power * height / rate
+        return energy
+
+    def charge_outbound_flight(self, uav):
+        """Battery left after the flight from the Home Point to the UAV's position; call it after placing a UAV"""
+        uav.current_battery = uav.battery_capacity - self._home_leg_energy(uav.position, outbound=True)
 
     def _apply_height_bounds(self, position: np.ndarray) -> np.ndarray:
         """

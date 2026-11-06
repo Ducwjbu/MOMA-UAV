@@ -80,7 +80,9 @@ python train_moma_ac.py --config config/train/moma_ac_gpi_ls.yaml --seed 1
 python train_moma_ac.py --config config/train/moma_ac_gpi_pd.yaml --seed 1
 ```
 
-Mỗi config train 1M bước. Mỗi bước là 60 giây mô phỏng.
+Mỗi config train 1M bước. Mỗi bước là 60 giây mô phỏng. Một episode là một lượt bay: 18 bước với `ma3`, 19 bước với 1 UAV. Đó là lượt bay dài nhất mà pin vẫn còn đủ để bay về trạm mặt đất (`return_home` trong config môi trường) kể cả khi hover hết công suất ở điểm xa nhất. Episode cũng kết thúc sớm nếu pin của một UAV chỉ còn đủ để bay về.
+
+Tùy chọn thử nghiệm cho `ma3`: `guide_prob` và `guide_until` trong config train bật bộ dẫn đội hình (`guide.py`). Nó lái phần di chuyển trong một tỉ lệ episode để agent được thấy các đội hình dàn đều. Mặc định tắt.
 
 Các tham số:
 

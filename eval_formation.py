@@ -40,6 +40,8 @@ def evaluate(env, positions: np.ndarray, power: float, n_episodes: int, steps: i
         env.reset()
         for uav, pos in zip(env.uavs.values(), positions):
             uav.position = pos.copy()
+            if env.return_home is not None:
+                env.charge_outbound_flight(uav)   # The flight out goes to the formation, not to the random start
         # Placing the UAVs is setup: forget the assignments, so it isn't counted as handovers
         for ue in env.ues.values():
             ue.assigned_uav = None
@@ -79,7 +81,7 @@ if __name__ == "__main__":
     parser.add_argument("--radius", type=float, default=600.0, help="Distance from the center to each UAV (m)")
     parser.add_argument("--power", type=float, default=0.5, help="Transmit power as a fraction of max_power")
     parser.add_argument("--n_episodes", type=int, default=3)
-    parser.add_argument("--steps", type=int, default=20, help="Episode length, eval_steps of moma_ac_ma3.yaml")
+    parser.add_argument("--steps", type=int, default=18, help="Episode length, eval_steps of moma_ac_ma3.yaml")
     parser.add_argument("--n_omega", type=int, default=30)
     parser.add_argument("--out", default="formation_baseline.csv")
     args = parser.parse_args()

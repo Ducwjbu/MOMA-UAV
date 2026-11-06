@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from utils import Configuration
 from environment import NetworkSlicingEnv
+from guide import FormationGuide
 from agents_moma_ac import SLA_KEYS, MOMA_AC_Agent, MOMA_CTDE_Agent, episode_diagnostics, nan_mean
 
 
@@ -126,6 +127,10 @@ class MOMA_AC_Trainer:
             "max_steps_per_episode":  int(_get(tcfg, "max_steps_per_episode", 60)),
             "omega_sampling":         str(_get(tcfg, "omega_sampling",        "random")),
             "corner_warmup_episodes": int(_get(tcfg, "corner_warmup_episodes", 0)),
+            # Formation guide (guide.py): share of episodes whose movement it steers, falling linearly
+            # to 0 at guide_until steps (0: constant). guide_prob 0 turns it off
+            "guide_prob":   float(_get(tcfg, "guide_prob",  0.0)),
+            "guide_until":  int(  _get(tcfg, "guide_until", 0)),
             # GPI-LS
             "gpi_ls_interval":  int(_get(tcfg, "gpi_ls_interval",  50_000)),
             "gpi_ls_episodes":  int(_get(tcfg, "gpi_ls_episodes",  3)),
@@ -218,6 +223,9 @@ class MOMA_AC_Trainer:
         if checkpoint_path and os.path.exists(checkpoint_path):
             self.agent.load(checkpoint_path)
 
+        self.guide = FormationGuide(self.env) if self.cfg["guide_prob"] > 0 else None
+        self.guide_p = 0.0
+
         # ── Metrics ──────────────────────────────────────────────
         self.step_log: list = []
         self.eval_log: list = []
@@ -232,6 +240,17 @@ class MOMA_AC_Trainer:
             self._load_resume()
 
     # ── Main Training Loop ──────────────────────────────────────
+
+    def _guide_episode(self, step: int) -> int:
+        """Steps the formation guide drives in the next episode (0: the actor alone)"""
+        if self.guide is None:
+            return 0
+        self.guide_p = self.cfg["guide_prob"]
+        if self.cfg["guide_until"] > 0:
+            self.guide_p *= max(0.0, 1.0 - step / self.cfg["guide_until"])
+        if np.random.rand() >= self.guide_p:
+            return 0
+        return self.guide.new_episode(self.cfg["max_steps_per_episode"])
 
     def _joint_obs(self, obs_dict: dict) -> np.ndarray:
         """Observations of all UAVs in id order, shape (n_uavs, obs_dim)."""
@@ -251,6 +270,7 @@ class MOMA_AC_Trainer:
         last_ep_val   = None
         last_ep_diag  = None
         omega         = self.agent.sample_omega()
+        guide_steps   = self._guide_episode(step)
         use_gpi       = self.agent.use_gpi               # Follow GPI policy (GPI-PD Alg. 2, line 12)
         t0            = time.time()
 
@@ -260,11 +280,15 @@ class MOMA_AC_Trainer:
             #               dims[3:] =sigmoid[0,1] (power, BW) — no clipping needed
             if self.multi_uav:
                 action = self.agent.select_joint_action(obs, omega, explore=True)
+                if ep_steps < guide_steps:   # The guide steers movement, the actor keeps power and bandwidth
+                    action[:, 0:3] = self.guide.movement(self.uav_ids, self.agent.expl_noise)
                 obs_dict_new, _, done, info = self.env.step(dict(zip(self.uav_ids, action)))
                 obs_next = self._joint_obs(obs_dict_new)
                 ep_diag.append((info["coverage"], info["handovers"], info["min_uav_distance"], info["backhaul_limited"]))
             else:
                 action = self.agent.select_action(obs, omega, explore=True, use_gpi=use_gpi)
+                if ep_steps < guide_steps:
+                    action[0:3] = self.guide.movement([self.uav_id], self.agent.expl_noise)[0]
                 obs_dict_new, _, done, info = self.env.step({self.uav_id: action})
                 obs_next = obs_dict_new.get(self.uav_id, obs)
             r_vec    = np.array(info.get("reward_vector", [0., 0., 0.]),
@@ -305,6 +329,7 @@ class MOMA_AC_Trainer:
                 last_ep_val = np.mean(ep_rvec, axis=0) if ep_rvec else None
                 last_ep_diag = episode_diagnostics(ep_diag) if ep_diag else None
                 omega       = self.agent.sample_omega()
+                guide_steps = self._guide_episode(step)
                 obs_dict   = self.env.reset()
                 obs         = self._joint_obs(obs_dict) if self.multi_uav else obs_dict[self.uav_id]
                 ep_rvec     = []
@@ -324,6 +349,8 @@ class MOMA_AC_Trainer:
                 })
                 if last_ep_diag is not None:
                     self.step_log[-1].update(last_ep_diag)
+                if self.guide is not None:
+                    self.step_log[-1]["guide_prob"] = self.guide_p
                 pbar.set_postfix({
                     "QoS":  f"{last_ep_val[0]:.3f}",
                     "Eng":  f"{last_ep_val[1]:.3f}",

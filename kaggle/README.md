@@ -115,7 +115,7 @@ Cập nhật code trước: chạy `py kaggle/build_bundle.py`, rồi vào Datas
 
 ## Chạy 3 UAV (`ma3`)
 
-`ma3` là MOMA-TD3 của paper trên 3 UAV, chỉ lấy mẫu omega đều. Môi trường `config/environment/ma3.yaml`: khu 2 km, 31 UE eMBB, 60 UE mMTC và 26 trạm bên đường (RSU, slice URLLC), episode 20 bước. Nó không nằm trong variant mặc định.
+`ma3` là MOMA-TD3 của paper trên 3 UAV, chỉ lấy mẫu omega đều. Môi trường `config/environment/ma3.yaml`: khu 2 km, 31 UE eMBB, 60 UE mMTC và 26 trạm bên đường (RSU, slice URLLC), episode 18 bước (pin phải còn đủ để bay về trạm mặt đất). Nó không nằm trong variant mặc định.
 
 1. Nên dùng một notebook riêng (cách tạo như Bước 2). Đặt `VARIANTS = ["ma3"]` và `SEEDS` theo nhu cầu. Config `moma_ac_ma3.yaml` đã tự trỏ tới `config/environment/ma3.yaml`. Có thể để chung với các variant 1 UAV, nhưng run `ma3` chậm hơn nhiều nên sẽ chiếm chỗ lâu.
 2. Kết quả nằm ở `runs/saved_models_moma_ac_ma3/seed_<n>/`. `eval_metrics.csv` và `step_metrics.csv` có thêm `coverage`, `handovers`, `backhaul_limited` (tỷ lệ UAV vượt dung lượng backhaul), `min_uav_distance` (khoảng cách nhỏ nhất thực sự giữa hai UAV) và `mean_uav_distance` (trung bình theo step của cặp gần nhất). Các cột SLA theo slice giống run 1 UAV.

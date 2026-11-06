@@ -157,7 +157,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_episodes", type=int, default=20)
     parser.add_argument("--seed_base", type=int, default=100000, help="Episode k uses seed_base + k")
     parser.add_argument("--steps", type=int, default=None,
-                        help="Episode length; default eval_steps of the train config, 20 for --formation")
+                        help="Episode length; default eval_steps of the train config, 18 for --formation (moma_ac_ma3.yaml)")
     parser.add_argument("--n_omega", type=int, default=30)
     parser.add_argument("--baseline", default=None, help=".npy of another policy on the same episodes, for paired deltas")
     parser.add_argument("--out", required=True, help="Output prefix")
@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
     omegas = eval_omegas(args.n_omega)
     if args.formation:
-        steps = args.steps or 20
+        steps = args.steps or 18
         policies = {"formation": run_formation(args.env_config or "config/environment/ma3.yaml", args.n_omega,
                                                args.n_episodes, args.seed_base, steps, args.radius, args.power)}
     else:
