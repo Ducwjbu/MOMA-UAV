@@ -42,9 +42,7 @@ Trên Windows, nếu lệnh `python` không có trong PATH thì dùng `py` thay 
 Nên chạy thử mỗi khi vừa pull code mới hoặc vừa sửa gì đó. Tạo file `smoke.yaml` ngoài repo, hoặc trong một thư mục không commit, với nội dung:
 
 ```yaml
-# Chép từ config/train/moma_ac_ma3.yaml (hoặc moma_ac_random.yaml), rồi ghi đè các dòng sau
-env_config: "config/environment/ma3.yaml"
-omega_sampling: "random"
+# Chép nguyên file config/train/moma_ac_<variant>.yaml muốn thử, rồi sửa các dòng sau
 total_training_steps: 1500
 min_buffer_size: 100
 batch_size: 32
@@ -67,7 +65,7 @@ dyna_rollouts: 100
 model_fit_steps: 30
 ```
 
-Rồi chạy `python train_moma_ac.py --config smoke.yaml`. Chạy thử thành công khi lệnh kết thúc không lỗi và `smoke_out/` có `eval_metrics.csv`, `checkpoints/` và file `DONE`. Các số trong lần chạy thử không có ý nghĩa.
+Rồi chạy `python train_moma_ac.py --config smoke.yaml`. Tốc độ (it/s) trong 5000 bước đầu cao hơn hẳn lúc train thật, vì khi đó chưa cập nhật mạng; muốn đo tốc độ thì xem sau khoảng 20k bước. Chạy thử thành công khi lệnh kết thúc không lỗi và `smoke_out/` có `eval_metrics.csv`, `checkpoints/` và file `DONE`. Các số trong lần chạy thử không có ý nghĩa.
 
 ## Train
 
@@ -103,7 +101,7 @@ Các tham số:
 
 | Run | Kaggle GPU | Laptop GTX 1650 + CPU 12 luồng |
 |---|---|---|
-| `ma3`, 1M bước | khoảng 9 giờ (đã đo) | khoảng 20 giờ (13 bước/giây khi chạy 3 run cùng lúc) |
+| `ma3`, 1M bước | khoảng 9 giờ (30 bước/giây, đã đo) | khoảng 14 giờ (20 bước/giây mỗi run khi chạy 3 run cùng lúc) |
 | 1 UAV, 1M bước | chưa đo với `v1.0` | chưa đo với `v1.0` |
 
 Run dài nên chạy trên Kaggle, xem [kaggle/README.md](kaggle/README.md). Nhớ build lại file upload bằng `python kaggle/build_bundle.py` mỗi khi sửa code.
