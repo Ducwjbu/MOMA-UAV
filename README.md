@@ -11,7 +11,14 @@ Mô tả kỹ thuật đầy đủ (môi trường, reward, agent, các lỗi đ
 
 ## Phiên bản môi trường
 
-Môi trường hiện tại là **`v1.0`** (git tag `v1.0`). Nó có thành phố tường minh theo ITU-R P.1410, suy hao xuyên tường, shadowing tương quan, fast fading, gió Hà Nội, traffic theo chuẩn 3GPP, các trạm bên đường (RSU) cho URLLC, và QoS theo SLA. Nguồn của từng tham số được ghi trong comment của `config/environment/*.yaml`.
+Môi trường `v1.0` (git tag `v1.0`) có thành phố tường minh theo ITU-R P.1410, suy hao xuyên tường, shadowing tương quan, fast fading, gió Hà Nội, traffic theo chuẩn 3GPP, các trạm bên đường (RSU) cho URLLC, và QoS theo SLA. Nguồn của từng tham số được ghi trong comment của `config/environment/*.yaml`.
+
+Sau `v1.0` môi trường đổi hai lần, nên mọi kết quả trong `results-v1/` đều phải chạy lại:
+
+- **Pin dự trữ để bay về:** theo cơ chế Low Battery RTH của DJI M300. Mỗi episode dài 18 bước với 3 UAV, 19 bước với 1 UAV.
+- **Mô hình lưu lượng mới:** bản đồ mật độ lưu lượng log-normal của Lee et al. 2014 (`traffic_map.py`, mục `traffic_map` trong config) thay cho các hotspot. Mỗi episode sinh một bản đồ mới. UE eMBB xuất hiện theo bản đồ, UE mMTC xuất hiện đều.
+
+Hai thay đổi này sẽ được gắn tag `v1.1`.
 
 **Mọi thay đổi môi trường đều làm kết quả cũ mất giá trị so sánh**, vì thang reward thay đổi. Vì vậy:
 

@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from utils import Configuration
 from city import City
+from traffic_map import TrafficMap
 from dataclasses import dataclass, field
 from numba import jit, prange
 from collections import defaultdict, deque
@@ -466,6 +467,11 @@ class NetworkSlicingEnv:
         self.hotspot_max_count = 4  # Maximum concurrent hotspots
         self.hotspot_min_lifetime = 900.0  # seconds
         self.hotspot_max_lifetime = 1800.0  # seconds
+        # Measured spatial traffic density (Lee et al. 2014, traffic_map.py) in place of the hotspots: arriving UEs
+        # of traffic_map.slices are placed with probability proportional to a log-normal, spatially correlated map
+        # drawn at every reset. Absent: the hotspots above
+        self.traffic_map_params = getattr(env_config, 'traffic_map', None)
+        self.traffic_map = None
 
         #Traffic model
         self.traffic_patterns = env_config.traffic_patterns
@@ -576,9 +582,12 @@ class NetworkSlicingEnv:
             for uav in self.uavs.values():
                 self.charge_outbound_flight(uav)
 
-        # Episodes start with two active hotspots, so UEs are clustered from step 0
+        # Episodes start with two active hotspots, so UEs are clustered from step 0; with a traffic map, a new map
+        # instead (it holds for the whole episode: Lee et al. measure hourly densities, an episode is 18-19 min)
         self.hotspots = []
-        for _ in range(2):
+        if self.traffic_map_params is not None:
+            self.traffic_map = TrafficMap(self.service_area, self.traffic_map_params)
+        for _ in range(2 if self.traffic_map is None else 0):
             hotspot = self._spawn_new_hotspot()
             hotspot['age'] = hotspot['lifetime'] * 0.2
             hotspot['current_strength'] = hotspot['max_strength']
@@ -1213,7 +1222,8 @@ class NetworkSlicingEnv:
         self.stats['departures'] = 0
         
         # Update hotspot lifecycles
-        self._update_hotspots()
+        if self.traffic_map is None:
+            self._update_hotspots()
         
         # ============================================
         # OPTIMIZATION 1: Get active UEs as arrays
@@ -1431,9 +1441,17 @@ class NetworkSlicingEnv:
         # ============================================
         # Find active hotspots (strength > 0.5)
         active_hotspots = [h for h in self.hotspots if h['current_strength'] > 0.5]
-        
+
+        if self.traffic_map is not None:
+            # The slice first, since only traffic_map.slices follow the map; the others are uniform
+            slice_type = self._draw_slice()
+            if slice_type in self.traffic_map_params['slices']:
+                x, y = self.traffic_map.sample()
+            else:
+                x = np.random.uniform(0, self.service_area[0])
+                y = np.random.uniform(0, self.service_area[1])
         # 70% chance to spawn near an active hotspot
-        if active_hotspots and np.random.random() < 0.7:
+        elif active_hotspots and np.random.random() < 0.7:
             # Choose hotspot weighted by strength
             weights = [h['current_strength'] for h in active_hotspots]
             weights = np.array(weights) / sum(weights)
@@ -1462,11 +1480,9 @@ class NetworkSlicingEnv:
         velocity_x = speed * np.cos(direction)
         velocity_y = speed * np.sin(direction)
         
-        slice_type = np.random.choice(
-            ["embb", "urllc", "mmtc"],
-            p=[self.slice_probs["embb"], self.slice_probs["urllc"], self.slice_probs["mmtc"]]
-        )
-        
+        if self.traffic_map is None:
+            slice_type = self._draw_slice()
+
         # ============================================
         # Create UE with reused/new ID
         # ============================================
@@ -1490,6 +1506,12 @@ class NetworkSlicingEnv:
         )
         
         self.ues[new_ue_id] = new_ue
+
+    def _draw_slice(self) -> str:
+        return np.random.choice(
+            ["embb", "urllc", "mmtc"],
+            p=[self.slice_probs["embb"], self.slice_probs["urllc"], self.slice_probs["mmtc"]]
+        )
 
     def _street_directions(self, xy: np.ndarray) -> List[np.ndarray]:
         """Unit directions a pedestrian at xy can walk: along a north-south street +-y, along an east-west street

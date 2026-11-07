@@ -187,6 +187,23 @@ rsu:
     spacing: 1000.0 # m along the streets
     antenna_height: 5.0 # m
 
+# Spatial traffic density (traffic_map.py), replacing the hotspots: Lee, Zhou, Zhong, Niu, Zhou, Zhang, "Spatial
+# Modeling of the Traffic Density in Cellular Networks", IEEE Wireless Commun. 21(1):80-88, 2014. Eq. 1-2: a
+# log-normal map from a sum of L = 10 sinusoids; Table 1, urban DL (measured in a city of over 8 million): sigma
+# 2.3991, coherence distance 71.4 m, omega_max 0.011592 rad/m; 10 m pixels (3/300 km, p. 82); a map off the
+# coherence distance by more than 30 m is redrawn (p. 85). mu (18.93) only scales the density and is left out: the
+# load calibration of the slicing section stands. Drawn at every reset and held for the episode. Only eMBB follows
+# the map, since the measured density is human data use (p. 87); mMTC sensors stay uniform
+traffic_map:
+    sigma: 2.3991
+    omega_max: 0.011592 # rad/m
+    n_sinusoids: 10
+    pixel: 10.0 # m
+    coherence_distance: 71.4 # m
+    coherence_tolerance: 30.0 # m
+    max_redraws: 50
+    slices: [embb]
+
 # Distance-based classification thresholds (used for DA formation)
 da_distance_thresholds:
     near_max: 300.0 # meters - "Near" SINR level externally
