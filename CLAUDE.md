@@ -20,6 +20,8 @@ py train_moma_ac.py --config config/train/moma_ac_gpi_ls.yaml
 py train_moma_ac.py --config config/train/moma_ac_gpi_pd.yaml
 py train_moma_ac.py --config config/train/moma_ac_ma3.yaml      # 3 UAVs, CTDE
 py train_moma_ac.py --config config/train/moma_ac_ma3_prior.yaml  # 3 UAVs, residual on the formation prior (proposed)
+py train_moma_ac.py --config config/train/moma_ac_ma3_g90.yaml        # ablation: ma3 with gamma 0.9
+py train_moma_ac.py --config config/train/moma_ac_ma3_prior_g99.yaml  # ablation: ma3_prior with gamma 0.99
 
 # No-training reference for ma3: 3 UAVs hovering in a fixed triangle (18 steps, as the ma3 eval)
 py eval_formation.py
@@ -27,7 +29,9 @@ py eval_formation.py
 # Optional flags
 py train_moma_ac.py --config <yaml> --env_config <yaml> --checkpoint <path.pth> --seed <n> --resume --max_hours <h>
 
-# Final numbers: eval one checkpoint on 20 held-out episodes (seeds 100000+), CPU, with bootstrap CIs
+# Final numbers: eval one checkpoint on 20 held-out episodes (seeds 100000+), CPU, with bootstrap CIs.
+# Seeds 100000+ were used to develop ma3_prior (gamma, radius), so they are validation; final 3-UAV numbers use
+# --seed_base 200000 for every policy, heuristics included, run once the method is fixed.
 py eval_checkpoint.py --config config/train/moma_ac_random.yaml --checkpoint <dir>/checkpoints/checkpoint_step_1000000.pth --out eval_random
 py eval_checkpoint.py --config config/train/moma_ac_ols.yaml --checkpoint <...> --baseline eval_random_actor.npy --out eval_ols
 py eval_checkpoint.py --formation --out eval_triangle
@@ -38,7 +42,7 @@ py compare_runs.py saved_models_moma_ac_random saved_models_moma_ac_ols saved_mo
 
 Use `py` on this machine; `python` is not on the PATH in Git Bash.
 
-Long runs go on Kaggle: see `kaggle/README.md`. Rebuild the upload with `py kaggle/build_bundle.py` after any code change; a new file the training needs must also be added to `FILES` there. `MOMA_DEVICE=cpu|cuda` overrides the device. `kaggle/run_kaggle.py` runs several training processes at once and pins each to the least busy GPU. `ma3` and `ma3_prior` are not in its default variants: pass `--variants ma3_prior ma3`.
+Long runs go on Kaggle: see `kaggle/README.md`. Rebuild the upload with `py kaggle/build_bundle.py` after any code change; a new file the training needs must also be added to `FILES` there. `MOMA_DEVICE=cpu|cuda` overrides the device. `kaggle/run_kaggle.py` runs several training processes at once and pins each to the least busy GPU. `ma3`, `ma3_prior` and the ablations `ma3_g90`, `ma3_prior_g99` are not in its default variants: pass `--variants ma3_prior ma3`. The 3-UAV results for the course report are on env tag `v1.1`, kept fixed until they are done.
 
 **Smoke test:** to check a change, copy a train config and set `total_training_steps: 1500`, `min_buffer_size: 100`, `batch_size: 32`, `max_steps_per_episode: 20`, `save_interval: 1500`, `eval_interval: 750`, `eval_n_omega: 5`, `eval_n_episodes: 1`, `eval_steps: 5`, and a throwaway `save_dir`. For the OLS and GPI variants also set `gpi_ls_interval: 300`, `gpi_ls_episodes: 1`, `dyna_interval: 100`, `dyna_rollouts: 100`, `model_fit_steps: 30`. This takes about a minute and exercises training, GPI-LS, Dyna, evaluation, and checkpointing. Keys left out fall back to the defaults in `MOMA_AC_Trainer.__init__`. A train config can name its environment with `env_config`; `--env_config` overrides it.
 

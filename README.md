@@ -80,6 +80,9 @@ Rồi chạy `python train_moma_ac.py --config smoke.yaml`. Tốc độ (it/s) t
 # 3 UAV: bản cải tiến (đội hình nền + residual) và baseline MOMA-TD3
 python train_moma_ac.py --config config/train/moma_ac_ma3_prior.yaml --seed 1
 python train_moma_ac.py --config config/train/moma_ac_ma3.yaml --seed 1
+# Ablation 2x2 (đội hình nền x gamma): MOMA-TD3 với γ 0,9, và đội hình nền với γ 0,99 của paper
+python train_moma_ac.py --config config/train/moma_ac_ma3_g90.yaml --seed 1
+python train_moma_ac.py --config config/train/moma_ac_ma3_prior_g99.yaml --seed 1
 
 # 1 UAV, 4 cách chọn omega
 python train_moma_ac.py --config config/train/moma_ac_random.yaml --seed 1   # baseline
@@ -140,7 +143,9 @@ Eval lúc train chỉ dùng 3 episode, lặp lại cùng seed, nên chỉ dùng 
 
 ### 1. Eval checkpoint trên 20 episode riêng
 
-Eval chạy trên các episode chưa từng dùng khi train (seed 100000 trở đi), trên CPU để lặp lại được, có khoảng tin cậy 95% bootstrap:
+Eval chạy trên các episode chưa từng dùng khi train (seed 100000 trở đi), trên CPU để lặp lại được, có khoảng tin cậy 95% bootstrap.
+
+Seed 100000 trở đi đã được dùng khi phát triển `ma3_prior` (chọn γ, bán kính đội hình), nên coi chúng là tập validation. Số liệu cuối của 3 UAV dùng tập test riêng: thêm `--seed_base 200000` cho mọi policy, kể cả heuristic, và chỉ chạy khi đã chốt phương pháp.
 
 ```bash
 # Baseline trước

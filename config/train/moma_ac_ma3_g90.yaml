@@ -1,0 +1,46 @@
+# ============================================================
+# MOMA-AC Training Config — 3 UAVs, CTDE as in the MOMA-AC paper, with gamma 0.9 (ablation)
+# Differs from moma_ac_ma3.yaml only in gamma and save_dir; with moma_ac_ma3_prior_g99.yaml it completes the 2x2 of prior x gamma
+# omega ~ uniform on the simplex (Dirichlet(1,1,1)), per episode
+# ============================================================
+
+# Environment
+env_config: "config/environment/ma3.yaml"
+
+# Training
+total_training_steps: 1000000
+min_buffer_size: 5000
+train_frequency: 1
+train_iterations: 1
+batch_size: 256
+max_steps_per_episode: 18     # min on station at T_L = 60 s: the longest mission that, in the worst case (hovering at full power, farthest point), still leaves the energy to fly home (return_home)
+
+# Omega sampling
+omega_sampling: "random"
+corner_warmup_episodes: 0
+
+# TD3 hyperparameters
+actor_lr: 3.0e-4
+critic_lr: 3.0e-4
+gamma: 0.9                    # As moma_ac_ma3_prior.yaml: separates the effect of gamma from that of the prior
+tau: 0.005
+policy_delay: 2
+policy_noise: 0.2
+noise_clip: 0.5
+expl_noise: 0.3
+expl_noise_min: 0.05
+expl_noise_decay: 0.9999
+
+# Replay buffer
+buffer_size: 500000
+
+# Logging & saving
+log_interval: 5000
+save_interval: 100000
+eval_interval: 50000
+eval_n_omega: 30
+eval_n_episodes: 3
+eval_steps: 18
+
+# Output
+save_dir: "saved_models_moma_ac_ma3_g90"

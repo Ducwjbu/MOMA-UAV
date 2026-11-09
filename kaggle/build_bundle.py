@@ -22,6 +22,8 @@ FILES = [
     "config/train/moma_ac_gpi_pd.yaml",
     "config/train/moma_ac_ma3.yaml",
     "config/train/moma_ac_ma3_prior.yaml",
+    "config/train/moma_ac_ma3_g90.yaml",
+    "config/train/moma_ac_ma3_prior_g99.yaml",
     "kaggle/run_kaggle.py",
 ]
 
