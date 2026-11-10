@@ -25,6 +25,8 @@ py train_moma_ac.py --config config/train/moma_ac_ma3_prior_g99.yaml  # ablation
 
 # No-training reference for ma3: 3 UAVs hovering in a fixed triangle (18 steps, as the ma3 eval)
 py eval_formation.py
+# The no-training baseline family for 3 UAVs (10 ways to fly the r=600 triangle), on the same episodes as eval_checkpoint.py
+py eval_heuristics.py --seed_base 200000 --out evals/heuristics
 
 # Optional flags
 py train_moma_ac.py --config <yaml> --env_config <yaml> --checkpoint <path.pth> --seed <n> --resume --max_hours <h>
@@ -36,8 +38,12 @@ py eval_checkpoint.py --config config/train/moma_ac_random.yaml --checkpoint <di
 py eval_checkpoint.py --config config/train/moma_ac_ols.yaml --checkpoint <...> --baseline eval_random_actor.npy --out eval_ols
 py eval_checkpoint.py --formation --out eval_triangle
 
-# Compare variants (mean ± std over seeds)
+# Compare variants (mean ± std over seeds of the training eval; curves only)
 py compare_runs.py saved_models_moma_ac_random saved_models_moma_ac_ols saved_models_moma_ac_gpi_ls saved_models_moma_ac_gpi_pd
+
+# Final numbers over seeds from eval_checkpoint.py .npy files (same --seed_base): mean over seeds, two-level
+# bootstrap CI (seeds, then eval episodes shared by all methods), paired differences, P(improvement) over seed pairs
+py aggregate_seeds.py --method ma3 "evals/ma3_s*_actor.npy" --method ma3_prior "evals/ma3_prior_s*_actor.npy" --family heuristics evals/heur.npy --baseline ma3 --out agg
 ```
 
 Use `py` on this machine; `python` is not on the PATH in Git Bash.
@@ -46,7 +52,7 @@ Long runs go on Kaggle: see `kaggle/README.md`. Rebuild the upload with `py kagg
 
 **Smoke test:** to check a change, copy a train config and set `total_training_steps: 1500`, `min_buffer_size: 100`, `batch_size: 32`, `max_steps_per_episode: 20`, `save_interval: 1500`, `eval_interval: 750`, `eval_n_omega: 5`, `eval_n_episodes: 1`, `eval_steps: 5`, and a throwaway `save_dir`. For the OLS and GPI variants also set `gpi_ls_interval: 300`, `gpi_ls_episodes: 1`, `dyna_interval: 100`, `dyna_rollouts: 100`, `model_fit_steps: 30`. This takes about a minute and exercises training, GPI-LS, Dyna, evaluation, and checkpointing. Keys left out fall back to the defaults in `MOMA_AC_Trainer.__init__`. A train config can name its environment with `env_config`; `--env_config` overrides it.
 
-Each run writes to `save_dir` (or `save_dir/seed_<n>` with `--seed`): `step_metrics.csv`, `eval_metrics.csv`, `pareto_points.csv` (every evaluated omega and its reward vector), `gpi_ls_metrics.csv` (OLS and GPI variants), and `checkpoints/`. Results are tables only; nothing plots. `.gitignore` excludes `__pycache__/`, root-level `saved_models_*/` and `runs/`, checkpoints (`*.pth`), and replay buffers (`*.npz`, `resume/`); the CSVs copied into `results-v0/` (old env) and `results-v1/` (env `v1.0`) are tracked. `README.md` is the run guide for the team.
+Each run writes to `save_dir` (or `save_dir/seed_<n>` with `--seed`): `step_metrics.csv`, `eval_metrics.csv`, `pareto_points.csv` (every evaluated omega and its reward vector), `gpi_ls_metrics.csv` (OLS and GPI variants), and `checkpoints/`. Results are tables only; nothing plots. `.gitignore` excludes `__pycache__/`, root-level `saved_models_*/` and `runs/`, checkpoints (`*.pth`), and replay buffers (`*.npz`, `resume/`); the CSVs and test-seed evals of the course-report runs are tracked in `results-v1.1/` (env `v1.1`; older result folders were removed and stay in git history at tag `v1.0`). `README.md` is the run guide for the team.
 
 ## Architecture
 
@@ -102,8 +108,8 @@ The actor uses tanh for the first 3 dims and sigmoid for the rest. `select_actio
 - The buffer, critics and actor see `a_i`, the residual. `zero_movement_output` zeroes the movement rows of the actor's last layer, so the untrained policy is the formation; a loaded checkpoint overwrites that. Power and bandwidth have no prior.
 - Can't be combined with the guide (`ValueError`). `eval_checkpoint.py` gets the wrapped env through the trainer, so it applies the prior from the train config. `eval_formation.py` and `--formation` don't use it.
 - Why: on ma3 the UAV positions explain only about 17% of a step's QoS variance (supervised check), so MOMA-TD3 from scratch never finds spread formations and cruises at every weight. The r=600 triangle is within 0.4% of the RMS distance of the 3-means coverage placement of the 2 km area.
-- Why gamma 0.9: with 0.99 the vector critic drifts far below the true values, even negative for QoS and fairness at the energy corner (TD3 paper Sec. 5.1). That drift pulls the residual away from the formation; the prior with gamma 0.99 ends no better than plain MOMA-TD3.
-- At 100k steps on 20 held-out episodes the prior with gamma 0.9 reached HV 0.254 against 0.187 for `ma3`. It hovers in formation at QoS-heavy weights and cruises at the energy corner.
+- Why gamma 0.9: with 0.99 the vector critic drifts far below the true values, even negative for QoS and fairness at the energy corner (TD3 paper Sec. 5.1). That drift pulls the residual away from the formation. gamma 0.9 was chosen a priori from the horizon (an action's effect fades within about 2 steps, episodes are 18) and a coarse pilot; it was not tuned with the same budget for every method.
+- Results on env `v1.1` (`results-v1.1/`, 1M steps, 5 seeds, test seeds 200000+, `aggregate_seeds.py` CIs over seeds and episodes): `ma3_prior` HV 0.332 [0.324, 0.340] (seed std 0.001), the heuristic family 0.274, `ma3_prior_g99` 0.290, `ma3_g90` 0.268, `ma3` 0.176 [0.100, 0.239] (seed 3 collapses to 0.026). Each ingredient alone reaches about the heuristic family, and only both together beat it (+0.058 [+0.048, +0.068]); the effects are sub-additive (+0.092 and +0.114 alone, +0.156 together). At 100k the prior with gamma 0.99 was no better than plain MOMA-TD3, but by 1M it is. The proposed method hovers in formation at QoS-heavy weights and cruises at the energy corner. The eMBB SLA share is 1-2% for every policy, heuristics included.
 
 There are no actor snapshots: the "policies" of GPI are the one conditioned network at each weight in M. `_gpi_action_batch` and `_gpi_td_errors` score each candidate only with its own `Q(s, a, w')` instead of the full K×K sweep, for speed.
 
@@ -113,7 +119,7 @@ The training eval (3 episodes, the same seeds every time) is for curves only. Re
 
 ## Known pitfalls
 
-- **Any env change invalidates earlier results.** Reward scales move, so old HV values and any baseline run outside this repo aren't comparable. Rerun all variants. All results in `results-v0/` (and the 0.228 HV quoted below) come from the earlier env: suburban channel, cone antenna, 20 N UAV, uncapped fairness, 60-step episodes, and 50 UEs for `ma3`. They were runs to check that training works.
+- **Any env change invalidates earlier results.** Reward scales move, so old HV values and any baseline run outside this repo aren't comparable. Rerun all variants. The 0.228 HV quoted below and the removed `results-v0/` come from the earlier env: suburban channel, cone antenna, 20 N UAV, uncapped fairness, 60-step episodes, and 50 UEs for `ma3`. They were runs to check that training works.
 - **`--checkpoint` is only a partial resume.** It loads weights and optimizers, but the step counter restarts at 0 and the buffers are empty. For a real continuation use `--resume`, which reads `<save_dir>/resume/` (written at `save_interval` and when `--max_hours` runs out). It restarts the episode, since env state isn't saved. A finished run deletes `resume/` and writes a `DONE` file.
 - **`--env_config` is only partly honored on the numba path.** Without an `antenna` section, SINR comes from the numba function, whose A2G and beam-angle constants always come from `default.yaml`, at import. With one (`ma3`), `_link_gains_db` reads the env config. `_backhaul_capacity` reads the env config either way.
 - **`num_das_per_slice` must stay 3.** The trainer derives `act_dim` from it, but the env hardcodes 3 distance levels per slice.

@@ -7,3 +7,7 @@ __pycache__/
 *.pth
 *.npz
 resume/
+
+# Downloaded Kaggle output zips
+/result/
+/result_ablation/

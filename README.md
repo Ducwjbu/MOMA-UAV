@@ -13,18 +13,17 @@ Mô tả kỹ thuật đầy đủ (môi trường, reward, agent, các lỗi đ
 
 Môi trường `v1.0` (git tag `v1.0`) có thành phố tường minh theo ITU-R P.1410, suy hao xuyên tường, shadowing tương quan, fast fading, gió Hà Nội, traffic theo chuẩn 3GPP, các trạm bên đường (RSU) cho URLLC, và QoS theo SLA. Nguồn của từng tham số được ghi trong comment của `config/environment/*.yaml`.
 
-Sau `v1.0` môi trường đổi hai lần, nên mọi kết quả trong `results-v1/` đều phải chạy lại:
+Sau `v1.0` môi trường đổi hai lần, tạo thành `v1.1` (git tag `v1.1`). Kết quả của báo cáo môn học chạy trên `v1.1`:
 
 - **Pin dự trữ để bay về:** theo cơ chế Low Battery RTH của DJI M300. Mỗi episode dài 18 bước với 3 UAV, 19 bước với 1 UAV.
 - **Mô hình lưu lượng mới:** bản đồ mật độ lưu lượng log-normal của Lee et al. 2014 (`traffic_map.py`, mục `traffic_map` trong config) thay cho các hotspot. Mỗi episode sinh một bản đồ mới. UE eMBB xuất hiện theo bản đồ, UE mMTC xuất hiện đều.
 
-Hai thay đổi này sẽ được gắn tag `v1.1`.
 
 **Mọi thay đổi môi trường đều làm kết quả cũ mất giá trị so sánh**, vì thang reward thay đổi. Vì vậy:
 
 - Chỉ so những run cùng phiên bản môi trường.
-- `results-v0/` là kết quả của môi trường cũ, chỉ dùng để kiểm tra rằng train chạy được. Không đưa các số này vào bài báo.
-- `results-v1/` là kết quả của môi trường `v1.0`.
+- `results-v1.1/` là kết quả của môi trường `v1.1`: CSV lúc train của 4 biến thể 3 UAV × 5 seed, và eval trên seed test (`eval_test/`, bảng gộp `agg.csv`).
+- Kết quả của các môi trường cũ đã được xoá khỏi thư mục, vẫn còn trong lịch sử git (tag `v1.0`).
 
 Muốn sửa môi trường thì bàn trước với cả nhóm. Nếu sửa, tạo tag mới (`v1.1`, ...) và chạy lại toàn bộ.
 
@@ -112,7 +111,7 @@ Các tham số:
 | `--env_config` | Thay config môi trường. Chỉ dùng cho thí nghiệm độ nhạy. |
 | `--checkpoint` | Chỉ nạp trọng số. Bộ đếm bước về 0 và buffer rỗng, nên không dùng để chạy tiếp. |
 
-**Chia seed trong nhóm.** Mỗi người nhận seed riêng để không chạy trùng, và ghi lại ai chạy seed nào. Seed 0 của `ma3` đã chạy xong (`results-v1/`).
+**Chia seed trong nhóm.** Mỗi người nhận seed riêng để không chạy trùng, và ghi lại ai chạy seed nào. Seed 0–4 của 4 biến thể 3 UAV đã chạy xong (`results-v1.1/`).
 
 **Chạy tiếp khi phải tắt máy.** Chạy với `--max_hours`, ví dụ `--max_hours 8`. Khi muốn tiếp tục, chạy lại đúng lệnh cũ và thêm `--resume`. Mạng, optimizer, buffer, RNG và log đều được giữ. Riêng episode đang chạy dở thì bắt đầu lại, vì trạng thái môi trường không được lưu. Trạng thái resume cũng được lưu ở mỗi `save_interval` (100k bước), nên nếu máy tắt đột ngột thì chỉ mất phần sau lần lưu cuối. Run xong sẽ xóa `resume/` và ghi file `DONE`.
 
@@ -163,6 +162,7 @@ python eval_checkpoint.py --config config/train/moma_ac_ma3.yaml \
     --checkpoint saved_models_moma_ac_ma3/seed_1/checkpoints/checkpoint_step_1000000.pth \
     --out eval_ma3_s1
 python eval_checkpoint.py --formation --out eval_triangle
+python eval_heuristics.py --out eval_heuristics      # Họ 10 heuristic, cùng episode
 ```
 
 Kết quả nằm trong `<out>.csv`, mỗi policy một dòng:
@@ -182,11 +182,19 @@ Khoảng tin cậy ở đây chỉ phản ánh nhiễu giữa các episode eval,
 python compare_runs.py saved_models_moma_ac_random saved_models_moma_ac_ols saved_models_moma_ac_gpi_ls saved_models_moma_ac_gpi_pd
 ```
 
-Lệnh này in mean ± std qua các seed ở mốc eval cuối, và ghi `comparison.csv` cho mọi mốc eval. Mỗi thư mục là `save_dir` của một variant, chứa các `seed_*/`.
+Lệnh này in mean ± std qua các seed ở mốc eval cuối, và ghi `comparison.csv` cho mọi mốc eval. Mỗi thư mục là `save_dir` của một variant, chứa các `seed_*/`. Đây là eval lúc train, chỉ để xem đường học.
+
+Số liệu cuối gộp từ các file `.npy` của `eval_checkpoint.py` (bước 1, cùng `--seed_base`, mỗi seed một file):
+
+```bash
+python aggregate_seeds.py --method ma3 "evals/ma3_s*_actor.npy" --method ma3_prior "evals/ma3_prior_s*_actor.npy"     --baseline ma3 --out agg
+```
+
+`hv`, `eum`, `eu_front` là trung bình qua các seed. Khoảng tin cậy 95% bootstrap hai tầng (lấy lại seed, rồi lấy lại episode eval), nên phản ánh cả khác biệt giữa các seed train. `d_*_vs_<baseline>` là chênh lệch, so từng cặp trên cùng episode. `p_improve_hv_vs_<baseline>` là xác suất một seed của phương pháp có HV cao hơn một seed của baseline (Agarwal et al., NeurIPS 2021). `--family <tên> <file.npy>` thêm một họ policy không học, ví dụ các heuristic. `<out>_seeds.csv` có số liệu từng seed.
 
 ### 3. Lưu kết quả vào repo
 
-Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v1/` theo cấu trúc sẵn có rồi commit. Không commit checkpoint (`*.pth`) hay replay buffer (`*.npz`, `resume/`); `.gitignore` đã loại các file này.
+Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<phiên bản môi trường>/` theo cấu trúc của `results-v1.1/` rồi commit. Không commit checkpoint (`*.pth`) hay replay buffer (`*.npz`, `resume/`); `.gitignore` đã loại các file này.
 
 ## Cấu trúc repo
 
@@ -197,12 +205,14 @@ Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v1/`
 | `environment.py` | Mô phỏng mạng: UAV, UE, kênh truyền, cấp phát RB, hàng đợi, reward. |
 | `city.py` | Thành phố tường minh theo ITU-R P.1410 và kiểm tra tầm nhìn thẳng (LoS). |
 | `eval_checkpoint.py` | Eval cuối với khoảng tin cậy. |
+| `aggregate_seeds.py` | Gộp eval cuối của nhiều seed, khoảng tin cậy bootstrap hai tầng. |
 | `eval_formation.py` | Heuristic 3 UAV đứng yên thành tam giác. |
+| `eval_heuristics.py` | Họ 10 heuristic 3 UAV (bay theo tam giác r = 600 m), cùng episode với `eval_checkpoint.py`. |
 | `compare_runs.py` | Gộp các seed. |
 | `config/train/` | Config train cho từng variant. |
 | `config/environment/` | `default.yaml` (1 UAV, khu 1155 m) và `ma3.yaml` (3 UAV, khu 2 km), có nguồn cho từng tham số. |
 | `kaggle/` | Notebook, script và hướng dẫn chạy trên Kaggle. |
-| `results-v0/`, `results-v1/` | Kết quả theo phiên bản môi trường. |
+| `results-v1.1/` | Kết quả của môi trường `v1.1`. |
 
 ## Xử lý sự cố
 
