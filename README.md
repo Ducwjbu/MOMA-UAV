@@ -192,6 +192,13 @@ python aggregate_seeds.py --method ma3 "evals/ma3_s*_actor.npy" --method ma3_pri
 
 `hv`, `eum`, `eu_front` là trung bình qua các seed. Khoảng tin cậy 95% bootstrap hai tầng (lấy lại seed, rồi lấy lại episode eval), nên phản ánh cả khác biệt giữa các seed train. `d_*_vs_<baseline>` là chênh lệch, so từng cặp trên cùng episode. `p_improve_hv_vs_<baseline>` là xác suất một seed của phương pháp có HV cao hơn một seed của baseline (Agarwal et al., NeurIPS 2021). `--family <tên> <file.npy>` thêm một họ policy không học, ví dụ các heuristic. `<out>_seeds.csv` có số liệu từng seed.
 
+Hành vi và hình cho báo cáo (3 UAV): `eval_trajectories.py` ghi vị trí, công suất, độ phủ từng bước ở 3 góc trọng số trên cùng episode test (cần checkpoint trong `runs/`); `plot_results.py` vẽ đường học, HV có CI, ablation 2×2, front Pareto, quỹ đạo, và ghi `behaviour.csv`, vào `figures/` (không commit).
+
+```bash
+python eval_trajectories.py --out results-v1.1/eval_test/trajectories
+python plot_results.py --results results-v1.1 --out figures
+```
+
 ### 3. Lưu kết quả vào repo
 
 Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<phiên bản môi trường>/` theo cấu trúc của `results-v1.1/` rồi commit. Không commit checkpoint (`*.pth`) hay replay buffer (`*.npz`, `resume/`); `.gitignore` đã loại các file này.
@@ -208,6 +215,8 @@ Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<ph
 | `aggregate_seeds.py` | Gộp eval cuối của nhiều seed, khoảng tin cậy bootstrap hai tầng. |
 | `eval_formation.py` | Heuristic 3 UAV đứng yên thành tam giác. |
 | `eval_heuristics.py` | Họ 10 heuristic 3 UAV (bay theo tam giác r = 600 m), cùng episode với `eval_checkpoint.py`. |
+| `eval_trajectories.py` | Ghi quỹ đạo và hành vi của các policy 3 UAV ở 3 góc trọng số. |
+| `plot_results.py` | Vẽ các hình của báo cáo từ `results-v1.1/`. |
 | `compare_runs.py` | Gộp các seed. |
 | `config/train/` | Config train cho từng variant. |
 | `config/environment/` | `default.yaml` (1 UAV, khu 1155 m) và `ma3.yaml` (3 UAV, khu 2 km), có nguồn cho từng tham số. |
