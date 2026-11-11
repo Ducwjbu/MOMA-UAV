@@ -121,8 +121,135 @@ Tổng quan về chủ đề này: Kirk, Zhang, Grefenstette, Rocktäschel, "A S
 - OLS hoặc GPI-LS giúp policy tốt đều ở mọi ω, để khi DPI chuyển ω thì policy ở ω mới vẫn tốt.
 - Prior theo nhu cầu và mạng không phụ thuộc số UAV giúp chạy được ở bản đồ và số UAV mới.
 
+## Cập nhật 2026-11-11: quyết định và tài liệu mới
+
+Sơ đồ kiến trúc bản 1: https://claude.ai/artifact/QoM1msQLpvBDc9oFWBK8Hd (riêng tư; chia sẻ bằng nút Share).
+
+### Quyết định
+
+- **Hướng "cách 2":** cả đội có một mục tiêu chung do nhà mạng đặt. ω_i của từng UAV là **vai trò** để phục vụ mục tiêu chung đó (ví dụ một UAV lo QoS ở điểm nóng, một UAV lo pin). Đây **không phải** "mỗi UAV một lợi ích riêng" theo nghĩa trò chơi.
+- Mỗi UAV một ω_i; người vận hành được ghi đè.
+- Tín hiệu kích hoạt và ngưỡng: bàn với thầy.
+- Bài tham khảo chính cho ω riêng mỗi agent: **PCMA** (bài bạn đã đọc trước đó).
+
+### DPI: đã đọc bản đầy đủ (Cao et al., ICLR 2026, arXiv:2603.22813)
+
+- **Nơi đăng:** đã được nhận ở ICLR 2026, không chỉ là preprint như ghi ở trên.
+- **DPI suy ra ω từ return mà critic của chính agent dự đoán** (Eq. 1–4, 8). Bài viết: "discourages caring about objectives that are unattainable at the moment" (Sec. 3.3). Vì vậy ω dịch về mục tiêu đang dễ đạt.
+  - Ví dụ Fig. 1 của bài: người xếp hàng bỏ "đạo đức" để chen hàng khi đói.
+  - Với UAV, điều này đi ngược nhu cầu: khi tan concert, QoS khó đạt nhất nhưng cũng cần nhất.
+- **Baseline luật viết tay thắng DPI** ở cả ba môi trường. "Dense Oracle" có quyền xem tín hiệu sự kiện (Table 4, 5):
+
+  | Môi trường | Dense Oracle (MER / SR) | DPI (MER / SR) |
+  |---|---|---|
+  | Maze | 40.3 / 62.9% | 30.2 / 59.0% |
+  | Liên tục | 67.0 / 99.98% | 42.1 / 81.0% |
+
+  Nhà mạng nhìn thấy SLA và pin, nên điều khiển theo luật (cách A) là lựa chọn hợp lý.
+- **Trở ngại riêng của bài UAV:**
+  - Reward năng lượng âm: loss căn hướng Eq. 8 đẩy trọng số năng lượng về 0.
+  - Critic của ta từng bị lệch.
+  - DPI dùng PPO một agent, ta dùng TD3 nhiều agent.
+- **Kết luận:** DPI gốc chỉ dùng làm phương án so sánh.
+
+### Hai bài đã đọc khác
+
+- **Toure, Tsilimantos, Esrafilian, Kountouris**, "Optimizing Energy and Data Collection in UAV-aided IoT Networks using Attention-based MORL", arXiv:2601.14092, 2026.
+  - Trạng thái là tập token; self-attention không positional encoding; MaxPool trên token thiết bị; ω là một token riêng.
+  - Train với K = 6 thiết bị, test với 3–10 không cần train lại (Fig. 6). Ở w = (0, 1), mạng chủ yếu chú ý vào token ω (Fig. 7).
+  - Bài làm với một UAV, hành động rời rạc, SAC; mô hình năng lượng cho hover rẻ hơn bay, ngược với Zeng.
+  - **Dùng cho:** actor và critic không phụ thuộc số UAV.
+- **Lu, Herman, Yu**, "Multi-Objective RL: Convexity, Stationarity and Pareto Optimality" (CAPQL), ICLR 2023.
+  - Với policy ngẫu nhiên dừng, tập giá trị là lồi (Prop. 3), nên tổng có trọng số đạt mọi điểm Pareto (Prop. 4).
+  - Policy tất định chỉ đạt các đỉnh, và ánh xạ ω → nghiệm không liên tục (Fig. 6, Remark 4). Cộng entropy thì ánh xạ liên tục (Prop. 5).
+  - **Dùng cho:** ta đang dùng TD3 tất định. Entropy còn làm hàm đối ngẫu trơn (xem mục toán bên dưới), nên nó thuộc thiết kế chính chứ không chỉ là ablation.
+  - **Lưu ý:** định lý giả định một agent, tầm nhìn vô hạn, MDP ergodic. Policy dạng tích của nhiều agent có thể không giữ tính lồi.
+
+### Cơ sở toán học (đề xuất, chưa kiểm hết)
+
+- **(a) Lagrange = tổng có trọng số.**
+  - Bài toán: tối ưu mục tiêu chính với điều kiện V_k ≥ c_k. Hàm Lagrange là `L = ⟨e₀ + λ, V⟩ − λ·c`, tức tổng có trọng số với `ω = (e₀ + λ)/‖e₀ + λ‖₁`.
+  - Vì vậy policy có điều kiện theo ω chính là lời giải của hàm Lagrange với mọi λ. Dịch ω theo λ là tăng dần theo gradient ở miền đối ngẫu, **không cần train lại**.
+  - Dựa vào: Paternain, Chamon, Calvo-Fullana, Ribeiro, "Constrained RL Has Zero Duality Gap", NeurIPS 2019; CAPQL Prop. 4; Ying, Ding, Lavaei, "A Dual Approach to CMDPs with Entropy Regularization", AISTATS 2022 (có entropy thì hàm đối ngẫu trơn, hội tụ Õ(1/T)).
+- **(b) Hàng đợi ảo.**
+  - Cập nhật `λ_k ← max(0, λ_k + η(ngưỡng_k − đo_k))` là hàng đợi ảo của drift-plus-penalty (M. J. Neely, *Stochastic Network Optimization with Application to Communication and Queueing Systems*, Morgan & Claypool, 2010).
+  - Với C-additive approximation: ràng buộc thoả tính trung bình theo thời gian; mục tiêu cách tối ưu O(1/V), hàng đợi O(V). Có bản cho động học Markov (Huang & Neely, arXiv:1008.0200).
+  - Phải tự chuyển từ quyết định từng bước sang policy nhiều bước: coi mỗi lần giữ ω là một khung và dùng kết quả cho hệ renewal của Neely. Cần đối chiếu sách gốc.
+- **(c) Exponential tilting** (tự suy ra, chỉ đúng cho posterior chính xác).
+  - Với `p(z) ∝ N(0, I)·exp(β⟨ω(z), e⟩)` thì `∂E[ω_k]/∂e_k = β·Var(ω_k) ≥ 0`.
+  - DPI gốc (e = G, return dự đoán): QoS dự đoán giảm thì ưu tiên QoS giảm.
+  - Bản sửa (e = mức thiếu hụt so với mục tiêu): QoS thiếu thì ưu tiên QoS tăng.
+- **(d) P so với I.**
+  - Bằng chứng là thiếu hụt hiện tại thì giống điều khiển P: dao động, còn sai lệch thường trực. Lagrange là điều khiển I.
+  - Stooke, Achiam, Abbeel, "Responsive Safety in RL by PID Lagrangian Methods", ICML 2020, PMLR 119:9133–9143.
+  - Đề xuất: bằng chứng là hàng đợi ảo cộng phần P, tức PID-Lagrangian có ước lượng bất định.
+- **Phần khó chứng minh:**
+  - Nhiều agent hợp tác có ràng buộc có thể có duality gap khác 0 (Kahe & Kebriaei, arXiv:2410.15335).
+  - Môi trường đổi giữa episode.
+  - Toàn bộ vòng lặp kín với mạng nơ-ron: chỉ chứng minh được dưới giả định "policy ε-tối ưu với mỗi ω".
+
+### Công trình liên quan tới việc dịch ω theo ràng buộc
+
+| Công trình | Giống | Khác |
+|---|---|---|
+| CCPO (Yao et al., NeurIPS 2023, arXiv:2310.03718) | Policy có điều kiện theo ngưỡng ràng buộc, đổi lúc chạy | Ngưỡng do người đặt, cố định cả episode; một agent |
+| PDOA (arXiv:2409.09958) | Đổi bài toán có ràng buộc thành MORL | Offline, cần demonstration |
+| Lyapunov-guided DRL (arXiv:2409.13580, 2501.15928, 2603.27364) | Hàng đợi ảo cho UAV và slicing | Hàng đợi nhúng vào reward lúc train |
+| SafeSlicing (Liu, Choi, Han, ICNP 2021, arXiv:2110.04320) | Lagrange cho SLA trong slicing | Một mục tiêu; nhân tử học lúc train |
+| Kahe & Kebriaei (arXiv:2410.15335) | Primal-dual phân tán, nhân tử riêng mỗi agent | Không có policy có điều kiện theo ω |
+
+Phần còn mới (sau khoảng 10 lượt tìm kiếm, chưa phải rà soát đầy đủ; nên kiểm thêm bằng Elicit):
+- ω_i dịch lúc chạy theo KPI của nhà mạng, có cơ sở đối ngẫu và hàng đợi ảo, không train lại;
+- trên policy đa mục tiêu nhiều agent có prior đội hình;
+- so sánh với DPI và với ω học được.
+
+### Mỗi agent một preference
+
+| Bài | ω_i từ đâu | Reward | Ghi chú |
+|---|---|---|---|
+| **PCMA**: Wang, Guo, Xie, Liu, Cao, Chen, "Learning Coordinated Preference for MOMARL", arXiv:2606.14693 (v2 9/2026) | Planner rút `p_i ~ Dir(φ_ψ(o_i))` | Reward chung cho đội cộng vector riêng mỗi agent: `R_i = r_team·1_K + r_i` | Mục tiêu đội cố định; xem chi tiết dưới |
+| MIRL: Xia & Herrmann, arXiv:2610.35736 (10/2026) | Học bằng meta-gradient để phục vụ ω_team do người dùng đặt; MIRL-D đổi từng bước theo lịch sử cục bộ | **Vector chung cho cả đội** (Def. 2.2) | MO-COMA, liên tục; chênh với baseline nhỏ, nhiều chỗ trong một độ lệch chuẩn |
+| AA-MAMORL: Li, Luo, Huang, Qi, Min, arXiv:2511.08926 (11/2025) | Cho sẵn hoặc `w_i = g_i(o_i)` | Vector | Mỗi agent có lợi ích riêng (cách 1); critic attention trên token (o_j, a_j, w_j); MAMO-DDPG; cân bằng Nash Bayes tồn tại khi các agent quan sát được ω của nhau |
+| MAGPIE (Mu et al., arXiv:2608.08604, IEEE T-ASE) | **Không phải MORL** | — | "Preference" là phản hồi so sánh từng cặp, dùng để học reward vô hướng |
+
+**PCMA chi tiết** (Sec. 1–5 đọc nguyên văn; thí nghiệm chỉ đọc qua bản tóm tắt):
+- Lợi ích của agent i: `U_i = J_team + p_iᵀ J_i`. Advantage của actor: `A_i = A_team + λ2·p_iᵀ A_i^ind` (Eq. 1).
+- Planner train bằng PPO trên advantage của đội trừ đi một thưởng đa dạng: `D_p = (1/2N²)ΣΣ‖p_i − p_j‖²` (Eq. 3).
+- Critic đội và critic vector cho từng agent (Eq. 2). CTDE, PPO.
+- **Định lý 4.2:** đa dạng preference cộng thêm `ηNκD_p` vào mức cải thiện của đội, nhưng chỉ khi có giả định căn chỉnh 4.1 (κ > 0). Thưởng đa dạng thì được cộng bất kể giả định có đúng không.
+- **Định lý 4.6:** nếu `‖p^{t+1} − p^t‖ ≤ δ` thì sai lệch so với cân bằng bị chặn bởi `Cδ/(1−ρ)` (cần giả định co 4.4 và Lipschitz 4.5). Dùng được cho trường hợp ω đổi lúc chạy, và là lý do để giữ ω đổi mượt.
+- **Thí nghiệm:** 3 seed; MPE, Catch, Escort, MOMAWalker, SMAC, OpenCDA-MARL (tối đa 10 agent). Các con số chưa đối chiếu.
+
+**Ánh xạ PCMA sang bài UAV:**
+- J_team ↔ mục tiêu của nhà mạng: tổng có trọng số theo ω_team, hoặc hàm Lagrange của các ràng buộc.
+- J_i ↔ mục tiêu riêng của UAV i: QoS các UE nó phục vụ, năng lượng của nó, công bằng giữa các UE của nó. **Môi trường phải tách reward theo UAV.**
+- **Môi trường đã có lý do cho vai trò khác nhau:** episode kết thúc khi **bất kỳ** UAV nào chạm năng lượng cần để quay về. Vì vậy UAV pin yếu tự ưu tiên năng lượng là có lợi cho cả đội.
+
+### Kiến trúc đề xuất bản 2 (phân tầng; chưa vẽ lại sơ đồ)
+
+1. **Tầng đội:** mục tiêu của nhà mạng, cập nhật PID-Lagrangian hoặc hàng đợi ảo trên KPI của cả mạng, cho ra ω_team lúc chạy. Có cơ sở toán (a), (b), (d).
+2. **Tầng UAV:** planner kiểu PCMA, nhận (o_i, ω_team), cho ra p_i. Train để tối đa hoá lợi ích của đội; có thể thêm thưởng đa dạng.
+3. **Actor attention:** token gồm bản thân, láng giềng (thêm **p_j của láng giềng**, theo AA-MAMORL), vùng nhu cầu, p_i. Cộng với prior theo nhu cầu.
+4. **Ghi đè:** người vận hành đặt ω_team cho cả mạng, hoặc p_i cho một UAV.
+
+Câu hỏi mở thêm:
+- Tách reward theo UAV thế nào, nhất là công bằng.
+- Planner train on-policy (PPO như PCMA) trong khi actor dùng TD3 off-policy, hay dùng meta-gradient kiểu MIRL?
+- Đa dạng p_i có thật sự giúp không (giả định κ > 0 của PCMA)? Phải kiểm bằng thí nghiệm, so với p_i = ω_team cho mọi UAV.
+
 ## Link
 
+- PCMA: https://arxiv.org/abs/2606.14693
+- MIRL: https://arxiv.org/html/2610.35736
+- AA-MAMORL: https://arxiv.org/html/2511.08926v1
+- Toure et al.: https://arxiv.org/abs/2601.14092
+- CAPQL: https://github.com/haoyelu/CAPQL
+- Paternain et al.: https://arxiv.org/abs/1910.13393
+- Ying et al.: https://proceedings.mlr.press/v151/ying22a.html
+- PID Lagrangian: https://proceedings.mlr.press/v119/stooke20a.html
+- CCPO: https://arxiv.org/abs/2310.03718
+- SafeSlicing: https://arxiv.org/abs/2110.04320
+- Kahe & Kebriaei: https://arxiv.org/abs/2410.15335
 - DPI: https://arxiv.org/html/2603.22813
 - GPI-PD: https://arxiv.org/abs/2301.07784
 - Dynamic weights: https://arxiv.org/abs/1809.07803
