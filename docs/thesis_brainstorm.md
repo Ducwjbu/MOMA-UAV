@@ -237,6 +237,46 @@ Câu hỏi mở thêm:
 - Planner train on-policy (PPO như PCMA) trong khi actor dùng TD3 off-policy, hay dùng meta-gradient kiểu MIRL?
 - Đa dạng p_i có thật sự giúp không (giả định κ > 0 của PCMA)? Phải kiểm bằng thí nghiệm, so với p_i = ω_team cho mọi UAV.
 
+### Các quyết định còn mở (sơ đồ bản 2, cùng link ở trên)
+
+Các mục ghi "quyết trước" chặn việc sửa môi trường v2.
+
+**Hỏi thầy:**
+- **D1 Mục tiêu vận hành và tín hiệu** (quyết trước):
+  - KPI nào (SLA từng slice, pin dự trữ, độ phủ) và ngưỡng bao nhiêu.
+  - Viết thành bài toán "tối ưu X với điều kiện Y ≥ c".
+- **D2 Mật độ người dùng** (quyết trước): nhà mạng có ước lượng được không? Có thì dùng prior theo nhu cầu; không thì giữ tam giác cố định, hoặc chỉ dùng số UE mà các UAV đang phục vụ.
+- **D8 Ghi đè ở tầng nào:**
+  - Có ba lựa chọn: ω_team cho cả mạng, p_i cho một UAV, hoặc cả hai.
+  - Khi ghi đè p_i của một UAV, các UAV còn lại có tự bù không?
+- **D9 Chia sẻ p_j giữa các UAV:** UAV có gửi vai trò cho nhau được không (giả định liên lạc)? Theo AA-MAMORL, cần quan sát được preference của nhau thì mới có điểm cân bằng.
+- **D12 Mức lý thuyết:** định lý chứng minh đầy đủ (dưới giả định policy ε-tối ưu), hay mệnh đề kèm kiểm chứng bằng thí nghiệm.
+
+**Mình đề xuất, cần bạn đồng ý:**
+- **D3 Tách reward theo UAV** (quyết trước):
+  - Đề xuất: theo PCMA, reward đội cộng vector riêng. Phần riêng gồm QoS của các UE mà UAV đó phục vụ và năng lượng của chính nó. Công bằng chỉ giữ ở mức đội.
+  - Lựa chọn khác: theo MIRL, chỉ dùng vector của đội.
+- **D10 Môi trường v2 cụ thể** (quyết trước):
+  - Kịch bản nào: tan concert, tải URLLC tăng, gió mạnh.
+  - N đổi giữa ca, hay chỉ khác N giữa các episode.
+  - Sửa eMBB: scheduler chia lại RB thừa, hàng đợi riêng mỗi slice, ngưỡng 50 Mbps.
+- **D7 TD3 hay thêm entropy:** entropy làm hàm đối ngẫu trơn, nên cơ sở toán của tầng đội vững hơn. Đổi lại phải đổi thuật toán gốc so với paper MOMA-AC.
+- **D11 Baseline và quota:**
+  - Bắt buộc: `ma3_prior` chạy lại trên v2, PCMA nguyên bản, mọi UAV dùng chung p_i = ω_team, DPI gốc.
+  - Tuỳ chọn: MIRL, AA-MAMORL.
+
+**Quyết bằng thí nghiệm nhỏ:**
+- **D4 Cách train planner:** PPO ở nhịp chậm (PCMA), meta-gradient (MIRL), hoặc tối ưu qua critic như một hành động bậc cao. Cách cuối là ý của mình, chưa ai kiểm chứng.
+- **D5 Thưởng đa dạng p_i:** có hay không, và hệ số λ1 bao nhiêu. Ablation so với p_i = ω_team cho mọi UAV.
+- **D6 Nhịp cập nhật:** ω_team và p_i đổi mỗi bước hay mỗi khung vài bước; hệ số P, I, D; mức chặn δ cho mỗi lần đổi (PCMA Thm 4.6). Thử trên checkpoint có sẵn, chưa cần Kaggle.
+
+**Thứ tự đề xuất:**
+1. Chốt D1, D2, D3, D10 với thầy, rồi sửa môi trường v2.
+2. Thử D6 trên checkpoint có sẵn.
+3. Chốt D7 và D11, rồi cài planner, actor và critic attention.
+4. Pilot D4 và D5, rồi train đầy đủ.
+5. Bàn D8, D9, D12 song song.
+
 ## Link
 
 - PCMA: https://arxiv.org/abs/2606.14693
