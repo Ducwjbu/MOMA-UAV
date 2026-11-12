@@ -277,6 +277,47 @@ Các mục ghi "quyết trước" chặn việc sửa môi trường v2.
 4. Pilot D4 và D5, rồi train đầy đủ.
 5. Bàn D8, D9, D12 song song.
 
+## Cập nhật 2026-11-12: bài toán v2, kiến trúc bản 3, phần đã implement
+
+Hạn chế của bài toán, câu hỏi cho thầy (Q1–Q12) và ngưỡng SLA đề xuất nằm trong trang Notion "Khoá luận MOMA-UAV: hạn chế và câu hỏi cho thầy" (bản nháp riêng tư của bạn).
+
+**Kiến trúc bản 3** (thay bản 2):
+- Planner PCMA không còn ở phần lõi.
+- Một bộ điều khiển ω chạy lúc vận hành, không train: PID-Lagrange / hàng đợi ảo trên KPI của nhà mạng, cho ω_team, và hàng đợi ảo cục bộ cho ω_i.
+- Một policy có điều kiện theo ω_i, train một lần.
+
+**Đã implement** (nhánh `duc`). Mọi khóa mặc định tắt; khi tắt, môi trường cho output giống `v1.1` từng bit và smoke train cho trọng số giống từng bit.
+
+| Mục | Ở đâu | Kiểm tra |
+|---|---|---|
+| A1 bộ điều khiển ω lúc chạy | `eval_controller.py` | ω cố định tái tạo `eval_checkpoint.py` đến 1e-6; hệ số chỉnh trên seed validation |
+| C1 chia lại RB rảnh | `slicing.rb_sharing` | Tam giác đứng yên: SLA URLLC 0.25 → 0.40 |
+| C2 hàng đợi riêng mỗi slice | `slicing.per_slice_queues` | mMTC 0.33 → 0.45, URLLC giảm (mất lợi ích dùng chung) |
+| B1 ω riêng mỗi UAV | `omega_per_agent`, `omega_switch_prob` | Smoke train, eval với ω chung và ω riêng |
+| C3 số UAV hoạt động thay đổi | mục `fleet` trong config môi trường | UAV rút không phục vụ, không nhiễu; prior xếp lại bằng Hungarian |
+| C4 tăng tốc | `city.py` (LoS bằng numba) | Giống bản numpy trên 60k đoạn; môi trường nhanh hơn ~27% |
+| B2 actor/critic attention | `network: attention` | Checkpoint 3 UAV chạy trên 4 UAV; chậm hơn MLP ~40% mỗi bước train |
+
+**Kết quả A1 trên seed validation** (`ma3_prior`, ràng buộc QoS ≥ 0.30, tối ưu năng lượng):
+- Hệ số mặc định (λ bắt đầu từ 0) quá chậm trong 18 bước: QoS 0.26, mọi episode vi phạm.
+- Chỉ có phần I, K_I 0.5, λ khởi đầu 0.5: QoS 0.322, năng lượng −0.044, 6.7% episode vi phạm. Ngang ω cố định tốt nhất chọn sau khi biết kết quả (a = 0.30: 0.336, −0.044, 8%).
+- Giữ λ qua cả ca (`--carry`): QoS trung bình bám đúng ngưỡng (0.296–0.302), năng lượng −0.040, nhưng từng episode dao động quanh ngưỡng.
+- Phần P làm dao động nhiều hơn (một câu trả lời cho D6).
+- DPI rút gọn: QoS 0.39, năng lượng −0.107. Nó bỏ qua ngưỡng và dồn ω về mục tiêu đang cao.
+
+**Kết quả A1 trên seed test** (200000+, 5 seed × 20 episode, hệ số đã chọn ở trên):
+
+| Cách chọn ω | Năng lượng [CI 95%] | QoS | Episode vi phạm |
+|---|---|---|---|
+| PID (chỉ I, reset mỗi episode) | −0.040 [−0.041, −0.038] | 0.320 | 5% |
+| ω cố định tốt nhất, chọn sau khi biết kết quả test (a = 0.30) | −0.041 [−0.043, −0.040] | 0.336 | 13% |
+| PID giữ λ qua cả ca | −0.038 [−0.040, −0.037] | 0.301 (trung bình) | 49% |
+| DPI rút gọn | −0.098 | 0.390 | 0% |
+
+Bộ điều khiển ngang (năng lượng chồng CI) hoặc hơn ω tốt nhất chọn sau khi biết kết quả, mà không cần biết trước. Ở v1.1 kịch bản tĩnh, nên chưa thấy lợi thế khi điều kiện đổi; cần các kịch bản sự kiện của môi trường v2 (`fleet`, Q6).
+
+**Chưa làm, chờ quyết định:** mục tiêu theo slice (Q2), ngưỡng SLA theo 5QI (Q1, Q3), hành động theo tỉ lệ slice (Q7), dịch vụ liên tục có đổi pin (Q5), kịch bản sự kiện (Q6), prior theo nhu cầu (Q4), UE có trọng số (Q12), baseline tối ưu (Q7, Q8). Chưa train thật trên Kaggle cho đến khi chốt môi trường v2.
+
 ## Link
 
 - PCMA: https://arxiv.org/abs/2606.14693
