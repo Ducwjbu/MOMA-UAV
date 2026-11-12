@@ -37,6 +37,9 @@ py eval_controller.py --out evals/ctrl_change --seed_base 200000 --carry --chang
 # Thesis pilots (300k steps on v1.1): ma3_prior_pa (one omega per UAV), ma3_prior_att (attention networks),
 # ma3_prior_att_fleet (attention on config/environment/ma3_fleet.yaml); role test: one UAV at the energy corner
 py eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
+# Viewer: record eval episodes (state of every UAV and UE after each step; reads the env only, bit-identical
+# results) and write a self-contained page (visualize/out/ is not tracked; design in visualize/architecture.md)
+py -m visualize.record --methods ma3_prior ma3 --episodes 0 1 --out visualize/out/run1 --html
 py plot_results.py --results results-v1.1 --out figures
 
 # Optional flags

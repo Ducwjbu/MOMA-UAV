@@ -211,6 +211,12 @@ python eval_controller.py --out evals/ctrl_change --seed_base 200000 --carry --c
 python eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
 ```
 
+Xem lại một episode trên bản đồ (UAV bay, UE đi, association, UE trượt SLA vì đâu): `visualize/record.py` ghi episode của checkpoint (chỉ đọc env, kết quả không đổi), `--html` ra một trang tự chứa mở thẳng bằng trình duyệt. Thiết kế ở `visualize/architecture.md`.
+
+```bash
+python -m visualize.record --methods ma3_prior ma3 --episodes 0 1 --out visualize/out/run1 --html
+```
+
 Pilot 300k bước cho kiến trúc mới (chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa` (mỗi UAV một omega), `ma3_prior_att` (mạng attention), `ma3_prior_att_fleet` (attention, môi trường `ma3_fleet.yaml` có UAV rút giữa chừng).
 
 Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt, kết quả `v1.1` giữ nguyên từng bit (đã kiểm):
@@ -242,6 +248,7 @@ Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<ph
 | `eval_heuristics.py` | Họ 10 heuristic 3 UAV (bay theo tam giác r = 600 m), cùng episode với `eval_checkpoint.py`. |
 | `eval_trajectories.py` | Ghi quỹ đạo và hành vi của các policy 3 UAV ở 3 góc trọng số. |
 | `eval_controller.py` | Khoá luận: chọn omega lúc chạy theo ngưỡng KPI, trên policy đã train. |
+| `visualize/` | Trình xem episode: bộ ghi `record.py` và trang `viewer.html`. |
 | `plot_results.py` | Vẽ các hình của báo cáo từ `results-v1.1/`. |
 | `compare_runs.py` | Gộp các seed. |
 | `config/train/` | Config train cho từng variant. |

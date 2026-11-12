@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UAV Episode Viewer</title>
+<style>
+:root {
+  --bg: #f6f6f3; --panel: #ffffff; --fg: #1f2328; --muted: #646b75; --border: #d9dbde;
+  --map-bg: #f3f4f0; --bldg-lo: #e7e4de; --bldg-hi: #bdb7ad; --range: #9aa3ad;
+  --uav0: #0f766e; --uav1: #7c3aed; --uav2: #b45309; --uav3: #be185d;
+  --embb: #2563eb; --urllc: #dc2626; --mmtc: #16a34a;
+  --st-idle: #c3cad3; --st-met: #16a34a; --st-unc: #8b939d; --st-norb: #334155;
+  --st-rate: #dc2626; --st-delay: #ea580c; --st-rel: #c026d3;
+  --density: 234, 88, 12;
+  --s-qos: #2563eb; --s-energy: #b45309; --s-fair: #16a34a; --s-cov: #111827;
+  --banner-bg: rgba(255, 255, 255, 0.88); --interp: #b45309;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --fg: #e6e8eb; --muted: #9aa1ab; --border: #33373d;
+    --map-bg: #1a1d21; --bldg-lo: #26292e; --bldg-hi: #454a52; --range: #59616b;
+    --uav0: #2dd4bf; --uav1: #a78bfa; --uav2: #fbbf24; --uav3: #f472b6;
+    --embb: #60a5fa; --urllc: #f87171; --mmtc: #4ade80;
+    --st-idle: #4b5260; --st-met: #4ade80; --st-unc: #7b838e; --st-norb: #cbd5e1;
+    --st-rate: #f87171; --st-delay: #fb923c; --st-rel: #e879f9;
+    --density: 251, 146, 60;
+    --s-qos: #60a5fa; --s-energy: #fbbf24; --s-fair: #4ade80; --s-cov: #e5e7eb;
+    --banner-bg: rgba(29, 32, 36, 0.9); --interp: #fbbf24;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --panel: #1d2024; --fg: #e6e8eb; --muted: #9aa1ab; --border: #33373d;
+  --map-bg: #1a1d21; --bldg-lo: #26292e; --bldg-hi: #454a52; --range: #59616b;
+  --uav0: #2dd4bf; --uav1: #a78bfa; --uav2: #fbbf24; --uav3: #f472b6;
+  --embb: #60a5fa; --urllc: #f87171; --mmtc: #4ade80;
+  --st-idle: #4b5260; --st-met: #4ade80; --st-unc: #7b838e; --st-norb: #cbd5e1;
+  --st-rate: #f87171; --st-delay: #fb923c; --st-rel: #e879f9;
+  --density: 251, 146, 60;
+  --s-qos: #60a5fa; --s-energy: #fbbf24; --s-fair: #4ade80; --s-cov: #e5e7eb;
+  --banner-bg: rgba(29, 32, 36, 0.9); --interp: #fbbf24;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+label { color: var(--muted); }
+select, button, input[type=file] { font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+button { cursor: pointer; min-width: 30px; }
+button:hover { border-color: var(--muted); }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; padding: 16px; }
+@media (max-width: 980px) { main { grid-template-columns: minmax(0, 1fr); } }
+.maps { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.maps.two { grid-template-columns: 1fr 1fr; }
+@media (max-width: 720px) { .maps.two { grid-template-columns: 1fr; } }
+.mapbox { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; min-width: 0; }
+.mapbox .title { font-weight: 600; margin-bottom: 2px; overflow-wrap: anywhere; }
+.mapbox .sub { color: var(--muted); font-size: 12px; margin-bottom: 6px; overflow-wrap: anywhere; }
+.mapbox canvas { width: 100%; display: block; aspect-ratio: 1 / 1; border-radius: 4px; cursor: crosshair; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-top: 12px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.controls input[type=range] { flex: 1 1 220px; min-width: 160px; }
+.controls .time { font-variant-numeric: tabular-nums; min-width: 190px; }
+.layers { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 10px; }
+.layers label { color: var(--fg); white-space: nowrap; }
+.side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.card h2 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
+.chart { width: 100%; height: 110px; display: block; }
+.keys { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+.sw.sq { border-radius: 2px; }
+.sw.line { width: 14px; height: 0; border-radius: 0; border-top: 2px solid; vertical-align: 3px; }
+.sw.dash { width: 14px; height: 0; border-radius: 0; border-top: 2px dashed; vertical-align: 3px; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 2px 4px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 500; }
+.tablewrap { overflow-x: auto; }
+#tip { position: fixed; pointer-events: none; z-index: 10; max-width: 340px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18); display: none; white-space: pre-line; }
+#loader { padding: 32px 16px; max-width: 640px; }
+.note { color: var(--muted); font-size: 12px; }
+.warn { color: var(--interp); font-size: 12px; }
+</style>
+</head>
+<body>
+<script type="application/json" id="trace"></script>
+
+<div id="loader" hidden>
+  <h1 style="font-size:16px">UAV Episode Viewer</h1>
+  <p>Trang này chưa có trace nhúng sẵn. Chọn file JSON do <code>py -m visualize.record</code> ghi ra:</p>
+  <input type="file" id="file" accept=".json,application/json">
+  <p class="note">Hoặc chạy bộ ghi với <code>--html</code> để có một file HTML tự chứa.</p>
+</div>
+
+<div id="app" hidden>
+<header>
+  <h1>UAV Episode Viewer</h1>
+  <span><label for="selA">Bên A</label> <select id="selA"></select></span>
+  <span><label for="selB">So sánh với</label> <select id="selB"></select></span>
+  <span><label for="colorBy">Màu UE</label>
+    <select id="colorBy"><option value="status">Trạng thái SLA</option><option value="slice">Slice</option></select></span>
+  <button id="theme" title="Đổi giao diện sáng/tối">Giao diện: tự động</button>
+</header>
+<main>
+  <section>
+    <div class="maps" id="maps"></div>
+    <div class="controls">
+      <button id="first" title="Về đầu (Home)">⏮</button>
+      <button id="prev" title="Khung bước trước (←)">◀</button>
+      <button id="play" title="Phát / dừng (Space)">▶</button>
+      <button id="next" title="Khung bước sau (→)">▶|</button>
+      <input type="range" id="slider" min="0" max="1" step="0.001" value="0" aria-label="Thời gian">
+      <span class="time" id="time"></span>
+      <span><label for="speed">Tốc độ</label>
+        <select id="speed"><option value="0.5">0.5 bước/s</option><option value="1" selected>1 bước/s</option>
+          <option value="2">2 bước/s</option><option value="4">4 bước/s</option></select></span>
+      <label style="color:var(--fg)"><input type="checkbox" id="interp" checked> Nội suy giữa các bước</label>
+    </div>
+    <div class="layers" id="layers"></div>
+    <div class="keys" id="legend" style="margin-top:8px"></div>
+    <p class="note" id="explain">
+      Env chỉ tính mạng (association, SINR, SLA) một lần ở cuối mỗi bước 60 s, tại vị trí cuối của UAV.
+      Giữa hai khung bước, UAV và UE được vẽ đi thẳng (khớp giả định năng lượng của env), nhưng màu UE là trạng
+      thái của khung bước trước và đường association bị ẩn. Rê chuột vào UE hoặc UAV để xem chi tiết; bấm để
+      ghim và vẽ cả quãng đường của nó.
+    </p>
+  </section>
+  <aside class="side">
+    <div class="card"><h2>Episode</h2><div id="epinfo" class="note"></div></div>
+    <div class="card"><h2>Reward vector (mỗi bước)</h2><canvas class="chart" id="chReward"></canvas>
+      <div class="keys"><span><span class="sw line" style="border-color:var(--s-qos)"></span>QoS</span>
+        <span><span class="sw line" style="border-color:var(--s-energy)"></span>−năng lượng</span>
+        <span><span class="sw line" style="border-color:var(--s-fair)"></span>fairness</span>
+        <span id="abKey1"></span></div></div>
+    <div class="card"><h2>Tỉ lệ UE đạt SLA theo slice, và coverage</h2><canvas class="chart" id="chSla"></canvas>
+      <div class="keys"><span><span class="sw line" style="border-color:var(--embb)"></span>eMBB</span>
+        <span><span class="sw line" style="border-color:var(--urllc)"></span>URLLC</span>
+        <span><span class="sw line" style="border-color:var(--mmtc)"></span>mMTC</span>
+        <span><span class="sw line" style="border-color:var(--s-cov)"></span>coverage</span></div></div>
+    <div class="card"><h2>Tốc độ mặt đất mỗi UAV (m/s)</h2><canvas class="chart" id="chSpeed"></canvas>
+      <div class="keys" id="uavKeys1"></div></div>
+    <div class="card"><h2>Công suất phát mỗi UAV (tỉ lệ max)</h2><canvas class="chart" id="chPower"></canvas>
+      <div class="keys" id="uavKeys2"></div></div>
+    <div class="card"><h2>Các UAV ở khung hiện tại</h2><div class="tablewrap" id="uavTable"></div></div>
+  </aside>
+</main>
+</div>
+<div id="tip"></div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- constants
+const STATUS_LABEL = ["Không có traffic", "Đạt SLA", "Không được phủ", "Có UAV nhưng không có RB",
+                      "Trượt SLA: rate", "Trượt SLA: delay", "Trượt SLA: reliability"];
+const STATUS_VAR = ["--st-idle", "--st-met", "--st-unc", "--st-norb", "--st-rate", "--st-delay", "--st-rel"];
+const SLICE_LABEL = ["eMBB", "URLLC", "mMTC"];
+const SLICE_VAR = ["--embb", "--urllc", "--mmtc"];
+const UAV_VAR = ["--uav0", "--uav1", "--uav2", "--uav3"];
+const LAYERS = [
+  ["buildings", "Nhà", true], ["density", "Mật độ traffic", false], ["assoc", "Association", true],
+  ["uavTrail", "Vệt bay UAV", true], ["action", "Lệnh bước tới", true], ["vertex", "Đỉnh prior", true],
+  ["ueTrail", "Vệt đi UE", false], ["labels", "Nhãn độ cao", true], ["wind", "Gió", true],
+];
+
+const S = { a: 0, b: -1, p: 0, playing: false, interp: true, speed: 1, colorBy: "status",
+            layers: Object.fromEntries(LAYERS.map(l => [l[0], l[2]])), pin: null, theme: "auto" };
+let TRACE = null, EPS = [], C = {}, views = [];
+
+// ---------------------------------------------------------------- helpers
+function readColors() {
+  const cs = getComputedStyle(document.documentElement);
+  const names = ["--bg", "--panel", "--fg", "--muted", "--border", "--map-bg", "--bldg-lo", "--bldg-hi", "--range",
+    "--density", "--banner-bg", "--interp", "--s-qos", "--s-energy", "--s-fair", "--s-cov",
+    ...STATUS_VAR, ...SLICE_VAR, ...UAV_VAR];
+  C = {};
+  for (const n of names) C[n] = cs.getPropertyValue(n).trim();
+}
+function hexToRgb(h) {
+  h = h.replace("#", "");
+  if (h.length === 3) h = h.split("").map(c => c + c).join("");
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+function mix(c1, c2, t) {
+  const a = hexToRgb(c1), b = hexToRgb(c2);
+  return `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * t)).join(",")})`;
+}
+function alpha(c, a) { const [r, g, b] = hexToRgb(c); return `rgba(${r},${g},${b},${a})`; }
+const uavColor = i => C[UAV_VAR[i % UAV_VAR.length]];
+const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "–" : Number(v).toFixed(d);
+const lerp = (a, b, t) => a + (b - a) * t;
+function frameLabel(ep, i) {
+  const n = ep.frames.length - 1;
+  return i === 0 ? "Sau reset" : `Sau bước ${i}/${n}`;
+}
+
+// ---------------------------------------------------------------- data
+function prepare(ep) {
+  ep.sceneObj = TRACE.scenes[ep.scene];
+  ep.label = `${ep.method} · seed ${ep.train_seed} · ${ep.corner} · ep ${ep.episode}`;
+  ep.index = ep.frames.map(f => { const m = new Map(); f.ues.track.forEach((t, k) => m.set(t, k)); return m; });
+  ep.paths = new Map();     // track -> [[frame, x, y], ...]
+  ep.frames.forEach((f, i) => f.ues.track.forEach((t, k) => {
+    if (!ep.paths.has(t)) ep.paths.set(t, []);
+    ep.paths.get(t).push([i, f.ues.x[k], f.ues.y[k]]);
+  }));
+  ep.nUav = ep.frames[0].uavs.length;
+  ep.speed = ep.frames.map(f => f.uavs.map(u => u.pre ? Math.hypot(u.pos[0] - u.pre[0], u.pos[1] - u.pre[1]) / TRACE.meta.T_L : null));
+}
+
+// ---------------------------------------------------------------- map view
+class MapView {
+  constructor(parent, side) {
+    this.side = side;
+    this.box = document.createElement("div");
+    this.box.className = "mapbox";
+    this.title = document.createElement("div"); this.title.className = "title";
+    this.sub = document.createElement("div"); this.sub.className = "sub";
+    this.canvas = document.createElement("canvas");
+    this.box.append(this.title, this.sub, this.canvas);
+    parent.append(this.box);
+    this.ctx = this.canvas.getContext("2d");
+    this.bg = document.createElement("canvas");
+    this.bgKey = "";
+    this.hits = [];
+    this.canvas.addEventListener("mousemove", e => this.onMove(e));
+    this.canvas.addEventListener("mouseleave", () => hideTip());
+    this.canvas.addEventListener("click", e => this.onClick(e));
+  }
+  setEpisode(ep) {
+    this.ep = ep;
+    this.title.textContent = (this.side === "B" ? "B: " : (views.length > 1 ? "A: " : "")) + ep.label;
+    const om = ep.omega.map(r => "(" + r.map(v => fmt(v, 2)).join(", ") + ")").join(" ");
+    this.sub.textContent = `ω ${ep.omega.length > 1 ? "theo UAV " : ""}${om} · env seed ${ep.env_seed} · ` +
+      `trung bình episode: QoS ${fmt(ep.mean_reward[0], 3)}, năng lượng ${fmt(ep.mean_reward[1], 3)}, fairness ${fmt(ep.mean_reward[2], 3)}`;
+  }
+  resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(200, Math.round(this.canvas.clientWidth));
+    if (this.canvas.width !== Math.round(w * dpr)) {
+      this.canvas.width = this.canvas.height = Math.round(w * dpr);
+    }
+    this.dpr = dpr; this.size = w;
+    const sc = this.ep.sceneObj;
+    this.pad = 14;
+    this.scale = (w - 2 * this.pad) / Math.max(sc.area[0], sc.area[1]);
+  }
+  X(x) { return this.pad + x * this.scale; }
+  Y(y) { return this.size - this.pad - y * this.scale; }
+
+  drawBackground() {
+    const sc = this.ep.sceneObj;
+    const key = [this.ep.scene, this.canvas.width, S.layers.buildings, S.layers.density, S.theme, C["--map-bg"]].join("|");
+    if (key === this.bgKey) return;
+    this.bgKey = key;
+    this.bg.width = this.canvas.width; this.bg.height = this.canvas.height;
+    const g = this.bg.getContext("2d");
+    g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    g.fillStyle = C["--panel"]; g.fillRect(0, 0, this.size, this.size);
+    g.fillStyle = C["--map-bg"];
+    g.fillRect(this.X(0), this.Y(sc.area[1]), sc.area[0] * this.scale, sc.area[1] * this.scale);
+    if (S.layers.density && sc.density) {
+      const d = sc.density, [nx, ny] = d.shape;
+      const raw = atob(d.u8_b64);
+      const img = new ImageData(nx, ny);
+      const rgb = C["--density"].split(",").map(Number);
+      for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) {
+        const q = raw.charCodeAt(ix * ny + iy) / 255;
+        const o = ((ny - 1 - iy) * nx + ix) * 4;
+        img.data[o] = rgb[0]; img.data[o + 1] = rgb[1]; img.data[o + 2] = rgb[2];
+        img.data[o + 3] = Math.round(Math.pow(q, 2.2) * 200);
+      }
+      const tmp = document.createElement("canvas"); tmp.width = nx; tmp.height = ny;
+      tmp.getContext("2d").putImageData(img, 0, 0);
+      g.imageSmoothingEnabled = true;
+      g.drawImage(tmp, this.X(0), this.Y(ny * d.pixel), nx * d.pixel * this.scale, ny * d.pixel * this.scale);
+    }
+    if (S.layers.buildings && sc.city) {
+      const c = sc.city, H = c.heights;
+      let hmax = 1;
+      for (const row of H) for (const h of row) hmax = Math.max(hmax, h);
+      for (let i = 0; i < H.length; i++) for (let j = 0; j < H[i].length; j++) {
+        const x0 = i * c.pitch + c.offset, y0 = j * c.pitch + c.offset;
+        const x1 = Math.min(x0 + c.width, sc.area[0]), y1 = Math.min(y0 + c.width, sc.area[1]);
+        if (x1 <= x0 || y1 <= y0) continue;
+        g.fillStyle = mix(C["--bldg-lo"], C["--bldg-hi"], Math.min(1, H[i][j] / hmax));
+        g.fillRect(this.X(x0), this.Y(y1), (x1 - x0) * this.scale, (y1 - y0) * this.scale);
+      }
+    }
+    // fly range and the gateway
+    const fr = sc.fly_range;
+    g.strokeStyle = C["--range"]; g.lineWidth = 1; g.setLineDash([4, 4]);
+    g.strokeRect(this.X(fr.x[0]), this.Y(fr.y[1]), (fr.x[1] - fr.x[0]) * this.scale, (fr.y[1] - fr.y[0]) * this.scale);
+    g.setLineDash([]);
+    if (sc.gateway) {
+      const gx = this.X(sc.gateway[0]), gy = this.Y(sc.gateway[1]);
+      g.fillStyle = C["--fg"];
+      g.beginPath(); g.moveTo(gx, gy - 9); g.lineTo(gx - 7, gy + 3); g.lineTo(gx + 7, gy + 3); g.closePath(); g.fill();
+      g.font = "11px system-ui, sans-serif"; g.textAlign = "left"; g.textBaseline = "bottom";
+      g.fillText("gateway / Home Point", gx + 9, gy + 2);
+    }
+  }
+
+  draw(p) {
+    const ep = this.ep, ctx = this.ctx, n = ep.frames.length;
+    this.resize();
+    this.drawBackground();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(this.bg, 0, 0);
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    let i = Math.floor(p), a = p - i;
+    if (i >= n - 1) { i = n - 1; a = 0; }
+    const key = a < 1e-6;
+    const F0 = ep.frames[i], F1 = key ? F0 : ep.frames[i + 1];
+    this.hits = [];
+
+    // UAV positions at p (straight line between keyframes, as the env's energy model assumes)
+    const uavPos = F0.uavs.map((u, k) => key ? u.pos : u.pos.map((v, d) => lerp(v, F1.uavs[k].pos[d], a)));
+
+    // UE trails up to now
+    if (S.layers.ueTrail) {
+      ctx.lineWidth = 1;
+      for (const t of F0.ues.track) this.trackPath(t, i, alpha(C["--muted"], 0.35));
+    }
+    // pinned UE: its whole path
+    if (S.pin && S.pin.type === "ue" && ep.paths.has(S.pin.track)) {
+      ctx.lineWidth = 2;
+      this.trackPath(S.pin.track, n - 1, C["--fg"]);
+    }
+
+    // association lines, keyframes only (the network is computed only there)
+    if (key && S.layers.assoc) {
+      ctx.lineWidth = 0.8;
+      const u = F0.ues;
+      for (let k = 0; k < u.x.length; k++) {
+        if (u.uav[k] === null) continue;
+        const v = uavPos[u.uav[k]];
+        if (!v) continue;
+        ctx.strokeStyle = alpha(uavColor(u.uav[k]), 0.28);
+        ctx.beginPath(); ctx.moveTo(this.X(u.x[k]), this.Y(u.y[k])); ctx.lineTo(this.X(v[0]), this.Y(v[1])); ctx.stroke();
+      }
+    }
+
+    // UEs
+    this.drawUes(F0, F1, i, a, key);
+
+    // UAVs: trail, vertex, next action, body
+    const next = ep.frames[Math.min(i + 1, n - 1)];
+    F0.uavs.forEach((u, k) => {
+      const col = uavColor(k), pos = uavPos[k];
+      if (S.layers.uavTrail) {
+        ctx.strokeStyle = alpha(col, 0.55); ctx.lineWidth = 1.6; ctx.setLineDash([]);
+        ctx.beginPath();
+        for (let f = 0; f <= i; f++) {
+          const q = ep.frames[f].uavs[k].pos;
+          f === 0 ? ctx.moveTo(this.X(q[0]), this.Y(q[1])) : ctx.lineTo(this.X(q[0]), this.Y(q[1]));
+        }
+        ctx.lineTo(this.X(pos[0]), this.Y(pos[1]));
+        ctx.stroke();
+        for (let f = 0; f <= i; f++) {
+          const q = ep.frames[f].uavs[k].pos;
+          ctx.fillStyle = alpha(col, 0.7);
+          ctx.beginPath(); ctx.arc(this.X(q[0]), this.Y(q[1]), 2, 0, 2 * Math.PI); ctx.fill();
+        }
+      }
+      const vtx = (key ? u.vertex : (next.uavs[k].vertex || u.vertex));
+      if (S.layers.vertex && vtx) {
+        ctx.strokeStyle = col; ctx.lineWidth = 1.2; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.arc(this.X(vtx[0]), this.Y(vtx[1]), 7, 0, 2 * Math.PI); ctx.stroke();
+        ctx.strokeStyle = alpha(col, 0.35);
+        ctx.beginPath(); ctx.moveTo(this.X(pos[0]), this.Y(pos[1])); ctx.lineTo(this.X(vtx[0]), this.Y(vtx[1])); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      // the action of the step from keyframe i: where the command pointed (dashed) and the actor's residual
+      const nu = next.uavs[k];
+      if (S.layers.action && i < n - 1 && nu.cmd_target) {
+        const pre = nu.pre;
+        this.arrow(pre, nu.cmd_target, col, [5, 4], 1.4);
+        if (nu.residual) {
+          const L = ep.sceneObj.v_max * TRACE.meta.T_L;
+          let rx = nu.residual[0], ry = nu.residual[1];
+          const nr = Math.hypot(rx, ry); if (nr > 1) { rx /= nr; ry /= nr; }
+          this.arrow(pre, [pre[0] + rx * L, pre[1] + ry * L], alpha(col, 0.55), [1, 3], 1.4);
+        }
+      }
+      // body: ring by power, filled disc, id
+      const x = this.X(pos[0]), y = this.Y(pos[1]);
+      const power = key ? u.power : lerp(u.power, F1.uavs[k].power, a);
+      if (u.active) {
+        ctx.strokeStyle = alpha(col, 0.8); ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(x, y, 9 + 10 * power, 0, 2 * Math.PI); ctx.stroke();
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(x, y, 8, 0, 2 * Math.PI); ctx.fill();
+        ctx.fillStyle = C["--panel"];
+      } else {
+        ctx.strokeStyle = C["--muted"]; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(x, y, 8, 0, 2 * Math.PI); ctx.stroke();
+        ctx.fillStyle = C["--muted"];
+      }
+      ctx.font = "bold 10px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(String(u.id), x, y + 0.5);
+      if (S.layers.labels) {
+        ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "left"; ctx.fillStyle = C["--fg"];
+        ctx.fillText(`${Math.round(pos[2])} m`, x + 21, y - 8);
+      }
+      if (S.pin && S.pin.type === "uav" && S.pin.id === u.id) {
+        ctx.strokeStyle = C["--fg"]; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(x, y, 22, 0, 2 * Math.PI); ctx.stroke();
+      }
+      this.hits.push({ type: "uav", k, x, y, r: 12 });
+    });
+
+    if (S.layers.wind) this.drawWind();
+    this.drawBanner(ep, i, a, key);
+  }
+
+  trackPath(track, upto, color) {
+    const ctx = this.ctx, path = this.ep.paths.get(track);
+    if (!path || path.length < 2) return;
+    ctx.strokeStyle = color; ctx.beginPath();
+    let started = false;
+    for (const [f, x, y] of path) {
+      if (f > upto) break;
+      started ? ctx.lineTo(this.X(x), this.Y(y)) : ctx.moveTo(this.X(x), this.Y(y));
+      started = true;
+    }
+    ctx.stroke();
+  }
+
+  drawUes(F0, F1, i, a, key) {
+    const ctx = this.ctx, ep = this.ep;
+    const draw = (f, k, x, y, op) => {
+      const u = f.ues;
+      const st = u.status[k];
+      const col = S.colorBy === "slice" ? C[SLICE_VAR[u.slice[k]]] : C[STATUS_VAR[st]];
+      const X = this.X(x), Y = this.Y(y);
+      ctx.globalAlpha = op;
+      if (u.rsu[k]) {
+        ctx.fillStyle = col; ctx.fillRect(X - 3.5, Y - 3.5, 7, 7);
+        ctx.strokeStyle = C["--fg"]; ctx.lineWidth = 0.8; ctx.strokeRect(X - 3.5, Y - 3.5, 7, 7);
+      } else if (S.colorBy === "status" && st === 0) {
+        ctx.strokeStyle = col; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(X, Y, 2.6, 0, 2 * Math.PI); ctx.stroke();
+      } else {
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(X, Y, 3.2, 0, 2 * Math.PI); ctx.fill();
+        if (u.indoor[k]) { ctx.strokeStyle = C["--fg"]; ctx.lineWidth = 0.9; ctx.stroke(); }
+      }
+      if (S.pin && S.pin.type === "ue" && S.pin.track === u.track[k]) {
+        ctx.strokeStyle = C["--fg"]; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(X, Y, 7, 0, 2 * Math.PI); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      this.hits.push({ type: "ue", f, k, x: X, y: Y, r: 6 });
+    };
+    if (key) {
+      F0.ues.x.forEach((x, k) => draw(F0, k, x, F0.ues.y[k], 1));
+      return;
+    }
+    // between keyframes: a UE present in both moves on a straight line with its last computed state; one that
+    // departs fades out, one that arrives fades in
+    const idx1 = ep.index[i + 1];
+    F0.ues.track.forEach((t, k) => {
+      const j = idx1.get(t);
+      if (j === undefined) draw(F0, k, F0.ues.x[k], F0.ues.y[k], 0.45 * (1 - a));
+      else draw(F0, k, lerp(F0.ues.x[k], F1.ues.x[j], a), lerp(F0.ues.y[k], F1.ues.y[j], a), 0.45);
+    });
+    const idx0 = ep.index[i];
+    F1.ues.track.forEach((t, j) => { if (!idx0.has(t)) draw(F1, j, F1.ues.x[j], F1.ues.y[j], 0.45 * a); });
+  }
+
+  arrow(from, to, color, dash, width) {
+    const ctx = this.ctx;
+    const x0 = this.X(from[0]), y0 = this.Y(from[1]), x1 = this.X(to[0]), y1 = this.Y(to[1]);
+    const L = Math.hypot(x1 - x0, y1 - y0);
+    if (L < 4) return;
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    ctx.setLineDash([]);
+    const ang = Math.atan2(y1 - y0, x1 - x0);
+    ctx.beginPath(); ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - 8 * Math.cos(ang - 0.4), y1 - 8 * Math.sin(ang - 0.4));
+    ctx.lineTo(x1 - 8 * Math.cos(ang + 0.4), y1 - 8 * Math.sin(ang + 0.4));
+    ctx.closePath(); ctx.fill();
+  }
+
+  drawWind() {
+    const w = this.ep.sceneObj.wind, ctx = this.ctx;
+    const sp = Math.hypot(w[0], w[1]);
+    const cx = this.size - this.pad - 34, cy = this.pad + 30;
+    ctx.fillStyle = C["--banner-bg"]; ctx.strokeStyle = C["--border"]; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(cx - 30, cy - 26, 60, 58, 6); ctx.fill(); ctx.stroke();
+    if (sp > 0.05) {
+      const L = 16, dx = w[0] / sp * L, dy = -w[1] / sp * L;
+      ctx.strokeStyle = C["--fg"]; ctx.fillStyle = C["--fg"]; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(cx - dx, cy - dy); ctx.lineTo(cx + dx, cy + dy); ctx.stroke();
+      const ang = Math.atan2(dy, dx);
+      ctx.beginPath(); ctx.moveTo(cx + dx, cy + dy);
+      ctx.lineTo(cx + dx - 7 * Math.cos(ang - 0.45), cy + dy - 7 * Math.sin(ang - 0.45));
+      ctx.lineTo(cx + dx - 7 * Math.cos(ang + 0.45), cy + dy - 7 * Math.sin(ang + 0.45));
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.fillStyle = C["--fg"]; ctx.font = "10px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillText(`gió ${sp.toFixed(1)} m/s`, cx, cy + 28);
+  }
+
+  drawBanner(ep, i, a, key) {
+    const ctx = this.ctx;
+    const small = this.size < 560;
+    const text = key ? `${frameLabel(ep, i)} · khung bước${small ? "" : " (mạng được tính ở đây)"}`
+                     : `Nội suy ${i} → ${i + 1} · mạng KHÔNG được tính${small ? "" : " giữa hai bước"}`;
+    ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    const w = ctx.measureText(text).width + 14;
+    ctx.fillStyle = C["--banner-bg"]; ctx.strokeStyle = key ? C["--border"] : C["--interp"]; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(this.pad + 4, this.pad + 4, w, 22, 5); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = key ? C["--fg"] : C["--interp"];
+    ctx.fillText(text, this.pad + 11, this.pad + 15);
+    if (key && i > 0) {
+      const t = ep.frames[i].team;
+      const line = this.size < 560
+        ? `QoS ${fmt(t.reward[0], 2)} · E ${fmt(t.reward[1], 2)} · F ${fmt(t.reward[2], 2)} · cov ${fmt(t.coverage, 2)}`
+        : `QoS ${fmt(t.reward[0], 3)} · năng lượng ${fmt(t.reward[1], 3)} · fairness ${fmt(t.reward[2], 3)} · coverage ${fmt(t.coverage, 2)} · handover ${t.handovers}`;
+      const w2 = ctx.measureText(line).width + 14;
+      ctx.fillStyle = C["--banner-bg"]; ctx.strokeStyle = C["--border"];
+      ctx.beginPath(); ctx.roundRect(this.pad + 4, this.pad + 30, w2, 22, 5); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C["--fg"]; ctx.fillText(line, this.pad + 11, this.pad + 41);
+    }
+  }
+
+  pick(e) {
+    const r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    let best = null, bd = Infinity;
+    for (const h of this.hits) {
+      const d = Math.hypot(h.x - x, h.y - y) - (h.type === "uav" ? 6 : 0);
+      if (d < h.r && d < bd) { bd = d; best = h; }
+    }
+    return best;
+  }
+  onMove(e) {
+    const h = this.pick(e);
+    if (!h) return hideTip();
+    showTip(e, h.type === "ue" ? ueTip(this.ep, h.f, h.k) : uavTip(this.ep, h.k));
+  }
+  onClick(e) {
+    const h = this.pick(e);
+    if (!h) S.pin = null;
+    else if (h.type === "ue") S.pin = { type: "ue", track: h.f.ues.track[h.k] };
+    else S.pin = { type: "uav", id: this.ep.frames[0].uavs[h.k].id };
+    render();
+  }
+}
+
+// ---------------------------------------------------------------- tooltips
+function ueTip(ep, f, k) {
+  const u = f.ues, st = u.status[k];
+  const lines = [
+    `UE ${u.id[k]} (track ${u.track[k]}) · ${SLICE_LABEL[u.slice[k]]}${u.rsu[k] ? " · RSU cố định" : ""} · ${u.indoor[k] ? "trong nhà" : "ngoài trời"}`,
+    `Vị trí (${fmt(u.x[k], 0)}, ${fmt(u.y[k], 0)}) m`,
+    `UAV phục vụ: ${u.uav[k] === null ? "không" : u.uav[k]}`,
+    `Trạng thái: ${STATUS_LABEL[st]}`,
+  ];
+  if (st !== 0) {
+    const dem = u.demand_bps[k];
+    lines.push(`Demand ${dem >= 1e5 ? fmt(dem / 1e6, 1) + " Mbps" : fmt(dem, 3) + " bps"}` +
+               (u.rate_mbps[k] !== null ? ` · rate ${fmt(u.rate_mbps[k], 3)} Mbps · delay ${fmt(u.delay_ms[k], 1)} ms` : ""));
+    lines.push(`Thoả mãn: rate ${fmt(u.thr[k], 3)} · delay ${fmt(u.delay[k], 3)} · reliability ${fmt(u.rel[k], 3)}`);
+  }
+  const path = ep.paths.get(u.track[k]);
+  if (path) lines.push(`Có mặt ở ${path.length} khung (từ khung ${path[0][0]})`);
+  return lines.join("\n");
+}
+function uavTip(ep, k) {
+  const u = ep.frames[Math.min(Math.floor(S.p), ep.frames.length - 1)].uavs[k];
+  const L = [`UAV ${u.id}${u.active ? "" : " (không hoạt động)"} · ${frameLabel(ep, Math.floor(Math.min(S.p, ep.frames.length - 1)))}`,
+    `Vị trí (${fmt(u.pos[0], 0)}, ${fmt(u.pos[1], 0)}, ${fmt(u.pos[2], 0)}) m · pin ${fmt(100 * u.battery, 1)}%`,
+    `Công suất ${fmt(u.power, 2)} · phục vụ ${u.served} UE · RB eMBB/URLLC/mMTC ${u.rbs.join("/")}`];
+  if (u.vertex) L.push(`Cách đỉnh prior ${fmt(Math.hypot(u.pos[0] - u.vertex[0], u.pos[1] - u.vertex[1]), 0)} m`);
+  if (u.pre) {
+    const real = Math.hypot(u.pos[0] - u.pre[0], u.pos[1] - u.pre[1]);
+    const cmd = Math.hypot(u.cmd_target[0] - u.pre[0], u.cmd_target[1] - u.pre[1]);
+    L.push(`Bước vừa rồi: residual (${u.residual.map(v => fmt(v, 2)).join(", ")}) → lệnh sau prior (${u.move.map(v => fmt(v, 2)).join(", ")})`);
+    L.push(`Độ dời ngang: lệnh ${fmt(cmd, 0)} m, thật ${fmt(real, 0)} m (${fmt(real / TRACE.meta.T_L, 1)} m/s)`);
+    L.push(`Băng thông actor eMBB/URLLC/mMTC ${u.bw.map(v => fmt(v, 2)).join(" / ")}`);
+  }
+  return L.join("\n");
+}
+const tip = () => document.getElementById("tip");
+function showTip(e, text) {
+  const t = tip(); t.textContent = text; t.style.display = "block";
+  const w = t.offsetWidth, h = t.offsetHeight;
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + w > window.innerWidth - 8) x = e.clientX - w - 14;
+  if (y + h > window.innerHeight - 8) y = e.clientY - h - 14;
+  t.style.left = Math.max(8, x) + "px"; t.style.top = Math.max(8, y) + "px";
+}
+function hideTip() { tip().style.display = "none"; }
+
+// ---------------------------------------------------------------- charts
+function chart(id, series, p, yRange) {
+  const cv = document.getElementById(id), dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const pl = 34, pr = 6, pt = 6, pb = 18;
+  let lo = yRange ? yRange[0] : Infinity, hi = yRange ? yRange[1] : -Infinity;
+  if (!yRange) for (const s of series) for (const v of s.values) if (v !== null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  if (hi - lo < 1e-9) { lo -= 0.5; hi += 0.5; }
+  const pad = (hi - lo) * 0.08; if (!yRange) { lo -= pad; hi += pad; }
+  const nMax = Math.max(...series.map(s => s.values.length), 2);
+  const xs = i => pl + (i - 1) / Math.max(1, nMax - 2) * (W - pl - pr);   // frame index 1..n-1 (steps)
+  const ys = v => pt + (hi - v) / (hi - lo) * (H - pt - pb);
+  g.strokeStyle = C["--border"]; g.lineWidth = 1; g.fillStyle = C["--muted"];
+  g.font = "10px system-ui, sans-serif"; g.textAlign = "right"; g.textBaseline = "middle";
+  for (const v of [lo, (lo + hi) / 2, hi]) {
+    g.beginPath(); g.moveTo(pl, ys(v)); g.lineTo(W - pr, ys(v)); g.stroke();
+    g.fillText(v.toFixed(Math.abs(hi - lo) < 0.5 ? 3 : (Math.abs(hi - lo) < 5 ? 2 : 0)), pl - 4, ys(v));
+  }
+  g.textAlign = "center"; g.textBaseline = "top";
+  for (let i = 1; i < nMax; i += Math.max(1, Math.round((nMax - 1) / 6))) g.fillText(String(i), xs(i), H - pb + 4);
+  for (const s of series) {
+    g.strokeStyle = s.color; g.lineWidth = 1.6; g.setLineDash(s.dash ? [4, 3] : []);
+    g.beginPath(); let on = false;
+    s.values.forEach((v, i) => {
+      if (i === 0 || v === null) { on = false; return; }
+      on ? g.lineTo(xs(i), ys(v)) : g.moveTo(xs(i), ys(v)); on = true;
+    });
+    g.stroke();
+  }
+  g.setLineDash([]);
+  const px = Math.max(1, Math.min(p, nMax - 1));
+  g.strokeStyle = C["--fg"]; g.globalAlpha = 0.5; g.beginPath(); g.moveTo(xs(px), pt); g.lineTo(xs(px), H - pb); g.stroke();
+  g.globalAlpha = 1;
+}
+function seriesFor(ep, dash) {
+  const T = ep.frames.map(f => f.team || null);
+  const pick = fn => T.map(t => t ? fn(t) : null);
+  return {
+    reward: [0, 1, 2].map(j => ({ values: pick(t => t.reward[j]), color: C[["--s-qos", "--s-energy", "--s-fair"][j]], dash })),
+    sla: [0, 1, 2].map(j => ({ values: pick(t => t.sla[j]), color: C[SLICE_VAR[j]], dash }))
+      .concat([{ values: pick(t => t.coverage), color: C["--s-cov"], dash }]),
+    speed: [...Array(ep.nUav).keys()].map(k => ({ values: ep.speed.map(r => r[k]), color: uavColor(k), dash })),
+    power: [...Array(ep.nUav).keys()].map(k => ({ values: ep.frames.map((f, i) => i === 0 ? null : f.uavs[k].power), color: uavColor(k), dash })),
+  };
+}
+function renderCharts() {
+  const A = seriesFor(EPS[S.a], false), B = S.b >= 0 ? seriesFor(EPS[S.b], true) : null;
+  const both = k => B ? A[k].concat(B[k]) : A[k];
+  chart("chReward", both("reward"), S.p);
+  chart("chSla", both("sla"), S.p, [0, 1]);
+  chart("chSpeed", both("speed"), S.p, [0, Math.max(18, EPS[S.a].sceneObj.v_max + 1)]);
+  chart("chPower", both("power"), S.p, [0, 1]);
+}
+
+// ---------------------------------------------------------------- side panel
+function renderTable() {
+  const rows = [];
+  for (const [name, idx] of [["A", S.a], ["B", S.b]]) {
+    if (idx < 0) continue;
+    const ep = EPS[idx], i = Math.min(Math.floor(S.p), ep.frames.length - 1), f = ep.frames[i];
+    f.uavs.forEach((u, k) => {
+      const sp = ep.speed[i][k];
+      const dv = u.vertex ? Math.hypot(u.pos[0] - u.vertex[0], u.pos[1] - u.vertex[1]) : null;
+      rows.push(`<tr><td><span class="sw" style="background:${uavColor(k)}"></span>${S.b >= 0 ? name + " " : ""}UAV ${u.id}</td>` +
+        `<td>${fmt(u.pos[2], 0)}</td><td>${fmt(sp, 1)}</td><td>${fmt(u.power, 2)}</td><td>${u.served}</td>` +
+        `<td>${u.rbs.join("/")}</td><td>${fmt(100 * u.battery, 0)}%</td><td>${fmt(dv, 0)}</td></tr>`);
+    });
+  }
+  document.getElementById("uavTable").innerHTML =
+    `<table><tr><th>UAV</th><th>h (m)</th><th>v (m/s)</th><th>P</th><th>UE</th><th>RB e/u/m</th><th>pin</th><th>đỉnh (m)</th></tr>${rows.join("")}</table>` +
+    `<p class="note">v: tốc độ mặt đất của bước vừa rồi. RB: số RB mỗi slice ở khung này. Đỉnh: khoảng cách tới đỉnh prior.</p>`;
+}
+function renderInfo() {
+  const parts = [];
+  for (const [name, idx] of [["A", S.a], ["B", S.b]]) {
+    if (idx < 0) continue;
+    const ep = EPS[idx];
+    parts.push(`<b>${S.b >= 0 ? name + ": " : ""}${ep.label}</b><br>` +
+      `${ep.frames.length - 1} bước · ${ep.frames[ep.frames.length - 1].ues.x.length} UE ở khung cuối`);
+  }
+  const A = EPS[S.a], B = S.b >= 0 ? EPS[S.b] : null;
+  if (B && A.env_seed !== B.env_seed) parts.push(`<span class="warn">Hai bên là hai episode khác nhau (env seed ${A.env_seed} và ${B.env_seed}).</span>`);
+  else if (B) parts.push(`Cùng env seed: UE đi giống hệt nhau ở hai bên, chỉ UAV và association khác.`);
+  const m = TRACE.meta;
+  parts.push(`<span class="note">commit ${m.git_commit || "?"} · ${m.device || "?"} · checkpoint bước ${m.step}</span>`);
+  document.getElementById("epinfo").innerHTML = parts.join("<br>");
+  document.getElementById("abKey1").innerHTML = B ? `<span class="sw line" style="border-color:var(--muted)"></span>A <span class="sw dash" style="border-color:var(--muted)"></span>B` : "";
+  for (const id of ["uavKeys1", "uavKeys2"])
+    document.getElementById(id).innerHTML = [...Array(A.nUav).keys()]
+      .map(k => `<span><span class="sw line" style="border-color:${uavColor(k)}"></span>UAV ${A.frames[0].uavs[k].id}</span>`).join("") +
+      (B ? `<span>nét liền A, nét đứt B</span>` : "");
+}
+function renderLegend() {
+  const items = S.colorBy === "slice"
+    ? SLICE_LABEL.map((l, j) => `<span><span class="sw" style="background:${C[SLICE_VAR[j]]}"></span>${l}</span>`)
+    : STATUS_LABEL.map((l, j) => `<span><span class="sw" style="${j === 0 ? `border:1px solid ${C[STATUS_VAR[j]]}` : `background:${C[STATUS_VAR[j]]}`}"></span>${l}</span>`);
+  items.push(`<span><span class="sw sq" style="background:var(--muted)"></span>RSU (URLLC cố định)</span>`,
+             `<span><span class="sw" style="background:var(--muted);box-shadow:0 0 0 1px var(--fg)"></span>viền: trong nhà</span>`,
+             `<span>vòng quanh UAV: công suất · nét đứt: lệnh bước tới (sau prior) · chấm: residual của actor</span>`);
+  document.getElementById("legend").innerHTML = items.join("");
+}
+
+// ---------------------------------------------------------------- main loop
+function nFrames() {
+  const n = EPS[S.a].frames.length;
+  return S.b >= 0 ? Math.max(n, EPS[S.b].frames.length) : n;
+}
+function render() {
+  readColors();
+  const n = nFrames();
+  S.p = Math.max(0, Math.min(S.p, n - 1));
+  views.forEach(v => v.draw(S.p));
+  const sl = document.getElementById("slider");
+  sl.max = String(n - 1); sl.step = S.interp ? "0.001" : "1"; sl.value = String(S.p);
+  const i = Math.floor(S.p), key = S.p - i < 1e-6;
+  document.getElementById("time").textContent = key ? frameLabel(EPS[S.a], Math.min(i, EPS[S.a].frames.length - 1))
+    : `Giữa bước ${i} và ${i + 1} (nội suy)`;
+  document.getElementById("play").textContent = S.playing ? "⏸" : "▶";
+  renderCharts(); renderTable(); renderLegend();
+}
+function setupViews() {
+  const box = document.getElementById("maps");
+  box.innerHTML = ""; views = [];
+  box.classList.toggle("two", S.b >= 0);
+  views.push(new MapView(box, "A"));
+  if (S.b >= 0) views.push(new MapView(box, "B"));
+  views[0].setEpisode(EPS[S.a]);
+  if (S.b >= 0) views[1].setEpisode(EPS[S.b]);
+  renderInfo();
+}
+let last = null, acc = 0;
+function tick(ts) {
+  if (S.playing) {
+    const dt = last === null ? 0 : Math.min(0.1, (ts - last) / 1000);
+    const n = nFrames();
+    if (S.interp) S.p += dt * S.speed;
+    else { acc += dt * S.speed; if (acc >= 1) { acc -= 1; S.p = Math.floor(S.p) + 1; } }
+    if (S.p >= n - 1) { S.p = n - 1; S.playing = false; }
+    render();
+  }
+  last = ts;
+  requestAnimationFrame(tick);
+}
+
+function init(trace) {
+  TRACE = trace; EPS = trace.episodes;
+  if (!EPS.length) throw new Error("trace has no episode");
+  EPS.forEach(prepare);
+  document.getElementById("loader").hidden = true;
+  document.getElementById("app").hidden = false;
+  const selA = document.getElementById("selA"), selB = document.getElementById("selB");
+  selA.innerHTML = EPS.map((e, i) => `<option value="${i}">${e.label}</option>`).join("");
+  selB.innerHTML = `<option value="-1">— không —</option>` + EPS.map((e, i) => `<option value="${i}">${e.label}</option>`).join("");
+  selA.onchange = () => { S.a = +selA.value; S.pin = null; setupViews(); render(); };
+  selB.onchange = () => { S.b = +selB.value; setupViews(); render(); };
+  document.getElementById("colorBy").onchange = e => { S.colorBy = e.target.value; render(); };
+  document.getElementById("layers").innerHTML = LAYERS.map(([k, l]) =>
+    `<label><input type="checkbox" data-layer="${k}" ${S.layers[k] ? "checked" : ""}> ${l}</label>`).join("");
+  document.querySelectorAll("[data-layer]").forEach(cb => cb.onchange = () => { S.layers[cb.dataset.layer] = cb.checked; render(); });
+  const go = p => { S.playing = false; S.p = p; render(); };
+  document.getElementById("first").onclick = () => go(0);
+  document.getElementById("prev").onclick = () => go(Math.ceil(S.p - 1e-6) - 1);
+  document.getElementById("next").onclick = () => go(Math.floor(S.p + 1e-6) + 1);
+  document.getElementById("play").onclick = () => {
+    if (!S.playing && S.p >= nFrames() - 1) S.p = 0;
+    S.playing = !S.playing; acc = 0; render();
+  };
+  document.getElementById("slider").oninput = e => { S.playing = false; S.p = +e.target.value; render(); };
+  document.getElementById("speed").onchange = e => { S.speed = +e.target.value; };
+  document.getElementById("interp").onchange = e => { S.interp = e.target.checked; if (!S.interp) S.p = Math.round(S.p); render(); };
+  document.getElementById("theme").onclick = () => {
+    S.theme = { auto: "light", light: "dark", dark: "auto" }[S.theme];
+    if (S.theme === "auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", S.theme);
+    document.getElementById("theme").textContent = "Giao diện: " + { auto: "tự động", light: "sáng", dark: "tối" }[S.theme];
+    render(); renderInfo();
+  };
+  window.addEventListener("keydown", e => {
+    if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT" && e.target.type !== "range" && e.target.type !== "checkbox") return;
+    if (e.key === " ") { e.preventDefault(); document.getElementById("play").click(); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); document.getElementById("next").click(); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); document.getElementById("prev").click(); }
+    else if (e.key === "Home") document.getElementById("first").click();
+  });
+  window.addEventListener("resize", () => render());
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { render(); renderInfo(); });
+  setupViews(); render();
+  requestAnimationFrame(tick);
+}
+
+(function boot() {
+  const block = document.getElementById("trace").textContent.trim();
+  if (block) {
+    try { init(JSON.parse(block)); } catch (err) { document.body.textContent = "Không đọc được trace: " + err; }
+    return;
+  }
+  document.getElementById("loader").hidden = false;
+  document.getElementById("file").onchange = e => {
+    const f = e.target.files[0]; if (!f) return;
+    f.text().then(t => init(JSON.parse(t))).catch(err => alert("Không đọc được file: " + err));
+  };
+})();
+</script>
+</body>
+</html>
