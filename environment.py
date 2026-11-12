@@ -375,6 +375,15 @@ class NetworkSlicingEnv:
         # Slice-related parameters
         self.slice_weights = env_config.slicing.slice_weights  # Weights for each slice type
         self.slice_probs = env_config.slicing.slice_probabilities  # Probabilities for each slice type
+        # Work-conserving RB sharing (absent or "none": RBs of a demand area with no UE to serve stay unused).
+        # "idle": those RBs go to the UAV's demand areas that have traffic; "all": so do the RBs the action left
+        # unreserved. The action's shares then act as minimum guarantees, like rRMPolicyMinRatio of shared
+        # resources in 3GPP TS 28.541 (RRMPolicyRatio)
+        self.rb_sharing = getattr(env_config.slicing, 'rb_sharing', 'none')
+        if self.rb_sharing not in ('none', 'idle', 'all'):
+            raise ValueError(f"slicing.rb_sharing must be none, idle or all, got {self.rb_sharing}")
+        # One queue per slice at each UAV instead of one shared queue (absent: false), see _update_uavs_queuing_stats
+        self.per_slice_queues = bool(getattr(env_config.slicing, 'per_slice_queues', False))
 
         # Channel parameters
         self.carrier_frequency = env_config.channel.carrier_frequency  # Hz
@@ -1525,67 +1534,102 @@ class NetworkSlicingEnv:
             directions += [np.array([1.0, 0.0]), np.array([-1.0, 0.0])]
         return directions
 
+    def _queue_delay_drop(self, served: List, throughput_bps: float, buffer_bits: float) -> Tuple[float, float]:
+        """Mean queuing delay (ms, M/D/1) and drop rate (M/M/1/K) of one queue.
+
+        served: the UEs with packets that feed the queue; throughput_bps: what the queue can send (the UEs'
+        rates, capped by the backhaul share). The branches marked "only with a backhaul" keep results without a
+        backhaul comparable with earlier runs.
+        """
+        packet_sizes = [ue.packet_bytes for ue in served]
+        avg_packet_size = np.mean(packet_sizes) if packet_sizes else 0.0
+        arrival_rates = [ue.packet_rate for ue in served]
+        arrival_rate = np.sum(arrival_rates) if arrival_rates else 0.0   # packets per second
+
+        packet_bits = 1e3 + avg_packet_size * 8
+        if self.backhaul is not None and arrival_rate > 0:
+            # Mean over packets, not UEs, so that rho is offered bits over service bits and follows the
+            # backhaul load. Only with a backhaul: without one, results must stay comparable with earlier runs
+            packet_bits = 8.0 * np.dot(packet_sizes, arrival_rates) / arrival_rate
+        service_rate = throughput_bps / packet_bits  # packets per second
+        buffer_packets = buffer_bits / packet_bits
+
+        # Queuing delay
+        rho = arrival_rate / max(service_rate, 1)  # Utilization
+        if rho >= 1:
+            delay = 99
+        elif service_rate == 0:
+            delay = 999.0
+        else:
+            delay = rho / (2 * service_rate * (1 - rho)) * 1000  # in ms, M/D/1 formula
+            if self.backhaul is not None:
+                # The overload value caps it, so delay doesn't fall as load passes rho = 1.
+                # Only with a backhaul: without one, results must stay comparable with earlier runs
+                delay = min(delay, 99.0)
+
+        # Drop rate (M/M/1/K blocking probability)
+        if service_rate == 0:
+            drop = 1.0 if arrival_rate > 0 else 0.0
+        elif rho > 1 and (self.backhaul is None or (buffer_packets + 1) * np.log(rho) > 700.0):
+            # Limit for an overloaded queue; the finite-K formula overflows here.
+            # With a backhaul the formula runs up to that point, so the drop rate is continuous at rho = 1
+            drop = 1.0 - 1.0 / rho
+        elif rho == 1:
+            drop = 1 / (buffer_packets + 1)
+        else:
+            # The textbook numerator is rho^K. The one rho too many is harmless below rho = 1,
+            # and stays without a backhaul so that results remain comparable with earlier runs
+            numerator_power = buffer_packets + 1 if self.backhaul is None else buffer_packets
+            drop = ((rho ** numerator_power) * (1 - rho)) / (1 - rho ** (buffer_packets + 1))
+        return delay, np.clip(drop, 0.0, 1.0)
+
     def _update_uavs_queuing_stats(self):
-        '''Calculate the average queuing delay that UEs experience at their associated UAVs at each T_L period'''
+        """Queuing delay and drop rate at each UAV for this T_L.
+
+        Default: one queue per UAV for all its UEs, so an overloaded UAV delays every slice. With
+        slicing.per_slice_queues each slice has its own queue (slice isolation), with a third of the UAV's
+        buffer (assumed), served at the slice's UEs' rates; above the backhaul capacity every slice keeps its
+        share of the carried traffic, as _apply_backhaul_limit scales all UEs alike.
+        """
         for uav in self.uavs.values():
-
-            # Average packet size (bytes)
-            served = [ue for ue in self.ues.values()
-                      if ue.assigned_uav == uav.id and ue.is_active and getattr(ue, 'packet_rate', 0.0) > 0]
-            packet_sizes = [ue.packet_bytes for ue in served]
-            avg_packet_size = np.mean(packet_sizes) if packet_sizes else 0.0
-
-            
-            # Cummulative arrival rate (packets/sec)
-            arrival_rates = [ue.packet_rate for ue in served]
-            uav_arrival_rate = np.sum(arrival_rates) if arrival_rates else 0.0
-            
-            # Cummulative service rate (packets/sec)
-            througputs_of_ues_in_uav = [self._get_cached_throughput(ue) for ue in self.ues.values() if ue.assigned_uav == uav.id and ue.is_active]  # in bps
-            uav_throughput_bps = np.sum(througputs_of_ues_in_uav) if througputs_of_ues_in_uav else 0.0
+            at_uav = [ue for ue in self.ues.values() if ue.assigned_uav == uav.id and ue.is_active]
+            served = [ue for ue in at_uav if getattr(ue, 'packet_rate', 0.0) > 0]
+            throughputs = [self._get_cached_throughput(ue) for ue in at_uav]  # in bps
+            uav_throughput_bps = np.sum(throughputs) if throughputs else 0.0
+            capped_bps = uav_throughput_bps
             if self.backhaul is not None:
                 # Packets leave the UAV over the backhaul, so it sets the service rate as well
-                uav_throughput_bps = min(uav_throughput_bps, self.backhaul_capacity[uav.id])
-            packet_bits = 1e3 + avg_packet_size * 8
-            if self.backhaul is not None and uav_arrival_rate > 0:
-                # Mean over packets, not UEs, so that rho is offered bits over service bits and follows the
-                # backhaul load. Only with a backhaul: without one, results must stay comparable with earlier runs
-                packet_bits = 8.0 * np.dot(packet_sizes, arrival_rates) / uav_arrival_rate
-            uav_service_rate = uav_throughput_bps / packet_bits  # packets per second
+                capped_bps = min(uav_throughput_bps, self.backhaul_capacity[uav.id])
 
-            # Buffer size in packets
-            uav_buffer_size = uav.buffer_size / packet_bits # in packets
+            if not self.per_slice_queues:
+                uav.avg_queuing_delay_ms, uav.avg_drop_rate = self._queue_delay_drop(
+                    served, capped_bps, uav.buffer_size)
+                uav.slice_queue = None
+                continue
 
-            # CALCULATE QUEUING DELAY
-            rho = uav_arrival_rate / max(uav_service_rate, 1)  # Utilization
-            if rho >= 1:
-                uav.avg_queuing_delay_ms = 99
-            elif uav_service_rate == 0:
-                uav.avg_queuing_delay_ms = 999.0
-            else:
-                uav.avg_queuing_delay_ms = rho / (2 * uav_service_rate * (1 - rho)) * 1000  # in ms, M/D/1 formula
-                if self.backhaul is not None:
-                    # The overload value caps it, so delay doesn't fall as load passes rho = 1.
-                    # Only with a backhaul: without one, results must stay comparable with earlier runs
-                    uav.avg_queuing_delay_ms = min(uav.avg_queuing_delay_ms, 99.0)
+            share = capped_bps / uav_throughput_bps if uav_throughput_bps > 0 else 0.0
+            uav.slice_queue = {}
+            for s in ("embb", "urllc", "mmtc"):
+                thr_s = sum(t for ue, t in zip(at_uav, throughputs) if ue.slice_type == s)
+                uav.slice_queue[s] = self._queue_delay_drop(
+                    [ue for ue in served if ue.slice_type == s], thr_s * share, uav.buffer_size / 3.0)
+            # The UAV-level values are the packet-weighted means, for diagnostics only
+            rates = {s: sum(ue.packet_rate for ue in served if ue.slice_type == s) for s in uav.slice_queue}
+            total = sum(rates.values())
+            uav.avg_queuing_delay_ms = (sum(rates[s] * uav.slice_queue[s][0] for s in rates) / total
+                                        if total > 0 else 0.0)
+            uav.avg_drop_rate = (sum(rates[s] * uav.slice_queue[s][1] for s in rates) / total
+                                 if total > 0 else 0.0)
 
-            # CALCULATE DROP RATE (M/M/1/K blocking probability)
-            if uav_service_rate == 0:
-                uav.avg_drop_rate = 1.0 if uav_arrival_rate > 0 else 0.0
-            elif rho > 1 and (self.backhaul is None or (uav_buffer_size + 1) * np.log(rho) > 700.0):
-                # Limit for an overloaded queue; the finite-K formula overflows here.
-                # With a backhaul the formula runs up to that point, so the drop rate is continuous at rho = 1
-                uav.avg_drop_rate = 1.0 - 1.0 / rho
-            elif rho == 1:
-                uav.avg_drop_rate = 1 / (uav_buffer_size + 1)
-            else:
-                # The textbook numerator is rho^K. The one rho too many is harmless below rho = 1,
-                # and stays without a backhaul so that results remain comparable with earlier runs
-                numerator_power = uav_buffer_size + 1 if self.backhaul is None else uav_buffer_size
-                uav.avg_drop_rate = ( (rho**numerator_power) * (1 - rho) ) / (1 - rho**(uav_buffer_size + 1))
-            uav.avg_drop_rate = np.clip(uav.avg_drop_rate, 0.0, 1.0)
+    def _queue_of(self, ue) -> Tuple[float, float]:
+        """(queuing delay ms, drop rate) of the queue that holds the UE's packets"""
+        uav = self.uavs.get(ue.assigned_uav)
+        if uav is None:
+            return 0.0, 0.0
+        if getattr(uav, 'slice_queue', None) is not None:
+            return uav.slice_queue[ue.slice_type]
+        return uav.avg_queuing_delay_ms, uav.avg_drop_rate
 
-            # print(f"UAV {uav.id} - Arrival rate: {uav_arrival_rate:<10.2f} pkt/s | Service rate: {uav_service_rate:<12.2f} pkt/s | Rho: {rho:<10.4f} | Buffer size: {uav_buffer_size:<5.0f} pkts | Avg Delay: {uav.avg_queuing_delay_ms:<10.6f} ms | Drop Rate: {uav.avg_drop_rate:<10.4f}")
     # ============================================
     # ASSOCIATION METHODS
     # ============================================
@@ -2201,7 +2245,7 @@ class NetworkSlicingEnv:
         # Queuing delays
         # ========================
 
-        t_queue = np.array([self.uavs[ue.assigned_uav].avg_queuing_delay_ms for _, ue in active_ues], dtype=np.float32)
+        t_queue = np.array([self._queue_of(ue)[0] for _, ue in active_ues], dtype=np.float32)
 
         # ========================
         # Scheduling delays
@@ -2483,9 +2527,11 @@ class NetworkSlicingEnv:
         # ============================================
         # STEP 3: Process each UAV (can be parallelized)
         # ============================================
+        active_ues = {ue_id: ue for ue_id, ue in self.ues.items() if ue.is_active}
+
         for uav_id, uav in self.uavs.items():
             uav_das = uav_das_map.get(uav_id, [])
-            
+
             if not uav_das:
                 continue
             
@@ -2524,13 +2570,14 @@ class NetworkSlicingEnv:
                     rb = uav.RBs[rb_id]
                     rb.allocated_da_id = da.id
                     da.RB_ids_list.append(rb_id)
-        
+
+            if self.rb_sharing != 'none':
+                self._share_free_rbs(uav, uav_das, rb_order, int(cumsum[-1]), active_ues)
+
         # ============================================
         # STEP 5: Assign RBs to UEs (global pass)
         # ============================================
-        # Build UE lookup for faster access
-        active_ues = {ue_id: ue for ue_id, ue in self.ues.items() if ue.is_active}
-        
+
         for da in self.demand_areas.values():
             # The scheduler serves only UEs with traffic this step (an idle eMBB UE gets nothing)
             users = [ue_id for ue_id in da.user_ids
@@ -2555,6 +2602,49 @@ class NetworkSlicingEnv:
         # STEP 6: Invalidate cache once at the end
         # ============================================
         self._invalidate_sinr_cache()
+
+    @staticmethod
+    def _split_counts(n: int, weights: np.ndarray) -> np.ndarray:
+        """n items split in proportion to weights, largest remainder first (ties: lower index)"""
+        exact = n * weights / weights.sum()
+        counts = np.floor(exact).astype(int)
+        order = np.argsort(-(exact - counts), kind='stable')
+        counts[order[:n - counts.sum()]] += 1
+        return counts
+
+    def _share_free_rbs(self, uav, uav_das, rb_order, n_reserved: int, active_ues: Dict):
+        """Work-conserving sharing (slicing.rb_sharing) for one UAV.
+
+        RBs reserved for a demand area with no UE that has traffic, and with "all" also the RBs the action left
+        unreserved (rb_order[n_reserved:]), go to the UAV's demand areas that have such UEs, in proportion to
+        the RBs they reserved (to their UE counts when none reserved any). Draws no random numbers.
+        """
+        def users_with_traffic(da):
+            return sum(1 for u in da.user_ids
+                       if u in active_ues and getattr(active_ues[u], 'demand_bps', 0.0) > 0)
+
+        n_users = np.array([users_with_traffic(da) for da in uav_das])
+        busy = [da for da, n in zip(uav_das, n_users) if n > 0]
+        if not busy:
+            return
+        free = []
+        for da, n in zip(uav_das, n_users):
+            if n == 0:
+                free.extend(da.RB_ids_list)
+                da.RB_ids_list = []
+        if self.rb_sharing == 'all':
+            free.extend(int(r) for r in rb_order[n_reserved:])
+        if not free:
+            return
+        weights = np.array([len(da.RB_ids_list) for da in busy], dtype=np.float64)
+        if weights.sum() == 0:
+            weights = n_users[n_users > 0].astype(np.float64)
+        pos = 0
+        for da, c in zip(busy, self._split_counts(len(free), weights)):
+            for rb_id in free[pos:pos + c]:
+                uav.RBs[rb_id].allocated_da_id = da.id
+                da.RB_ids_list.append(rb_id)
+            pos += c
 
     # ============================================
     # REWARD CALCULATION METHODS
@@ -2782,7 +2872,7 @@ class NetworkSlicingEnv:
             return 0.0, 0.0
         
         # Drop rate (at assigned UAV)
-        drop_rate = self.uavs[ue.assigned_uav].avg_drop_rate if ue.assigned_uav in self.uavs else 0.0
+        drop_rate = self._queue_of(ue)[1]
         
         # Handover loss
         # Only the packets in the interruption are at risk, not the whole T_L

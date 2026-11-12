@@ -199,6 +199,23 @@ python eval_trajectories.py --out results-v1.1/eval_test/trajectories
 python plot_results.py --results results-v1.1 --out figures
 ```
 
+### Khoá luận: chọn omega lúc chạy (đang phát triển)
+
+`eval_controller.py` chạy policy `ma3_prior` đã train, nhưng omega đổi mỗi bước theo KPI mà nhà mạng đặt ngưỡng (PID-Lagrange, hàng đợi ảo, DPI rút gọn). Script so với các omega cố định và omega cố định tốt nhất chọn sau khi biết kết quả. Không train lại. Chỉnh hệ số trên seed 100000+, báo cáo trên 200000+.
+
+```bash
+python eval_controller.py --out evals/ctrl --seed_base 200000 --constraint qos:0.30 --primary energy
+```
+
+Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt, kết quả `v1.1` giữ nguyên từng bit (đã kiểm):
+
+| Khóa | Ở đâu | Ý nghĩa |
+|---|---|---|
+| `slicing.rb_sharing` | config môi trường | `none`, `idle` (RB của vùng không có UE có tải chia cho vùng khác của cùng UAV), `all` (cả RB mà action để trống) |
+| `slicing.per_slice_queues` | config môi trường | Mỗi slice một hàng đợi ở mỗi UAV, thay cho một hàng đợi chung |
+| `omega_per_agent` | config train (3 UAV) | Tỉ lệ episode mà mỗi UAV có omega riêng; critic nhận omega của mọi UAV |
+| `omega_switch_prob` | config train (3 UAV) | Xác suất đổi omega ở mỗi bước trong episode |
+
 ### 3. Lưu kết quả vào repo
 
 Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<phiên bản môi trường>/` theo cấu trúc của `results-v1.1/` rồi commit. Không commit checkpoint (`*.pth`) hay replay buffer (`*.npz`, `resume/`); `.gitignore` đã loại các file này.
@@ -216,6 +233,7 @@ Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<ph
 | `eval_formation.py` | Heuristic 3 UAV đứng yên thành tam giác. |
 | `eval_heuristics.py` | Họ 10 heuristic 3 UAV (bay theo tam giác r = 600 m), cùng episode với `eval_checkpoint.py`. |
 | `eval_trajectories.py` | Ghi quỹ đạo và hành vi của các policy 3 UAV ở 3 góc trọng số. |
+| `eval_controller.py` | Khoá luận: chọn omega lúc chạy theo ngưỡng KPI, trên policy đã train. |
 | `plot_results.py` | Vẽ các hình của báo cáo từ `results-v1.1/`. |
 | `compare_runs.py` | Gộp các seed. |
 | `config/train/` | Config train cho từng variant. |

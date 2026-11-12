@@ -135,6 +135,10 @@ class MOMA_AC_Trainer:
             # Formation prior (prior.py): the actor learns a residual on top of a fixed formation
             "formation_prior": bool( _get(tcfg, "formation_prior", False)),
             "prior_radius":    float(_get(tcfg, "prior_radius",    600.0)),
+            # Several UAVs: share of episodes with one omega per UAV (0: one team omega, as in the paper),
+            # and the per-step probability of a new omega within an episode (MOMA_CTDE_Agent)
+            "omega_per_agent":   float(_get(tcfg, "omega_per_agent",   0.0)),
+            "omega_switch_prob": float(_get(tcfg, "omega_switch_prob", 0.0)),
             # GPI-LS
             "gpi_ls_interval":  int(_get(tcfg, "gpi_ls_interval",  50_000)),
             "gpi_ls_episodes":  int(_get(tcfg, "gpi_ls_episodes",  3)),
@@ -194,7 +198,8 @@ class MOMA_AC_Trainer:
 
         # ── Agent ────────────────────────────────────────────────
         agent_cls  = MOMA_CTDE_Agent if self.multi_uav else MOMA_AC_Agent
-        agent_args = {"n_agents": len(self.uav_ids)} if self.multi_uav else {}
+        agent_args = ({"n_agents": len(self.uav_ids), "omega_per_agent": self.cfg["omega_per_agent"],
+                       "omega_switch_prob": self.cfg["omega_switch_prob"]} if self.multi_uav else {})
         self.agent = agent_cls(
             obs_dim   = self.obs_dim,
             act_dim   = self.act_dim,
@@ -312,10 +317,12 @@ class MOMA_AC_Trainer:
             # all already in similar scale, no normalization needed
             ep_end = done or (ep_steps + 1 >= self.cfg["max_steps_per_episode"])
             # Store the env's done only: the time limit truncates, it isn't terminal
-            self.agent.buffer.add(np.ravel(obs), np.ravel(action), r_vec, np.ravel(obs_next), omega, done)
+            self.agent.buffer.add(np.ravel(obs), np.ravel(action), r_vec, np.ravel(obs_next), np.ravel(omega), done)
 
             ep_rvec.append(r_vec)
             obs      = obs_next
+            if self.multi_uav:
+                omega = self.agent.maybe_switch_omega(omega)
             ep_steps += 1
             step     += 1
             pbar.update(1)

@@ -111,10 +111,11 @@ class MultiHeadActor(nn.Module):
 # ============================================================
 
 class VectorCritic(nn.Module):
-    """Q(obs, action, omega) -> R^n_obj (one Q-value per objective)."""
-    def __init__(self, obs_dim: int, act_dim: int, n_obj: int = 3, hidden: int = 256):
+    """Q(obs, action, omega) -> R^n_obj (one Q-value per objective).
+    omega_dim is the width of the omega input: n_obj, or n_agents * n_obj with one omega per UAV."""
+    def __init__(self, obs_dim: int, act_dim: int, n_obj: int = 3, hidden: int = 256, omega_dim: int = None):
         super().__init__()
-        inp = obs_dim + act_dim + n_obj
+        inp = obs_dim + act_dim + (n_obj if omega_dim is None else omega_dim)
         self.fc1 = nn.Linear(inp, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.out = nn.Linear(hidden, n_obj)
@@ -133,7 +134,7 @@ class VectorCritic(nn.Module):
 
 class ReplayBuffer:
     def __init__(self, obs_dim: int, act_dim: int, n_obj: int,
-                 max_size: int = 500_000):
+                 max_size: int = 500_000, omega_dim: int = None):
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
@@ -141,7 +142,7 @@ class ReplayBuffer:
         self.action   = np.zeros((max_size, act_dim),  dtype=np.float32)
         self.r_vec    = np.zeros((max_size, n_obj),    dtype=np.float32)
         self.obs_next = np.zeros((max_size, obs_dim),  dtype=np.float32)
-        self.omega    = np.zeros((max_size, n_obj),    dtype=np.float32)
+        self.omega    = np.zeros((max_size, n_obj if omega_dim is None else omega_dim), dtype=np.float32)
         self.done     = np.zeros((max_size, 1),        dtype=np.float32)
 
     def add(self, obs, action, r_vec, obs_next, omega, done):
@@ -940,7 +941,8 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
 
     def __init__(self, obs_dim: int, act_dim: int, n_agents: int, n_objectives: int = 3,
                  hidden_dim: int = 256, actor_lr: float = 3e-4,
-                 omega_sampling: str = "random", **kwargs):
+                 omega_sampling: str = "random", omega_per_agent: float = 0.0,
+                 omega_switch_prob: float = 0.0, **kwargs):
         if omega_sampling != "random":
             raise ValueError(f"MOMA_CTDE_Agent only supports omega_sampling='random', got {omega_sampling}")
 
@@ -954,18 +956,89 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_opt    = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
 
+        # One omega per UAV (thesis item B1). Off (0): one omega for the team, as in the paper. On: omega has
+        # shape (n_agents, n_obj); an episode draws an independent Dirichlet omega for each UAV with probability
+        # omega_per_agent, else one shared omega repeated. pi_i sees only its own omega_i, the critics see all
+        # of them, and UAV i's actor loss is omega_i . Q_team: the reward stays one team vector, and with the
+        # other UAVs' replay actions held fixed (Eq. 10-12) a UAV that weights energy mostly saves its own.
+        # omega_switch_prob redraws omega within an episode, so the policy sees omega change at run time
+        self.per_agent_omega   = omega_per_agent > 0
+        self.omega_per_agent   = omega_per_agent
+        self.omega_switch_prob = omega_switch_prob
+        if self.per_agent_omega:
+            w_dim = n_agents * n_objectives
+            critic_lr = self.critic_opt.param_groups[0]["lr"]
+            self.critic1 = VectorCritic(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
+                                        omega_dim=w_dim).to(DEVICE)
+            self.critic2 = VectorCritic(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
+                                        omega_dim=w_dim).to(DEVICE)
+            self.critic1_target = copy.deepcopy(self.critic1)
+            self.critic2_target = copy.deepcopy(self.critic2)
+            self.critic_opt = torch.optim.Adam(
+                list(self.critic1.parameters()) + list(self.critic2.parameters()), lr=critic_lr)
+            self.buffer = ReplayBuffer(n_agents * obs_dim, n_agents * act_dim, n_objectives,
+                                       self.buffer.max_size, omega_dim=w_dim)
+            self.current_omega = np.full((n_agents, n_objectives), 1.0 / n_objectives, dtype=np.float32)
+
         self.eval_diagnostics: list = []
         print(f"[MOMA-AC] CTDE: {n_agents} agents, obs_dim={obs_dim}, act_dim={act_dim} per agent\n")
+
+    # ── Omega ────────────────────────────────────────────────────
+
+    def _draw_team_omega(self) -> np.ndarray:
+        if not self.per_agent_omega:
+            return np.random.dirichlet(np.ones(self.n_obj)).astype(np.float32)
+        if np.random.rand() < self.omega_per_agent:
+            return np.random.dirichlet(np.ones(self.n_obj), self.n_agents).astype(np.float32)
+        return np.tile(np.random.dirichlet(np.ones(self.n_obj)), (self.n_agents, 1)).astype(np.float32)
+
+    def sample_omega(self) -> np.ndarray:
+        """Call at the start of each episode. Without per-UAV omega this is the base class's draw."""
+        if not self.per_agent_omega:
+            return super().sample_omega()
+        omega = self._draw_team_omega()
+        self.current_omega = omega
+        self.episode_count += 1
+        return omega
+
+    def maybe_switch_omega(self, omega: np.ndarray) -> np.ndarray:
+        """Within an episode: a new omega with probability omega_switch_prob (no random draw when it is 0)"""
+        if self.omega_switch_prob <= 0 or np.random.rand() >= self.omega_switch_prob:
+            return omega
+        self.current_omega = self._draw_team_omega()
+        return self.current_omega
+
+    def _omega_i(self, omega_b: torch.Tensor, i: int) -> torch.Tensor:
+        """UAV i's omega in a batch of (team or per-UAV) omegas"""
+        if not self.per_agent_omega:
+            return omega_b
+        return omega_b[:, i * self.n_obj:(i + 1) * self.n_obj]
+
+    def _team_omega(self, omega_b: torch.Tensor) -> torch.Tensor:
+        """The weight that picks the lower twin in the target: the mean of the UAVs' omegas"""
+        if not self.per_agent_omega:
+            return omega_b
+        return omega_b.view(omega_b.shape[0], self.n_agents, self.n_obj).mean(dim=1)
+
+    def critic_omega(self, omega: np.ndarray) -> np.ndarray:
+        """Omega as the critics take it: (n_obj,) for a team omega, or the per-UAV omegas flattened"""
+        omega = np.asarray(omega, dtype=np.float32).reshape(-1, self.n_obj)
+        if not self.per_agent_omega:
+            return omega[0]
+        return np.broadcast_to(omega, (self.n_agents, self.n_obj)).reshape(-1)
 
     # ── Action Selection ─────────────────────────────────────────
 
     @torch.no_grad()
     def select_joint_action(self, obs: np.ndarray, omega: np.ndarray,
                             explore: bool = True) -> np.ndarray:
-        """obs has shape (n_agents, obs_dim). Each UAV acts on its own obs_i and omega only."""
-        omega_t = torch.as_tensor(omega, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        """obs has shape (n_agents, obs_dim). Each UAV acts on its own obs_i and its omega only.
+        omega is one team omega (n_obj,) or one per UAV (n_agents, n_obj)."""
+        omega_t = torch.as_tensor(np.asarray(omega, dtype=np.float32).reshape(-1, self.n_obj),
+                                  dtype=torch.float32, device=DEVICE)
         obs_t   = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=DEVICE)
-        action  = np.stack([self.actor(obs_t[i:i + 1], omega_t, i).cpu().numpy()[0]
+        action  = np.stack([self.actor(obs_t[i:i + 1], omega_t[i:i + 1] if len(omega_t) > 1 else omega_t,
+                                       i).cpu().numpy()[0]
                             for i in range(self.n_agents)])
         if explore:
             n_pose = self.actor.n_pose_dims
@@ -994,7 +1067,7 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
             n_pose = self.actor.n_pose_dims
             next_a = []
             for i in range(n):
-                raw   = self.actor_target(obs_n_i[:, i], omega_b, i)
+                raw   = self.actor_target(obs_n_i[:, i], self._omega_i(omega_b, i), i)
                 noise = (torch.randn_like(raw) * self.policy_noise).clamp(
                             -self.noise_clip, self.noise_clip)
                 raw   = raw + noise
@@ -1005,7 +1078,8 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
             # Target from the critic with the lower scalarized value (Eq. 4-6)
             Q1_next = self.critic1_target(obs_n_b, next_a, omega_b)
             Q2_next = self.critic2_target(obs_n_b, next_a, omega_b)
-            use_q1  = (Q1_next * omega_b).sum(-1, keepdim=True) <= (Q2_next * omega_b).sum(-1, keepdim=True)
+            w_team  = self._team_omega(omega_b)
+            use_q1  = (Q1_next * w_team).sum(-1, keepdim=True) <= (Q2_next * w_team).sum(-1, keepdim=True)
             Q_next  = torch.where(use_q1, Q1_next, Q2_next)
             target  = r_b + self.gamma * (1.0 - done_b) * Q_next
 
@@ -1025,13 +1099,16 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         if self.total_updates % self.policy_delay == 0:
             # Eq. 10-12: in copy i of the batch only a_i comes from the actor, the
             # other UAVs keep their replay actions. One critic pass over all copies.
+            # With one omega per UAV, copy i is scalarized by UAV i's own omega_i
             joint = act_b.repeat(n, 1)
             for i in range(n):
                 start = i * self.act_dim
-                joint[i * B:(i + 1) * B, start:start + self.act_dim] = self.actor(obs_i[:, i], omega_b, i)
+                joint[i * B:(i + 1) * B, start:start + self.act_dim] = self.actor(
+                    obs_i[:, i], self._omega_i(omega_b, i), i)
             omega_r = omega_b.repeat(n, 1)
             Q_a     = self.critic1(obs_b.repeat(n, 1), joint, omega_r)
-            a_loss  = -(Q_a * omega_r).sum(-1).view(n, B).mean(dim=1).sum()
+            w_loss  = torch.cat([self._omega_i(omega_b, i) for i in range(n)], dim=0)
+            a_loss  = -(Q_a * w_loss).sum(-1).view(n, B).mean(dim=1).sum()
             self.actor_opt.zero_grad()
             a_loss.backward()
             nn.utils.clip_grad_norm_(self.actor.parameters(), 10.)
