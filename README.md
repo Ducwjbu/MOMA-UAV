@@ -213,6 +213,7 @@ Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt
 |---|---|---|
 | `slicing.rb_sharing` | config môi trường | `none`, `idle` (RB của vùng không có UE có tải chia cho vùng khác của cùng UAV), `all` (cả RB mà action để trống) |
 | `slicing.per_slice_queues` | config môi trường | Mỗi slice một hàng đợi ở mỗi UAV, thay cho một hàng đợi chung |
+| `fleet` (`n_active_min`, `withdraw_prob`, `withdraw_steps`) | config môi trường | Số UAV hoạt động đổi khi reset, một UAV có thể rút giữa episode; UAV rút vẫn giữ chỗ trong quan sát và hành động |
 | `omega_per_agent` | config train (3 UAV) | Tỉ lệ episode mà mỗi UAV có omega riêng; critic nhận omega của mọi UAV |
 | `omega_switch_prob` | config train (3 UAV) | Xác suất đổi omega ở mỗi bước trong episode |
 

@@ -90,6 +90,7 @@ class UAV:
     avg_drop_rate: float = 0.0  # NEW: Average packet drop rate at the UAV
     movement_energy: float = 0.0  # NEW: Cumulative movement energy used
     communication_energy: float = 0.0  # NEW: Cumulative communication energy used
+    active: bool = True  # False: out of the mission (fleet section), serves no one, draws no energy
 
     def __post_init__(self):
         if self.RBs is None:
@@ -384,6 +385,17 @@ class NetworkSlicingEnv:
             raise ValueError(f"slicing.rb_sharing must be none, idle or all, got {self.rb_sharing}")
         # One queue per slice at each UAV instead of one shared queue (absent: false), see _update_uavs_queuing_stats
         self.per_slice_queues = bool(getattr(env_config.slicing, 'per_slice_queues', False))
+        # Active UAVs change (thesis; absent: every UAV is active for the whole episode). num_uavs is then the
+        # fleet size: the observation and action keep a slot for every UAV, see _draw_fleet
+        fleet = getattr(env_config, 'fleet', None)
+        self.fleet = None if fleet is None else {
+            'n_active_min': int(getattr(fleet, 'n_active_min', self.num_uavs)),
+            'withdraw_prob': float(getattr(fleet, 'withdraw_prob', 0.0)),
+            'withdraw_steps': [int(v) for v in getattr(fleet, 'withdraw_steps', [1, 1])],
+        }
+        if self.fleet is not None and not 1 <= self.fleet['n_active_min'] <= self.num_uavs:
+            raise ValueError("fleet.n_active_min must be between 1 and num_uavs")
+        self.withdraw_at = None  # (step, uav_id) of this episode's withdrawal, if any
 
         # Channel parameters
         self.carrier_frequency = env_config.channel.carrier_frequency  # Hz
@@ -581,8 +593,12 @@ class NetworkSlicingEnv:
                 beam_direction=np.array([0.0, 0.0, -1.0])  # NEW: Default pointing down
             )
 
+        self.withdraw_at = None
+        if self.fleet is not None:
+            self._draw_fleet()
+
         if self._separation_active():
-            positions = self._separate_uavs(np.array([uav.position for uav in self.uavs.values()]))
+            positions = self._separate_positions(np.array([uav.position for uav in self.uavs.values()]))
             for uav, pos in zip(self.uavs.values(), positions):
                 uav.position = pos
         for uav in self.uavs.values():
@@ -751,8 +767,9 @@ class NetworkSlicingEnv:
             
             # Interference from other UAVs in 4 directions
             interference_dirs = {'N': 0, 'E': 0, 'S': 0, 'W': 0}
+            n_other = sum(other.active for oid, other in self.uavs.items() if oid != uav_id)
             for other_id, other_uav in self.uavs.items():
-                if other_id == uav_id:
+                if other_id == uav_id or not other_uav.active:
                     continue
                 dx = other_uav.position[0] - uav.position[0]
                 dy = other_uav.position[1] - uav.position[1]
@@ -763,7 +780,7 @@ class NetworkSlicingEnv:
                     interference_dirs['W' if dy > 0 else 'N'] += 1
             
             for dir in ['N', 'E', 'S', 'W']:
-                obs.append(interference_dirs[dir] / max(1, self.num_uavs - 1))  # 4
+                obs.append(interference_dirs[dir] / max(1, n_other))  # 4
 
             if self.num_uavs > 1:
                 # Uncovered UEs in 4 directions: where this UAV could add coverage
@@ -787,6 +804,9 @@ class NetworkSlicingEnv:
                     if other_id == uav_id:
                         continue
                     other_uav = self.uavs[other_id]
+                    if not other_uav.active:   # A UAV out of the mission: zeros (power 0 marks it)
+                        obs.extend([0.0, 0.0, 0.0, 0.0])
+                        continue
                     obs.append((other_uav.position[0] - uav.position[0]) / (self.uav_fly_range_x[1] - self.uav_fly_range_x[0]))
                     obs.append((other_uav.position[1] - uav.position[1]) / (self.uav_fly_range_y[1] - self.uav_fly_range_y[0]))
                     obs.append((other_uav.position[2] - uav.position[2]) / (self.uav_fly_range_h[1] - self.uav_fly_range_h[0]))
@@ -812,6 +832,14 @@ class NetworkSlicingEnv:
 
     def step(self, actions: Dict[int, np.ndarray]) -> Tuple[Dict[int, np.ndarray], float, bool, Dict]:
         """Execute actions and return next observations, reward, done, info"""
+
+        if self.fleet is not None:
+            self._apply_withdrawal()
+            for uav in self.uavs.values():
+                if not uav.active:
+                    uav.energy_used = {"movement": 0.0, "transmission": 0.0}
+        # An inactive UAV's action is ignored
+        actions = {uid: a for uid, a in actions.items() if self.uavs[uid].active}
 
         # Parse actions for each UAV: all moves are decided before any energy is counted
         new_positions = {}
@@ -840,7 +868,7 @@ class NetworkSlicingEnv:
         if self._separation_active():
             # UAVs without an action in this call hold their position
             all_positions = np.array([new_positions.get(uav_id, uav.position) for uav_id, uav in self.uavs.items()])
-            separated = self._separate_uavs(all_positions)
+            separated = self._separate_positions(all_positions)
             for uav_id, pos in zip(self.uavs.keys(), separated):
                 if uav_id in actions:
                     new_positions[uav_id] = pos
@@ -937,10 +965,10 @@ class NetworkSlicingEnv:
         # Check termination conditions. With return_home, Low Battery RTH: the mission ends when a UAV has
         # just the energy left to fly back to the Home Point
         if self.return_home is None:
-            done = any(uav.current_battery <= 0 for uav in self.uavs.values())
+            done = any(uav.current_battery <= 0 for uav in self.uavs.values() if uav.active)
         else:
             done = any(uav.current_battery <= self._home_leg_energy(uav.position, outbound=False)
-                       for uav in self.uavs.values())
+                       for uav in self.uavs.values() if uav.active)
 
         # Get new observations
         observations = self._get_observations()
@@ -968,7 +996,9 @@ class NetworkSlicingEnv:
             'handovers': self.stats['handovers'],
             'min_uav_distance': self._min_uav_distance(),
             # Share of UAVs whose traffic exceeds their backhaul
-            'backhaul_limited': sum(load > 1.0 for load in self.backhaul_load.values()) / self.num_uavs,
+            'backhaul_limited': sum(load > 1.0 for load in self.backhaul_load.values()) / max(1, sum(
+                uav.active for uav in self.uavs.values())),
+            'n_active': sum(uav.active for uav in self.uavs.values()),
             # Wind speed at the reference height (0 without wind)
             'wind_speed': float(np.linalg.norm(self.wind_ref)),
             # Share of UEs meeting their full SLA, per slice (nan when the slice has no demand this step)
@@ -1087,6 +1117,49 @@ class NetworkSlicingEnv:
     # UAV SEPARATION METHODS
     # ============================================
 
+    def _draw_fleet(self):
+        """Thesis (fleet section): which UAVs fly this episode, and whether one leaves it.
+
+        The number of active UAVs is uniform in [n_active_min, num_uavs], the active ones a random subset. With
+        probability withdraw_prob (and at least 2 active) one active UAV withdraws (a fault, or sent to swap its
+        battery) at a step uniform in withdraw_steps; from then on it serves no UE, causes no interference and
+        draws no energy, and the others see it with zero power.
+        """
+        ids = sorted(self.uavs)
+        n_active = np.random.randint(self.fleet['n_active_min'], self.num_uavs + 1)
+        active = set(np.random.choice(ids, n_active, replace=False).tolist())
+        for uid in ids:
+            self.uavs[uid].active = uid in active
+            if uid not in active:
+                self.uavs[uid].current_power = 0.0
+        if n_active >= 2 and np.random.rand() < self.fleet['withdraw_prob']:
+            lo, hi = self.fleet['withdraw_steps']
+            self.withdraw_at = (np.random.randint(lo, hi + 1), int(np.random.choice(sorted(active))))
+
+    def _apply_withdrawal(self):
+        """Take the withdrawing UAV out at the start of its step (step k: k steps have passed)"""
+        if self.withdraw_at is None:
+            return
+        step, uid = self.withdraw_at
+        if int(round(self.current_time / self.T_L)) == step:
+            uav = self.uavs[uid]
+            uav.active = False
+            uav.current_power = 0.0
+            uav.energy_used = {"movement": 0.0, "transmission": 0.0}
+
+    def active_uav_ids(self) -> List[int]:
+        return [uid for uid, uav in self.uavs.items() if uav.active]
+
+    def _separate_positions(self, positions: np.ndarray) -> np.ndarray:
+        """_separate_uavs over the active UAVs only (rows in self.uavs order); inactive rows stay"""
+        mask = np.array([uav.active for uav in self.uavs.values()])
+        if mask.all():
+            return self._separate_uavs(positions)
+        out = positions.astype(float).copy()
+        if mask.sum() > 1:
+            out[mask] = self._separate_uavs(positions[mask])
+        return out
+
     def _separation_active(self) -> bool:
         return self.num_uavs > 1 and self.min_uav_separation > 0
 
@@ -1124,7 +1197,7 @@ class NetworkSlicingEnv:
 
     def _min_uav_distance(self) -> float:
         """Smallest 3D distance between two UAVs, inf with a single UAV"""
-        positions = [uav.position for uav in self.uavs.values()]
+        positions = [uav.position for uav in self.uavs.values() if uav.active]
         distances = [np.linalg.norm(positions[i] - positions[j])
                      for i in range(len(positions)) for j in range(i + 1, len(positions))]
         return float(min(distances)) if distances else float('inf')
@@ -1678,8 +1751,10 @@ class NetworkSlicingEnv:
     def _associate_by_reference_snr(self, active_ues: List[UE]):
         """Strongest reference signal, covered if its SNR per RB at the UAV's power reaches the minimum"""
         gains_db = self._link_gains_db(active_ues)  # (num_ues, num_uavs)
-        ref_power_dbw = 10.0 * np.log10([uav.current_power / self.total_rbs for uav in self.uavs.values()])
+        ref_power_dbw = 10.0 * np.log10([uav.current_power / self.total_rbs if uav.active else 1.0
+                                         for uav in self.uavs.values()])
         ref_snr_db = gains_db + ref_power_dbw[np.newaxis, :] - 10.0 * np.log10(self.noise_power)
+        ref_snr_db[:, [not uav.active for uav in self.uavs.values()]] = -np.inf   # Inactive UAVs serve no one
         best = np.argmax(ref_snr_db, axis=1)
         uav_ids_list = list(self.uavs.keys())
         min_snr_db = self.antenna['min_association_snr_db']
@@ -1722,6 +1797,7 @@ class NetworkSlicingEnv:
         
         # Check beam constraints
         within_beam = angles <= uav_beam_angles[np.newaxis, :]  # (num_ues, num_uavs)
+        within_beam &= np.array([uav.active for uav in self.uavs.values()])[np.newaxis, :]
         
         # Set invalid distances to infinity
         distances_masked = distances.copy()
@@ -2998,12 +3074,16 @@ class NetworkSlicingEnv:
     def _calculate_energy_consumption_penalty(self) -> float:
         """Average UAV power draw over T_L, min-max normalized to [0, 1]"""
         total_energy_ratio = 0.0
+        n_active = 0
 
         for uav in self.uavs.values():
+            if not uav.active:   # Out of the mission (fleet section)
+                continue
+            n_active += 1
             total_power = sum(uav.energy_used.values()) / self.T_L
             total_energy_ratio += (total_power - self.min_total_power) / (self.max_total_power - self.min_total_power)
 
-        return float(np.clip(total_energy_ratio / self.num_uavs, 0.0, 1.0))
+        return float(np.clip(total_energy_ratio / max(1, n_active), 0.0, 1.0))
 
     def _calculate_fairness_index(self) -> float:
         """PRODUCTION VERSION: Fast and clean"""

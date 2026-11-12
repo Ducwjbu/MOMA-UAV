@@ -46,17 +46,44 @@ def move_to(env, position: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.array([xy[0], xy[1], np.clip(dh / (rate * env.T_L), -1.0, 1.0)])
 
 
+def assign_vertices(env, uav_ids, radius: float) -> dict:
+    """With a fleet section (active UAVs change): the regular n-gon of the n active UAVs, each vertex given to
+    one of them so that the total distance is smallest (Hungarian algorithm, scipy linear_sum_assignment)"""
+    from scipy.optimize import linear_sum_assignment
+    active = [uid for uid in uav_ids if env.uavs[uid].active]
+    vertices = formation_vertices(env, radius, len(active))
+    positions = np.array([env.uavs[uid].position for uid in active])
+    cost = np.linalg.norm(positions[:, None, :2] - vertices[None, :, :2], axis=2)
+    rows, cols = linear_sum_assignment(cost)
+    return {active[r]: vertices[c] for r, c in zip(rows, cols)}
+
+
 def attach(env, uav_ids, radius: float) -> np.ndarray:
-    """Make env.step add the prior to the movement of every UAV; returns the vertices"""
+    """Make env.step add the prior to the movement of every UAV; returns the vertices.
+
+    Without a fleet section UAV i takes vertex i of the N-gon, for the whole run. With one, the n-gon of the
+    active UAVs is reassigned whenever the active set changes (a reset, a withdrawal)."""
     vertices = formation_vertices(env, radius, len(uav_ids))
+    fixed = {uid: vertices[i] for i, uid in enumerate(uav_ids)}
+    cache = {"active": None, "targets": fixed}
     inner_step = env.step
+
+    def targets():
+        if getattr(env, "fleet", None) is None:
+            return fixed
+        active = tuple(uid for uid in uav_ids if env.uavs[uid].active)
+        if active != cache["active"] or env.current_time == 0.0:   # Reassign at every reset too
+            cache["active"], cache["targets"] = active, assign_vertices(env, uav_ids, radius)
+        return cache["targets"]
 
     def step(actions):
         combined = {}
-        for i, uid in enumerate(uav_ids):
+        tgt = targets()
+        for uid in uav_ids:
             if uid in actions:
                 a = np.array(actions[uid], dtype=np.float64)
-                a[0:3] = np.clip(a[0:3] + move_to(env, env.uavs[uid].position, vertices[i]), -1.0, 1.0)
+                if uid in tgt:
+                    a[0:3] = np.clip(a[0:3] + move_to(env, env.uavs[uid].position, tgt[uid]), -1.0, 1.0)
                 combined[uid] = a
         return inner_step(combined)
 
