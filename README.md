@@ -215,6 +215,8 @@ Xem lại một episode trên bản đồ (UAV bay, UE đi, association, UE trư
 
 ```bash
 python -m visualize.record --methods ma3_prior ma3 --episodes 0 1 --out visualize/out/run1 --html
+# Mặc định 3 góc; thêm trọng số bất kỳ (--omega, lặp được) hoặc các trọng số của eval lúc train (--sweep 30)
+python -m visualize.record --methods ma3_prior --corners qos --omega 0.6,0.2,0.2 --omega 1,1,1 --out visualize/out/w --html
 ```
 
 Pilot 300k bước cho kiến trúc mới (chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa` (mỗi UAV một omega), `ma3_prior_att` (mạng attention), `ma3_prior_att_fleet` (attention, môi trường `ma3_fleet.yaml` có UAV rút giữa chừng).

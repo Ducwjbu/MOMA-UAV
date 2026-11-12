@@ -279,6 +279,11 @@ def main():
     parser.add_argument("--corners", nargs="+", default=list(CORNERS),
                         help="qos energy fair, and with --roles u0_energy u1_energy u2_energy")
     parser.add_argument("--roles", action="store_true", help="Add the corners u<i>_energy (one omega per UAV)")
+    parser.add_argument("--omega", action="append", default=[], metavar="Q,E,F",
+                        help="Any team weight, e.g. --omega 0.6,0.2,0.2 (normalized to sum 1); repeatable")
+    parser.add_argument("--sweep", type=int, default=0, metavar="N",
+                        help="Also the interior weights of the training eval's sweep of N weights (eval_pareto_front: "
+                             "corners plus N - 3 seeded Dirichlet draws)")
     parser.add_argument("--out", required=True, help="Writes <out>.json (and <out>.html with --html)")
     parser.add_argument("--html", action="store_true", help="Also a self-contained viewer page")
     args = parser.parse_args()
@@ -294,6 +299,20 @@ def main():
         parser.error(f"unknown corners {unknown} (u<i>_energy needs --roles)")
     if args.roles:
         args.corners += [c for c in corners if c.startswith("u") and c not in args.corners]
+    extra = []
+    for text in args.omega:
+        w = np.array([float(v) for v in text.split(",")], np.float32)
+        if w.shape != (3,) or np.any(w < 0) or w.sum() <= 0:
+            parser.error(f"--omega needs three non-negative numbers: {text}")
+        extra.append(w / w.sum())
+    if args.sweep > 3:
+        # Same weights as MOMA_AC_Agent.eval_pareto_front
+        extra += list(np.random.RandomState(agents_moma_ac.EVAL_SEED).dirichlet(np.ones(3), args.sweep - 3)
+                      .astype(np.float32))
+    for w in extra:
+        name = "w(" + ",".join(f"{v:.2f}" for v in w) + ")"
+        corners[name] = w
+        args.corners.append(name)
 
     scenes, episodes = {}, []
     for m in args.methods:

@@ -138,6 +138,7 @@ Env tái dùng id của UE đã rời đi (`ue_id_pool`, [environment.py:1500](.
 
 - **Không sửa** `environment.py`, `agents_moma_ac.py`, `prior.py`, nên env v1.1 không đổi. Không cần đưa vào bundle Kaggle; chạy local trên CPU (`MOMA_DEVICE=cpu`), giống `eval_checkpoint.py`.
 - Chạy từ gốc repo, vì `environment.py` đọc config theo đường dẫn tương đối: `py -m visualize.record ...` (cần `visualize/__init__.py`).
+- Trọng số: mặc định 3 góc như `eval_trajectories.py`; `--roles` thêm các góc ω riêng mỗi UAV, `--omega Q,E,F` thêm trọng số bất kỳ, `--sweep N` thêm các trọng số bên trong của sweep eval lúc train (`eval_pareto_front`). Trình xem chỉ phát lại episode đã ghi: muốn xem một ω thì phải ghi nó trước, vì trang không chạy policy.
 - Dùng lại `eval_checkpoint.load_trainer`, `prior.formation_vertices` / `move_to` / `assign_vertices`, và `eval_trajectories.METHODS` để ánh xạ tên method sang config.
 - **Bộ ghi phụ thuộc tên thuộc tính của env.** Bộ ghi đọc các thuộc tính sau:
   - UAV: `uavs[i].position`, `current_power`, `current_battery`, `active`;

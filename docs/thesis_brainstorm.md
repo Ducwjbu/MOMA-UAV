@@ -339,6 +339,22 @@ Lưu ý khi trình bày: ở chế độ reset mỗi episode, kết quả tốt 
 
 **Chưa làm, chờ quyết định:** mục tiêu theo slice (Q2), ngưỡng SLA theo 5QI (Q1, Q3), hành động theo tỉ lệ slice (Q7), dịch vụ liên tục có đổi pin (Q5), kịch bản sự kiện (Q6), prior theo nhu cầu (Q4), UE có trọng số (Q12), baseline tối ưu (Q7, Q8). Chưa train thật trên Kaggle cho đến khi chốt môi trường v2.
 
+## Cập nhật 2026-11-13: trình xem episode, phép thử đứng yên
+
+Trình xem (`visualize/`, commit 7a3af15) cho thấy các UAV đi đường thẳng: mỗi UAV bay qua lại theo một trục, trục kia gần như đứng yên (residual theo trục đó gần hằng số, prior triệt tiêu nó), và `ma3` không prior cũng vậy. Bước xuôi gió dài 1020 m, ngược gió khoảng 500 m: giới hạn airspeed.
+
+Phép thử đứng yên (chỉ eval, không đổi env): giữ power và bandwidth của policy, thay di chuyển từ bước 3 bằng đứng yên tại chỗ (`hold_now`) hoặc tại trung điểm quỹ đạo của chính policy (`hold_mid`). Episode validation 100000+, 3 seed train x 10 episode, checkpoint 1M, số liệu trên các bước 3+. Script `hold_test.py` ở scratchpad của phiên 2026-11-13 (chưa đưa vào repo).
+
+| | QoS (hold_now - policy) | năng lượng | SLA URLLC, policy -> hold_now |
+|---|---|---|---|
+| `ma3_prior` góc QoS | +0.001 [-0.010, +0.012] | -0.163 [-0.202, -0.124] | 0.447 -> 0.607 |
+| `ma3_prior` góc năng lượng | -0.007 [-0.017, +0.003] | -0.253 | 0.065 -> 0.096 |
+| `ma3` góc QoS | -0.001 [-0.019, +0.017] | -0.220 | 0.211 -> 0.286 |
+
+- Bay qua lại không giúp QoS (CI chứa 0 ở mọi góc, cả hai method) mà tiết kiệm nhiều năng lượng: trong mô hình Zeng, treo tốn hơn bay. Ở góc QoS trọng số năng lượng bằng 0, nên đây là thói quen lan từ các ω khác, không bị phạt.
+- Nhưng nó làm hỏng SLA URLLC qua handover: ở episode 0 (test 200000), UE URLLC trượt reliability ở 82/120 lần đổi UAV phục vụ với `ma3` và 2/322 lần không đổi (`ma3_prior`: 48/70 và 28/372). Mất gói do handover (1% x 50 ms / 60 s, khoảng 8e-6) cộng PER dư đã vượt mục tiêu 1e-5. Reward QoS hầu như không thấy, vì độ thoả mãn reliability tính theo bậc "số 9" (thất bại 2e-5 so với 1e-5 vẫn được khoảng 0.94), còn chỉ số SLA là nhị phân.
+- Hệ quả cho v2: mục tiêu SLA theo slice (Q1 trong Notion) sẽ cho policy thấy cái giá này; tính mạng theo bước con (time dynamics) cần cho việc chấm QoS trong lúc bay. Với báo cáo môn học không đổi kết luận nào, có thể thêm như một quan sát.
+
 ## Link
 
 - PCMA: https://arxiv.org/abs/2606.14693

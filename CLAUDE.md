@@ -40,6 +40,8 @@ py eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100
 # Viewer: record eval episodes (state of every UAV and UE after each step; reads the env only, bit-identical
 # results) and write a self-contained page (visualize/out/ is not tracked; design in visualize/architecture.md)
 py -m visualize.record --methods ma3_prior ma3 --episodes 0 1 --out visualize/out/run1 --html
+# ... at any team weight (--omega Q,E,F, repeatable) or the training eval sweep's weights (--sweep 30)
+py -m visualize.record --methods ma3_prior --corners qos --omega 0.6,0.2,0.2 --out visualize/out/w --html
 py plot_results.py --results results-v1.1 --out figures
 
 # Optional flags
