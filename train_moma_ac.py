@@ -139,6 +139,9 @@ class MOMA_AC_Trainer:
             # and the per-step probability of a new omega within an episode (MOMA_CTDE_Agent)
             "omega_per_agent":   float(_get(tcfg, "omega_per_agent",   0.0)),
             "omega_switch_prob": float(_get(tcfg, "omega_switch_prob", 0.0)),
+            # Several UAVs: "mlp" (the paper's MultiHeadActor and flat critics) or "attention" (one actor for every
+            # UAV and an attention critic, independent of the number of UAVs)
+            "network":           str(  _get(tcfg, "network",           "mlp")),
             # GPI-LS
             "gpi_ls_interval":  int(_get(tcfg, "gpi_ls_interval",  50_000)),
             "gpi_ls_episodes":  int(_get(tcfg, "gpi_ls_episodes",  3)),
@@ -199,7 +202,8 @@ class MOMA_AC_Trainer:
         # ── Agent ────────────────────────────────────────────────
         agent_cls  = MOMA_CTDE_Agent if self.multi_uav else MOMA_AC_Agent
         agent_args = ({"n_agents": len(self.uav_ids), "omega_per_agent": self.cfg["omega_per_agent"],
-                       "omega_switch_prob": self.cfg["omega_switch_prob"]} if self.multi_uav else {})
+                       "omega_switch_prob": self.cfg["omega_switch_prob"], "network": self.cfg["network"]}
+                      if self.multi_uav else {})
         self.agent = agent_cls(
             obs_dim   = self.obs_dim,
             act_dim   = self.act_dim,

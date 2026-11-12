@@ -132,6 +132,111 @@ class VectorCritic(nn.Module):
 # Replay Buffers
 # ============================================================
 
+# ============================================================
+# Attention networks for any number of UAVs (thesis item B2)
+# ============================================================
+
+N_OBS_BASE = 30   # Observation dims before the other-UAV block with N > 1: 5 state + 9 DAs + 4 handover + 8 + 4
+N_OBS_OTHER = 4   # Per other UAV: dx, dy, dh, power ratio (0 for a UAV out of the mission)
+
+
+def split_obs(obs: torch.Tensor, n_agents: int):
+    """(..., obs_dim) -> own features (..., self_dim) and other UAVs (..., n_agents - 1, 4), in id order.
+    The own features are the dims before the other-UAV block plus those after it (backhaul, wind)."""
+    end = N_OBS_BASE + N_OBS_OTHER * (n_agents - 1)
+    own = torch.cat([obs[..., :N_OBS_BASE], obs[..., end:]], dim=-1)
+    others = obs[..., N_OBS_BASE:end].reshape(*obs.shape[:-1], n_agents - 1, N_OBS_OTHER)
+    return own, others
+
+
+class AttentionActor(nn.Module):
+    """
+    pi(o_i, omega_i, omega_j) for any number of UAVs, one network shared by all of them.
+    Query: an MLP of UAV i's own features and omega_i. Keys and values: one token per other UAV (its dx, dy, dh,
+    power ratio and omega_j, as in AA-MAMORL's tokens), masked when the UAV is out of the mission (power 0), plus
+    one learned null token so that a UAV alone still attends to something. Output as PreferencedActor.
+    """
+    def __init__(self, self_dim: int, act_dim: int, n_obj: int = 3, hidden: int = 128, n_heads: int = 4,
+                 n_pose_dims: int = 3):
+        super().__init__()
+        self.n_pose_dims = n_pose_dims
+        self.q_net = nn.Sequential(nn.Linear(self_dim + n_obj, hidden), nn.LayerNorm(hidden), nn.ReLU(),
+                                   nn.Linear(hidden, hidden))
+        self.kv_net = nn.Sequential(nn.Linear(N_OBS_OTHER + n_obj, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+        self.null = nn.Parameter(torch.zeros(1, 1, hidden))
+        self.attn = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.trunk = nn.Sequential(nn.Linear(2 * hidden, 2 * hidden), nn.LayerNorm(2 * hidden), nn.ReLU())
+        self.out = nn.Linear(2 * hidden, act_dim)
+
+    def forward(self, obs: torch.Tensor, omegas: torch.Tensor, agent_idx: int) -> torch.Tensor:
+        """obs (B, obs_dim) of UAV agent_idx; omegas (B, N, n_obj), every UAV's omega"""
+        B, N = omegas.shape[0], omegas.shape[1]
+        own, others = split_obs(obs, N)
+        q = self.q_net(torch.cat([own, omegas[:, agent_idx]], dim=-1)).unsqueeze(1)          # (B, 1, H)
+        idx = [j for j in range(N) if j != agent_idx]
+        kv = self.kv_net(torch.cat([others, omegas[:, idx]], dim=-1)) if idx else q[:, :0]   # (B, N-1, H)
+        kv = torch.cat([self.null.expand(B, 1, -1), kv], dim=1)
+        mask = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=obs.device),
+                          others[..., 3] == 0], dim=1)                                        # True: ignore
+        ctx, _ = self.attn(q, kv, kv, key_padding_mask=mask, need_weights=False)
+        raw = self.out(self.trunk(torch.cat([q, ctx], dim=-1).squeeze(1)))
+        pose = torch.tanh(raw[..., :self.n_pose_dims])
+        rest = torch.sigmoid(raw[..., self.n_pose_dims:])
+        return torch.cat([pose, rest], dim=-1)
+
+    def forward_all(self, obs: torch.Tensor, omegas: torch.Tensor) -> torch.Tensor:
+        """Every UAV's action in one pass: obs (B, N, obs_dim), omegas (B, N, n_obj) -> (B, N, act_dim).
+        The same function as forward for each agent_idx, batched over the UAVs."""
+        B, N = omegas.shape[0], omegas.shape[1]
+        own, others = split_obs(obs, N)                                       # (B,N,self), (B,N,N-1,4)
+        q = self.q_net(torch.cat([own, omegas], dim=-1)).reshape(B * N, 1, -1)
+        idx = torch.tensor([[j for j in range(N) if j != i] for i in range(N)], dtype=torch.long,
+                           device=obs.device).reshape(N, N - 1)
+        kv = self.kv_net(torch.cat([others, omegas[:, idx]], dim=-1)).reshape(B * N, N - 1, self.null.shape[-1])
+        kv = torch.cat([self.null.expand(B * N, 1, -1), kv], dim=1)
+        mask = torch.cat([torch.zeros(B * N, 1, dtype=torch.bool, device=obs.device),
+                          (others[..., 3] == 0).reshape(B * N, N - 1)], dim=1)
+        ctx, _ = self.attn(q, kv, kv, key_padding_mask=mask, need_weights=False)
+        raw = self.out(self.trunk(torch.cat([q, ctx], dim=-1).squeeze(1))).reshape(B, N, -1)
+        pose = torch.tanh(raw[..., :self.n_pose_dims])
+        rest = torch.sigmoid(raw[..., self.n_pose_dims:])
+        return torch.cat([pose, rest], dim=-1)
+
+
+class AttentionCritic(nn.Module):
+    """
+    Q(o, a, omega) -> R^n_obj for any number of UAVs. One token per UAV: its own features (absolute position,
+    power, battery, demand areas, ...), its action and its omega. A transformer layer mixes the tokens of the UAVs
+    in the mission (a UAV with power 0 is masked), their mean goes to the Q head, so Q is invariant to the order
+    of the UAVs and the same weights serve any N. omega is one team omega (B, n_obj) or one per UAV (B, N n_obj).
+    One layer by default: on a GTX 1650 an update (batch 256, 3 UAVs) takes 30 ms against 43 ms with two layers
+    and 14 ms for the MLP networks.
+    """
+    def __init__(self, self_dim: int, act_dim: int, n_obj: int = 3, hidden: int = 128, n_heads: int = 4,
+                 n_layers: int = 1):
+        super().__init__()
+        self.self_dim, self.act_dim, self.n_obj = self_dim, act_dim, n_obj
+        self.embed = nn.Sequential(nn.Linear(self_dim + act_dim + n_obj, hidden), nn.ReLU(),
+                                   nn.Linear(hidden, hidden))
+        layer = nn.TransformerEncoderLayer(hidden, n_heads, 2 * hidden, dropout=0.0, batch_first=True)
+        self.encoder = nn.TransformerEncoder(layer, n_layers, enable_nested_tensor=False)
+        self.head = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, n_obj))
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
+        B = obs.shape[0]
+        N = action.shape[-1] // self.act_dim
+        o = obs.view(B, N, -1)
+        own, _ = split_obs(o, N)
+        w = omega.view(B, N, self.n_obj) if omega.shape[-1] == N * self.n_obj else \
+            omega.unsqueeze(1).expand(B, N, self.n_obj)
+        x = self.embed(torch.cat([own, action.view(B, N, self.act_dim), w], dim=-1))
+        inactive = o[..., 3] == 0                                    # Own power ratio 0: out of the mission
+        h = self.encoder(x, src_key_padding_mask=inactive)
+        keep = (~inactive).unsqueeze(-1).float()
+        pooled = (h * keep).sum(1) / keep.sum(1).clamp(min=1.0)
+        return self.head(pooled)
+
+
 class ReplayBuffer:
     def __init__(self, obs_dim: int, act_dim: int, n_obj: int,
                  max_size: int = 500_000, omega_dim: int = None):
@@ -942,7 +1047,7 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
     def __init__(self, obs_dim: int, act_dim: int, n_agents: int, n_objectives: int = 3,
                  hidden_dim: int = 256, actor_lr: float = 3e-4,
                  omega_sampling: str = "random", omega_per_agent: float = 0.0,
-                 omega_switch_prob: float = 0.0, **kwargs):
+                 omega_switch_prob: float = 0.0, network: str = "mlp", **kwargs):
         if omega_sampling != "random":
             raise ValueError(f"MOMA_CTDE_Agent only supports omega_sampling='random', got {omega_sampling}")
 
@@ -952,7 +1057,15 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         self.act_dim  = act_dim
         self.n_agents = n_agents
 
-        self.actor        = MultiHeadActor(obs_dim, act_dim, n_agents, n_objectives, hidden_dim).to(DEVICE)
+        if network not in ("mlp", "attention"):
+            raise ValueError(f"network must be mlp or attention, got {network}")
+        self.network = network
+        if network == "mlp":
+            self.actor = MultiHeadActor(obs_dim, act_dim, n_agents, n_objectives, hidden_dim).to(DEVICE)
+        else:
+            # Thesis item B2: one actor for every UAV and an attention critic, both independent of N
+            self.self_dim = obs_dim - N_OBS_OTHER * (n_agents - 1)
+            self.actor = AttentionActor(self.self_dim, act_dim, n_objectives).to(DEVICE)
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_opt    = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
 
@@ -965,20 +1078,25 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         self.per_agent_omega   = omega_per_agent > 0
         self.omega_per_agent   = omega_per_agent
         self.omega_switch_prob = omega_switch_prob
-        if self.per_agent_omega:
-            w_dim = n_agents * n_objectives
+        if self.per_agent_omega or network == "attention":
+            w_dim = n_agents * n_objectives if self.per_agent_omega else n_objectives
             critic_lr = self.critic_opt.param_groups[0]["lr"]
-            self.critic1 = VectorCritic(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
-                                        omega_dim=w_dim).to(DEVICE)
-            self.critic2 = VectorCritic(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
-                                        omega_dim=w_dim).to(DEVICE)
+            if network == "attention":
+                self.critic1 = AttentionCritic(self.self_dim, act_dim, n_objectives).to(DEVICE)
+                self.critic2 = AttentionCritic(self.self_dim, act_dim, n_objectives).to(DEVICE)
+            else:
+                self.critic1 = VectorCritic(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
+                                            omega_dim=w_dim).to(DEVICE)
+                self.critic2 = VectorCritic(n_agents * obs_dim, n_agents * act_dim, n_objectives, hidden_dim,
+                                            omega_dim=w_dim).to(DEVICE)
             self.critic1_target = copy.deepcopy(self.critic1)
             self.critic2_target = copy.deepcopy(self.critic2)
             self.critic_opt = torch.optim.Adam(
                 list(self.critic1.parameters()) + list(self.critic2.parameters()), lr=critic_lr)
             self.buffer = ReplayBuffer(n_agents * obs_dim, n_agents * act_dim, n_objectives,
                                        self.buffer.max_size, omega_dim=w_dim)
-            self.current_omega = np.full((n_agents, n_objectives), 1.0 / n_objectives, dtype=np.float32)
+            if self.per_agent_omega:
+                self.current_omega = np.full((n_agents, n_objectives), 1.0 / n_objectives, dtype=np.float32)
 
         self.eval_diagnostics: list = []
         print(f"[MOMA-AC] CTDE: {n_agents} agents, obs_dim={obs_dim}, act_dim={act_dim} per agent\n")
@@ -1020,6 +1138,19 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
             return omega_b
         return omega_b.view(omega_b.shape[0], self.n_agents, self.n_obj).mean(dim=1)
 
+    def _omega_matrix(self, omega_b: torch.Tensor) -> torch.Tensor:
+        """(B, n_agents, n_obj): every UAV's omega, from a team omega or per-UAV omegas"""
+        B = omega_b.shape[0]
+        if self.per_agent_omega:
+            return omega_b.view(B, self.n_agents, self.n_obj)
+        return omega_b.unsqueeze(1).expand(B, self.n_agents, self.n_obj)
+
+    def _act(self, net, obs_i: torch.Tensor, omega_b: torch.Tensor, i: int) -> torch.Tensor:
+        """UAV i's action from actor net: the attention actor also sees the other UAVs' omegas"""
+        if self.network == "attention":
+            return net(obs_i, self._omega_matrix(omega_b), i)
+        return net(obs_i, self._omega_i(omega_b, i), i)
+
     def critic_omega(self, omega: np.ndarray) -> np.ndarray:
         """Omega as the critics take it: (n_obj,) for a team omega, or the per-UAV omegas flattened"""
         omega = np.asarray(omega, dtype=np.float32).reshape(-1, self.n_obj)
@@ -1037,9 +1168,13 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         omega_t = torch.as_tensor(np.asarray(omega, dtype=np.float32).reshape(-1, self.n_obj),
                                   dtype=torch.float32, device=DEVICE)
         obs_t   = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=DEVICE)
-        action  = np.stack([self.actor(obs_t[i:i + 1], omega_t[i:i + 1] if len(omega_t) > 1 else omega_t,
-                                       i).cpu().numpy()[0]
-                            for i in range(self.n_agents)])
+        if self.network == "attention":
+            omegas = omega_t.expand(self.n_agents, self.n_obj).unsqueeze(0)   # (1, N, n_obj)
+            action = self.actor.forward_all(obs_t.unsqueeze(0), omegas).cpu().numpy()[0]
+        else:
+            action = np.stack([self.actor(obs_t[i:i + 1], omega_t[i:i + 1] if len(omega_t) > 1 else omega_t,
+                                          i).cpu().numpy()[0]
+                               for i in range(self.n_agents)])
         if explore:
             n_pose = self.actor.n_pose_dims
             noise = np.random.normal(0, self.expl_noise, size=action.shape)
@@ -1066,8 +1201,14 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
             # Joint next action: each head plus its own clipped noise (Eq. 1-2)
             n_pose = self.actor.n_pose_dims
             next_a = []
-            for i in range(n):
-                raw   = self.actor_target(obs_n_i[:, i], self._omega_i(omega_b, i), i)
+            if self.network == "attention":
+                raw   = self.actor_target.forward_all(obs_n_i, self._omega_matrix(omega_b))
+                noise = (torch.randn_like(raw) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+                raw   = raw + noise
+                next_a = [torch.cat([raw[..., :n_pose].clamp(-1., 1.), raw[..., n_pose:].clamp(0., 1.)],
+                                    dim=-1).reshape(B, n * self.act_dim)]
+            for i in range(n if self.network != "attention" else 0):
+                raw   = self._act(self.actor_target, obs_n_i[:, i], omega_b, i)
                 noise = (torch.randn_like(raw) * self.policy_noise).clamp(
                             -self.noise_clip, self.noise_clip)
                 raw   = raw + noise
@@ -1101,10 +1242,12 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
             # other UAVs keep their replay actions. One critic pass over all copies.
             # With one omega per UAV, copy i is scalarized by UAV i's own omega_i
             joint = act_b.repeat(n, 1)
+            own_a = (self.actor.forward_all(obs_i, self._omega_matrix(omega_b))
+                     if self.network == "attention" else None)
             for i in range(n):
                 start = i * self.act_dim
-                joint[i * B:(i + 1) * B, start:start + self.act_dim] = self.actor(
-                    obs_i[:, i], self._omega_i(omega_b, i), i)
+                joint[i * B:(i + 1) * B, start:start + self.act_dim] = (
+                    own_a[:, i] if own_a is not None else self._act(self.actor, obs_i[:, i], omega_b, i))
             omega_r = omega_b.repeat(n, 1)
             Q_a     = self.critic1(obs_b.repeat(n, 1), joint, omega_r)
             w_loss  = torch.cat([self._omega_i(omega_b, i) for i in range(n)], dim=0)

@@ -41,7 +41,12 @@ Writes:
 
 Run:
   py eval_controller.py --out evals/ctrl_val --seed_base 100000
-  py eval_controller.py --out evals/ctrl --constraint qos:0.30 --primary energy --carry
+  py eval_controller.py --out evals/ctrl --seed_base 200000 --k_i 0.5 --k_p 0 --lambda_init 0.5
+  py eval_controller.py --out evals/ctrl_shift --seed_base 200000 --k_i 0.5 --k_p 2 --lambda_init 0.5 --carry
+
+Gains (tuned on 3 seeds x 10 validation episodes, qos >= 0.30, primary energy): per episode K_I 0.5, K_P 0,
+lambda_init 0.5 is the only setting with at most 10% of episodes violating; with --carry the time-averaged qos
+settles at the threshold (0.296-0.302) for every gain, and a P term adds oscillation.
   py eval_controller.py --out evals/ctrl_urllc --constraint sla_urllc:0.30:qos
 """
 
@@ -263,6 +268,8 @@ def main():
     p.add_argument("--k_p", type=float, default=2.0)
     p.add_argument("--k_i", type=float, default=0.5)
     p.add_argument("--k_d", type=float, default=0.0)
+    p.add_argument("--lambda_init", type=float, default=0.0, help="lambda at the start (of each episode, or of "
+                   "the shift with --carry)")
     p.add_argument("--delta", type=float, default=2.0, help="Max L1 change of omega per step (2 = no limit)")
     p.add_argument("--beta", type=float, default=20.0, help="dpi_lite temperature")
     p.add_argument("--fixed_grid", type=int, default=11, help="Points on the e_0 -> d line for the fixed omegas")
@@ -290,11 +297,12 @@ def main():
         ctrls = {}
         for m in args.methods:
             if m == "pid":
-                ctrls[m] = OmegaController(3, primary, constraints, args.k_p, args.k_i, args.k_d, args.delta)
+                ctrls[m] = OmegaController(3, primary, constraints, args.k_p, args.k_i, args.k_d, args.delta,
+                                           args.lambda_init)
             elif m == "i_only":
-                ctrls[m] = OmegaController(3, primary, constraints, 0.0, args.k_i, 0.0, args.delta)
+                ctrls[m] = OmegaController(3, primary, constraints, 0.0, args.k_i, 0.0, args.delta, args.lambda_init)
             elif m == "p_only":
-                ctrls[m] = OmegaController(3, primary, constraints, args.k_p, 0.0, 0.0, args.delta)
+                ctrls[m] = OmegaController(3, primary, constraints, args.k_p, 0.0, 0.0, args.delta, args.lambda_init)
             elif m == "dpi_lite":
                 ctrls[m] = DPILite(trainer.agent, 3, args.beta, args.delta, (e0 + d) / 2)
             elif m == "fixed":
