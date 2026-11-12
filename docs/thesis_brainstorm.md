@@ -316,6 +316,27 @@ Hạn chế của bài toán, câu hỏi cho thầy (Q1–Q12) và ngưỡng SLA
 
 Bộ điều khiển ngang (năng lượng chồng CI) hoặc hơn ω tốt nhất chọn sau khi biết kết quả, mà không cần biết trước. Ở v1.1 kịch bản tĩnh, nên chưa thấy lợi thế khi điều kiện đổi; cần các kịch bản sự kiện của môi trường v2 (`fleet`, Q6).
 
+Lưu ý khi trình bày: ở chế độ reset mỗi episode, kết quả tốt phần lớn nhờ khởi đầu λ = 0.5 (trọng số QoS khoảng 0.33, gần ω tốt nhất 0.30), giá trị lấy từ seed validation. Bằng chứng chính nên là hai thí nghiệm dưới, đều bắt đầu từ λ = 0.
+
+**A1 cả ca, nhà mạng đổi ngưỡng** (`--carry --change 10:0.35`, K_I 0.5, chỉ phần I, seed test):
+
+| Giai đoạn | Bộ điều khiển: năng lượng / QoS | ω cố định tốt nhất của giai đoạn (chọn sau khi biết kết quả) |
+|---|---|---|
+| Ngưỡng 0.30 (episode 0–9) | −0.037 / 0.296 | a = 0.30: −0.041 / 0.341 |
+| Ngưỡng 0.35 (episode 10–19) | −0.044 / 0.344 | a = 0.50: −0.047 / 0.356 |
+
+- Sau khi đổi ngưỡng, λ tăng dần từ 0.5 lên 0.9 và QoS bám ngưỡng mới sau khoảng 1 episode.
+- Một ω cố định phải biết trước cả hai mức ngưỡng mới làm được điều này.
+- Vì nhắm vào trung bình, khoảng 60% episode nằm hơi dưới ngưỡng. Muốn ít vi phạm theo từng episode thì đặt mục tiêu cao hơn ngưỡng một khoảng biên.
+
+**A1 với ràng buộc SLA URLLC ≥ 0.30** (trường hợp xấp xỉ, mục tiêu QoS chỉ là đại diện; `--carry`, λ từ 0): SLA URLLC trung bình 0.297, năng lượng −0.040, so với ω cố định tốt nhất (a = 0.30) −0.041 / 0.322. Cùng kiểu kết quả với trường hợp chính xác.
+
+**C2 kiểm lại với policy đã train** (góc QoS, 2 seed × 10 episode validation): hàng đợi riêng nâng URLLC từ 0.42 lên 0.48 (0.50 khi chia lại RB rảnh), mMTC từ 0.40 lên 0.44, nhưng eMBB giảm (khoảng 0.02 xuống 0.01). Kết quả xấu lần đầu là do phép thử chia đều băng thông cho 9 vùng.
+
+**Phép thử vai trò trên `ma3_prior` hiện có** (một UAV ở góc năng lượng, hai UAV kia ở góc QoS; seed 0, 5 episode validation): dù train với ω chung, UAV được giao năng lượng tự giảm công suất (0.32–0.67 thay vì 1.0) và bay nhanh hơn (khoảng 13.6–14 m/s thay vì 7–10 m/s). Lý do: mỗi head của actor nhận ω của chính UAV đó. Cả đội đạt QoS 0.30–0.34 với năng lượng −0.085 đến −0.102. Vì vậy câu hỏi của pilot B1 là train với ω riêng có cho đánh đổi tốt hơn mốc này không, chứ không phải có ra vai trò hay không.
+
+**Pilot đã chuẩn bị** (300k bước, chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa`, `ma3_prior_att`, và tuỳ chọn `ma3_prior_att_fleet`.
+
 **Chưa làm, chờ quyết định:** mục tiêu theo slice (Q2), ngưỡng SLA theo 5QI (Q1, Q3), hành động theo tỉ lệ slice (Q7), dịch vụ liên tục có đổi pin (Q5), kịch bản sự kiện (Q6), prior theo nhu cầu (Q4), UE có trọng số (Q12), baseline tối ưu (Q7, Q8). Chưa train thật trên Kaggle cho đến khi chốt môi trường v2.
 
 ## Link

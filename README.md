@@ -205,7 +205,13 @@ python plot_results.py --results results-v1.1 --out figures
 
 ```bash
 python eval_controller.py --out evals/ctrl --seed_base 200000 --constraint qos:0.30 --primary energy
+# Cả ca 20 episode, nhà mạng nâng ngưỡng lên 0,35 từ episode 10
+python eval_controller.py --out evals/ctrl_change --seed_base 200000 --carry --change 10:0.35 --k_i 0.5 --k_p 0
+# Phép thử vai trò: một UAV ở góc năng lượng, hai UAV kia ở góc QoS
+python eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
 ```
+
+Pilot 300k bước cho kiến trúc mới (chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa` (mỗi UAV một omega), `ma3_prior_att` (mạng attention), `ma3_prior_att_fleet` (attention, môi trường `ma3_fleet.yaml` có UAV rút giữa chừng).
 
 Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt, kết quả `v1.1` giữ nguyên từng bit (đã kiểm):
 

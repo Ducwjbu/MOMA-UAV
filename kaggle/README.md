@@ -123,6 +123,22 @@ Cập nhật code trước: chạy `py kaggle/build_bundle.py`, rồi vào Datas
 
 Tốc độ: riêng phần env của `ma3` khoảng 24 ms/bước trên CPU laptop, tức khoảng 7 giờ cho 1M bước chưa tính cập nhật mạng, nên một run gần như chắc chắn cần 2 session (Bước 5). Chưa đo trên Kaggle, hãy xem tiến độ ở log của session đầu. Mỗi run chưa xong chiếm nhiều đĩa hơn run 1 UAV, vì buffer lưu quan sát và hành động chung của cả đội.
 
+## Pilot khoá luận (300k bước, môi trường `v1.1`)
+
+Ba variant thử kiến trúc mới. Mỗi variant chạy 300k bước, so với đường học của `ma3_prior` ở cùng mốc. Pilot chỉ để biết kiến trúc có học được không; số liệu cuối sẽ chạy lại trên môi trường v2.
+
+| Variant | Thử gì | Ưu tiên |
+|---|---|---|
+| `ma3_prior_pa` | Mỗi UAV một omega (`omega_per_agent: 0.5`, `omega_switch_prob: 0.02`) | 1 |
+| `ma3_prior_att` | Actor và critic attention (`network: attention`), chậm hơn khoảng 40% mỗi bước | 1 |
+| `ma3_prior_att_fleet` | Attention trên `ma3_fleet.yaml`: 2 hoặc 3 UAV, 30% episode có một UAV rút giữa chừng | 2 (tuỳ chọn) |
+
+1. Upload lại Dataset (New Version) từ `kaggle/moma_uav_code.zip` mới, vì code và config đã đổi.
+2. Đặt `VARIANTS = ["ma3_prior_pa", "ma3_prior_att"]` và `SEEDS = [0, 1]`. Hai seed là đủ cho pilot. Mỗi run 300k bước mất khoảng 3–4 giờ, nên một session chạy được cả 4 run nếu `PARALLEL` là 2 trở lên.
+3. Tải về `runs/saved_models_moma_ac_<variant>/` và đặt vào `runs/` ở máy. Sau đó chạy phép thử vai trò cho `ma3_prior_pa`:
+   `py eval_trajectories.py --methods ma3_prior_pa --roles --seed_base 100000 --checkpoint_glob "runs/saved_models_moma_ac_{m}/seed_*/checkpoints/checkpoint_step_300000.pth" --out evals/roles_pa`
+   Mốc so sánh là `ma3_prior` (đã train với một omega chung) với cùng lệnh, `--methods ma3_prior` và checkpoint 300000.
+
 ## Chia việc nếu chạy không kịp
 
 Mỗi session chạy cùng lúc tối đa `PARALLEL` run, các run còn lại chờ đến khi có chỗ trống hoặc tới session sau. Nếu muốn nhanh hơn:

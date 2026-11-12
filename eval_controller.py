@@ -184,15 +184,24 @@ class DPILite:
         pass
 
 
-def run_episodes(trainer, controller, seeds, steps: int, carry: bool):
-    """Roll the team with omega from the controller; returns one row per step"""
+def run_episodes(trainer, controller, seeds, steps: int, carry: bool, constraints: list = (), changes=()):
+    """Roll the team with omega from the controller; returns one row per step.
+
+    changes: (episode, threshold) pairs. From that episode of the sequence on, the first constraint's threshold
+    is the new value (the operator changes the target during the shift); the controller reads it from the
+    shared constraint dict. Each row records the threshold in force (c_<kpi>) and the phase (changes applied).
+    """
     agent, env = trainer.agent, trainer.eval_env
     uids = sorted(env.uavs)
     rows = []
     rng_state = np.random.get_state()
+    c0 = constraints[0]["c"] if constraints else None
     controller.reset()
     try:
         for ep, s in enumerate(seeds):
+            phase = sum(ep >= e for e, _ in changes)
+            if constraints:
+                constraints[0]["c"] = c0 if phase == 0 else sorted(changes)[phase - 1][1]
             np.random.seed(s)
             if not carry:
                 controller.reset()
@@ -208,13 +217,16 @@ def run_episodes(trainer, controller, seeds, steps: int, carry: bool):
                 controller.observe(k)
                 if isinstance(controller, DPILite):
                     controller.update(g)
-                row = {"ep": ep, "t": t, "w_qos": w[0], "w_energy": w[1], "w_fair": w[2], **k}
+                row = {"ep": ep, "t": t, "phase": phase, "w_qos": w[0], "w_energy": w[1], "w_fair": w[2], **k}
+                row.update({f"c_{con['kpi']}": con["c"] for con in constraints})
                 row.update({f"lambda_{j}": v for j, v in enumerate(np.atleast_1d(controller.lam))})
                 rows.append(row)
                 if done:
                     break
     finally:
         np.random.set_state(rng_state)
+        if constraints:
+            constraints[0]["c"] = c0
     return rows
 
 
@@ -231,8 +243,9 @@ def summarize(steps: pd.DataFrame, primary: str, constraints: list) -> pd.DataFr
     """Per (method, seed, ep): episode means; then mean and CI over those units, per method"""
     ep = steps.groupby(["method", "seed", "ep"]).mean(numeric_only=True).reset_index()
     for con in constraints:
-        ep[f"gap_{con['kpi']}"] = np.maximum(0.0, con["c"] - ep[con["kpi"]])
-        ep[f"viol_{con['kpi']}"] = (ep[con["kpi"]] < con["c"]).astype(float)
+        c = ep[f"c_{con['kpi']}"] if f"c_{con['kpi']}" in ep else con["c"]   # The threshold in force
+        ep[f"gap_{con['kpi']}"] = np.maximum(0.0, c - ep[con["kpi"]])
+        ep[f"viol_{con['kpi']}"] = (ep[con["kpi"]] < c).astype(float)
     cols = [primary, "qos", "energy", "fair", "coverage", "sla_embb", "sla_urllc", "sla_mmtc"]
     cols = list(dict.fromkeys(cols)) + [c for c in ep.columns if c.startswith(("gap_", "viol_"))]
     out = []
@@ -277,6 +290,9 @@ def main():
     p.add_argument("--seed_base", type=int, default=100000, help="100000+ validation (tuning), 200000+ test")
     p.add_argument("--carry", action="store_true", help="Keep the controller state across episodes of a seed")
     p.add_argument("--n_seeds", type=int, default=None, help="Only the first n checkpoints")
+    p.add_argument("--change", action="append", default=[],
+                   help="EPISODE:THRESHOLD, repeatable: the first constraint's threshold from that episode of the "
+                        "sequence on (use with --carry for one shift); summaries are then per phase")
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
@@ -286,6 +302,7 @@ def main():
     if not files:
         p.error(f"no checkpoint matches {args.checkpoint_glob}")
     seeds = [args.seed_base + k for k in range(args.n_episodes)]
+    changes = [(int(x.split(":")[0]), float(x.split(":")[1])) for x in args.change]
     e0 = np.eye(3)[primary]
     d = np.eye(3)[constraints[0]["obj"]]
 
@@ -311,7 +328,7 @@ def main():
             else:
                 p.error(f"unknown method {m}")
         for name, c in ctrls.items():
-            df = pd.DataFrame(run_episodes(trainer, c, seeds, steps, args.carry))
+            df = pd.DataFrame(run_episodes(trainer, c, seeds, steps, args.carry, constraints, changes))
             df.insert(0, "seed", seed)
             df.insert(0, "method", name)
             frames.append(df)
@@ -319,16 +336,23 @@ def main():
 
     steps_df = pd.concat(frames, ignore_index=True)
     steps_df.to_csv(f"{args.out}_steps.csv", index=False, float_format="%.5g")
-    summary = summarize(steps_df, args.primary, constraints)
-    best = oracle_fixed(summary, args.primary, constraints)
-    summary["oracle"] = summary.method == best
-    summary.to_csv(f"{args.out}_summary.csv", index=False, float_format="%.4f")
-
     show = ["method", args.primary] + [con["kpi"] for con in constraints] + \
            [f"viol_{con['kpi']}" for con in constraints]
-    with pd.option_context("display.width", 200, "display.max_columns", 20):
-        print(summary[list(dict.fromkeys(show))].to_string(index=False, float_format="%.3f"))
-    print(f"oracle fixed omega (hindsight): {best}")
+    parts = []
+    for phase, g in steps_df.groupby("phase"):
+        cons = [dict(con) for con in constraints]
+        cons[0]["c"] = float(g[f"c_{cons[0]['kpi']}"].iloc[0])
+        summary = summarize(g, args.primary, cons)
+        best = oracle_fixed(summary, args.primary, cons)
+        summary["oracle"] = summary.method == best
+        summary.insert(1, "phase", phase)
+        summary.insert(2, "threshold", cons[0]["c"])
+        parts.append(summary)
+        print(f"phase {phase}: {cons[0]['kpi']} >= {cons[0]['c']}")
+        with pd.option_context("display.width", 200, "display.max_columns", 20):
+            print(summary[list(dict.fromkeys(show))].to_string(index=False, float_format="%.3f"))
+        print(f"oracle fixed omega (hindsight): {best}")
+    pd.concat(parts).to_csv(f"{args.out}_summary.csv", index=False, float_format="%.4f")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ FILES = [
     "eval_formation.py",
     "config/environment/default.yaml",
     "config/environment/ma3.yaml",
+    "config/environment/ma3_fleet.yaml",
     "config/train/moma_ac_random.yaml",
     "config/train/moma_ac_ols.yaml",
     "config/train/moma_ac_gpi_ls.yaml",
@@ -24,6 +25,9 @@ FILES = [
     "config/train/moma_ac_ma3_prior.yaml",
     "config/train/moma_ac_ma3_g90.yaml",
     "config/train/moma_ac_ma3_prior_g99.yaml",
+    "config/train/moma_ac_ma3_prior_pa.yaml",
+    "config/train/moma_ac_ma3_prior_att.yaml",
+    "config/train/moma_ac_ma3_prior_att_fleet.yaml",
     "kaggle/run_kaggle.py",
 ]
 

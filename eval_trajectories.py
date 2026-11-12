@@ -15,6 +15,10 @@ order, also for the methods without the prior).
 
 Run (checkpoints are not in git; the default glob is the runs/ layout of the course-report runs):
   py eval_trajectories.py --out results-v1.1/eval_test/trajectories
+Role test of the thesis pilot B1 (any method name maps to config/train/moma_ac_<name>.yaml):
+  py eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
+  (checkpoint_step_300000.pth for the pilots: --checkpoint_glob "runs/saved_models_moma_ac_{m}/seed_*/checkpoints/
+  checkpoint_step_300000.pth")
 """
 
 import argparse
@@ -98,8 +102,18 @@ def main():
     parser.add_argument("--n_episodes", type=int, default=20)
     parser.add_argument("--seed_base", type=int, default=200000)
     parser.add_argument("--radius", type=float, default=600.0, help="Triangle for dist_vertex")
+    parser.add_argument("--roles", action="store_true",
+                        help="Also the role test: corner u<i>_energy gives UAV i the energy corner and the others "
+                             "the QoS corner (one omega per UAV), to see whether UAV i alone saves energy")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+
+    corners = dict(CORNERS)
+    if args.roles:
+        for i in range(3):
+            w = np.tile(np.array(CORNERS["qos"], np.float32), (3, 1))
+            w[i] = CORNERS["energy"]
+            corners[f"u{i}_energy"] = w
 
     frames = []
     for m in args.methods:
@@ -108,8 +122,8 @@ def main():
             parser.error(f"no checkpoint for {m}: {args.checkpoint_glob.format(m=m)}")
         for f in files:
             seed = int(re.search(r"seed_(\d+)", f.replace("\\", "/")).group(1))
-            trainer = load_trainer(METHODS[m], f)
-            for cname, omega in CORNERS.items():
+            trainer = load_trainer(METHODS.get(m, f"config/train/moma_ac_{m}.yaml"), f)
+            for cname, omega in corners.items():
                 rows = record_episodes(trainer, omega, args.n_episodes, args.seed_base,
                                        trainer.cfg["eval_steps"], args.radius)
                 df = pd.DataFrame(rows)
@@ -118,7 +132,20 @@ def main():
                 df.insert(0, "method", m)
                 frames.append(df)
             print(f"{m} seed {seed} done", flush=True)
-    pd.concat(frames).to_csv(f"{args.out}.csv", index=False, float_format="%.4g")
+    df = pd.concat(frames)
+    df.to_csv(f"{args.out}.csv", index=False, float_format="%.4g")
+    if args.roles:
+        print(role_summary(df).to_string(float_format="%.3f"))
+
+
+def role_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Per method, corner and UAV, from step 3 on: mean commanded power and ground speed (m/s), and the team's
+    qos and energy. In the role test a UAV with a role of its own should differ from its teammates"""
+    df = df.sort_values(["method", "seed", "corner", "ep", "uav", "t"])
+    key = ["method", "seed", "corner", "ep", "uav"]
+    df["speed"] = np.hypot(df.groupby(key)["x"].diff(), df.groupby(key)["y"].diff()) / 60.0
+    on = df[df.t >= 3]
+    return on.groupby(["method", "corner", "uav"])[["power", "speed", "qos", "energy"]].mean().unstack("uav")
 
 
 if __name__ == "__main__":
