@@ -527,6 +527,26 @@ class NetworkSlicingEnv:
         # Per-UE QoS: 'min' of the KPI satisfactions (SLA semantics) or 'weighted' with qos_weights
         self.qos_aggregation = getattr(env_config, 'qos_aggregation', 'weighted')
         self.sla_ratio = {'embb': float('nan'), 'urllc': float('nan'), 'mmtc': float('nan')}
+        # v2 (docs/v2/plan.md, TIP 1): the objectives of the reward vector, by name. Absent: the v1.1 vector
+        # [qos, energy, fair]. sla_<slice> is a smooth stand-in for the share of the slice's UEs meeting their SLA:
+        # a UE scores sigmoid(sharpness * m), m its smallest KPI margin in natural log units (log of the ratio of
+        # rate to required rate, of delay budget to delay, of failure budget to failure rate), so 0.5 at the
+        # threshold and the SLA indicator as sharpness grows. energy is -energy penalty, as in v1.1
+        obj = getattr(env_config, 'objectives', None)
+        self.objectives = None if obj is None else [str(n) for n in obj.names]
+        if self.objectives is not None:
+            known = {'qos', 'energy', 'fair', 'sla_embb', 'sla_urllc', 'sla_mmtc'}
+            if not set(self.objectives) <= known:
+                raise ValueError(f"unknown objectives {set(self.objectives) - known}; known: {sorted(known)}")
+            if self.qos_aggregation != 'min':
+                raise ValueError("objectives needs qos_aggregation: min (SLA semantics)")
+        self.sla_sharpness = float(getattr(obj, 'sla_sharpness', 4.0)) if obj is not None else None
+        # Relative tolerance of the SLA test in the v2 path: a KPI exactly at its threshold meets it whatever the
+        # rounding of the float arithmetic (v1.1 compared floats for equality, see report/05_han_che.md item 11)
+        self.sla_tolerance = float(getattr(obj, 'sla_tolerance', 1e-9)) if obj is not None else None
+        self.sla_surrogate = {'embb': float('nan'), 'urllc': float('nan'), 'mmtc': float('nan')}
+        # Names of the reward vector's entries, for the trainer and the evaluation tools
+        self.objective_names = list(self.objectives) if self.objectives is not None else ['qos', 'energy', 'fair']
 
         # Statistics tracking
         self.stats = {
@@ -958,6 +978,11 @@ class NetworkSlicingEnv:
         # Vector reward for MORL (backward compatible, added to info), from the same computation
         reward_vector = np.array([reward_breakdown['qos_reward'], -reward_breakdown['energy_penalty'],
                                   reward_breakdown['fairness_reward']], dtype=np.float32)
+        if self.objectives is not None:   # v2: the objectives named in the config, in that order
+            values = {'qos': reward_breakdown['qos_reward'], 'energy': -reward_breakdown['energy_penalty'],
+                      'fair': reward_breakdown['fairness_reward'],
+                      **{f'sla_{st}': v for st, v in self.sla_surrogate.items()}}
+            reward_vector = np.array([values[n] for n in self.objectives], dtype=np.float32)
 
         # Update time
         self.current_time += self.T_L
@@ -2821,6 +2846,7 @@ class NetworkSlicingEnv:
         # ============================================
         slice_of_ue = []
         sla_met = {'embb': [], 'urllc': [], 'mmtc': []}
+        sla_soft = {'embb': [], 'urllc': [], 'mmtc': []}
         for ue in self.ues.values():
             if not ue.is_active or getattr(ue, 'demand_bps', 0.0) <= 0:
                 continue  # an idle eMBB UE has no demand this step
@@ -2842,7 +2868,12 @@ class NetworkSlicingEnv:
                 # Every KPI of the slice must hold (SLA): the UE scores its worst KPI, 1 exactly when the SLA is
                 # met. A smooth stand-in for the SLA indicator of Bellone et al. (DCOSS-IoT 2023), reported in info
                 overall_satisfaction = min(throughput_sat, delay_sat, reliability_sat)
-                sla_met[ue.slice_type].append(overall_satisfaction >= 1.0 - 1e-9)
+                if self.objectives is None:
+                    sla_met[ue.slice_type].append(overall_satisfaction >= 1.0 - 1e-9)
+                else:
+                    margin = self._sla_margin(ue, ue_throughput, total_delay_ms)
+                    sla_met[ue.slice_type].append(margin >= -self.sla_tolerance)
+                    sla_soft[ue.slice_type].append(self._sla_score(margin))
             else:
                 # Combine using slice-specific weights
                 ue_qos_weights = self.qos_weights[ue.slice_type]
@@ -2876,8 +2907,29 @@ class NetworkSlicingEnv:
         }
         # Share of UEs with demand whose SLA is met, per slice (nan if the slice has none this step)
         self.sla_ratio = {st: float(np.mean(v)) if v else float('nan') for st, v in sla_met.items()}
+        if self.objectives is not None:
+            # The objective of a slice with no demand this step is 1: nothing to violate
+            self.sla_surrogate = {st: float(np.mean(v)) if v else 1.0 for st, v in sla_soft.items()}
 
         return qos_reward, breakdown
+
+    def _sla_margin(self, ue, throughput_bps: float, delay_ms: float) -> float:
+        """Smallest KPI margin of a UE with demand, in natural log units (>= 0: its SLA holds): log(rate / required
+        rate), log(delay budget / delay), log(failure budget / failure rate). -inf without RBs (not served);
+        a slice without a rate requirement (min_rate 0) has no rate term"""
+        if not ue.assigned_rb:
+            return -np.inf
+        prof = self.qos_profiles[ue.slice_type]
+        tiny = 1e-300
+        margins = [np.log(prof.max_latency / max(delay_ms, tiny))]
+        if prof.min_rate > 0:
+            margins.append(np.log(max(throughput_bps, tiny) / prof.min_rate))
+        margins.append(np.log((1.0 - prof.min_reliability) / max(ue.failure_rate, tiny)))
+        return float(min(margins))
+
+    def _sla_score(self, margin: float) -> float:
+        """sigmoid(sharpness * margin), written with tanh so that +-inf map to 1 and 0"""
+        return float(0.5 * (1.0 + np.tanh(0.5 * self.sla_sharpness * margin)))
 
     def _calculate_throughput_satisfaction(self, ue) -> Tuple[float, float]:
         """
@@ -2964,6 +3016,11 @@ class NetworkSlicingEnv:
         
         # Overall reliability
         reliability = transmission_success * (1 - drop_rate) * (1 - handover_loss)
+        # The failure rate without the cancellation of 1 - reliability (1e-10 next to 1 keeps few digits)
+        link_fail = per if self.link_adaptation is not None else 1.0 - transmission_success
+        with np.errstate(divide='ignore'):
+            ue.failure_rate = float(-np.expm1(np.log1p(-min(link_fail, 1.0)) + np.log1p(-min(drop_rate, 1.0))
+                                              + np.log1p(-min(handover_loss, 1.0))))
         
         # Normalize
         min_reliability = self.qos_profiles[ue.slice_type].min_reliability

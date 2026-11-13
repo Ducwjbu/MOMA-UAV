@@ -953,8 +953,8 @@ class MOMA_AC_Agent:
             rv = self.eval_omega(env, w, n_episodes, steps, use_gpi=use_gpi)
             results.append(rv)
             self.sweep_sla.append(self.last_sla)
-            print(f"  eval {i+1}/{len(omegas)}: w={np.round(w,2)} "
-                  f"QoS={rv[0]:.3f} Eng={rv[1]:.3f} Fair={rv[2]:.3f}")
+            print(f"  eval {i+1}/{len(omegas)}: w={np.round(w,2)} " +
+                  (f"QoS={rv[0]:.3f} Eng={rv[1]:.3f} Fair={rv[2]:.3f}" if self.n_obj == 3 else f"r={np.round(rv, 3)}"))
         return np.array(results), omegas
 
     # ── Save / Load ──────────────────────────────────────────────

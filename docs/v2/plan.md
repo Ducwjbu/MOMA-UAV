@@ -124,3 +124,46 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
 ## Completion Reports
 
 (Thêm vào đây theo thứ tự TIP.)
+
+### TIP 0. Bộ kiểm v1.1 bit-for-bit (2026-11-13)
+
+- **STATUS:** xong.
+- **FILES CHANGED:** `docs/v2/check_v11.py` (mới).
+- **TEST RESULTS:**
+  - Tham chiếu ghi từ một worktree sạch của commit `ee68411` (v1.1 cộng các sửa tài liệu).
+  - Code hiện tại so với tham chiếu: env 4224 mảng, 0 lệch; train 96 tensor (smoke `ma3_prior` và `gpi_pd`), 0 lệch.
+  - Phần env chạy hai lần trên cùng code: 0 lệch.
+  - Đổi `noise_figure_db` từ 9.0 lên 9.1 trong `ma3.yaml`: script báo lệch từ bước đầu, exit 1. Config đã trả về nguyên trạng.
+- **ISSUES:** tham chiếu phụ thuộc máy (CPU, thư viện), nên nằm trong `runs/` và không commit. Máy khác phải `record` trên code v1.1 trước.
+- **DEVIATIONS:**
+  - Episode lấy seed validation 100000+, như `eval_omega`.
+  - Hành động lấy từ một `RandomState` riêng, để không đụng RNG của env.
+  - Train dùng 1 luồng torch, cho kết quả ổn định.
+- **SUGGESTIONS:** chạy `check` sau mỗi TIP. Mất khoảng 4 phút cả hai phần; chỉ phần env khoảng 45 giây.
+
+### TIP 1. Ngưỡng SLA theo 5QI và mục tiêu theo slice (2026-11-13)
+
+- **STATUS:** xong phần code và kiểm; tốc độ của slice dữ liệu là giá trị tạm.
+- **FILES CHANGED:**
+  - `environment.py`: mục `objectives`, `_sla_margin`, `_sla_score`, `ue.failure_rate` tính chính xác bằng `expm1/log1p`, `objective_names`.
+  - `train_moma_ac.py`: số mục tiêu và tên lấy từ env; `_hv_nd`, `hv_ref_point`.
+  - `agents_moma_ac.py`: chỉ đổi dòng in khi số mục tiêu khác 3.
+  - Mới: `config/environment/v2.yaml`, `config/train/moma_ac_v2_prior.yaml`, `docs/v2/check_tip1.py`, `docs/v2/sources.md`.
+  - `kaggle/build_bundle.py` thêm hai config v2.
+- **TEST RESULTS:**
+  - **Kiểm β lớn:** với β = 1e12, mục tiêu `sla_*` trùng tỉ lệ nhị phân trong `info` ở mọi bước (5 episode validation, 90 bước). Lệch tối đa 1.4e-8, do reward vector lưu float32. Với β = 4: mục tiêu 0.115 / 0.064 / 0.173 so với tỉ lệ nhị phân 0.116 / 0.065 / 0.173 (hành động ngẫu nhiên).
+  - **HV n chiều:** trùng `_hv_3d` từng bit trên 400 front của `results-v1.1` (thêm chiều thứ tư hằng số). Với 3 tập 25 điểm 4 chiều ngẫu nhiên, nằm trong khoảng tin cậy 95% của Monte Carlo (2 triệu mẫu).
+  - **Smoke train v2:** `moma_ac_v2_prior` với smoke settings chạy hết 1500 bước, có eval và checkpoint. CSV có cột theo tên mục tiêu.
+  - **v1.1 không đổi:** `check_v11.py check` cho 0 lệch ở cả env và train.
+- **ISSUES:**
+  - Tốc độ video của lực lượng cứu hộ (2 Mbps) là giá trị tạm lấy từ TS 22.125. Cần một nguồn tốt hơn.
+  - Bảng 5QI đọc từ bản dựng lại TS 23.501 v20.2.0, chưa đối chiếu PDF chính thức.
+  - Tải mới (31 UE dữ liệu × 2 Mbps) nhẹ hơn nhiều so với v1.1. Số UE và tải hiệu chỉnh ở TIP 6.
+  - `eval_checkpoint.py`, `aggregate_seeds.py`, `eval_controller.py`, `plot_results.py` vẫn giả định 3 mục tiêu. Tổng quát hoá ở TIP 8.
+- **DEVIATIONS:**
+  - Slice dữ liệu dùng 5QI 67 (video khẩn cấp, PER 1e-3) thay vì 5QI 70 (PER 1e-6). Lý do: env chỉ mô hình HARQ, PER dư của eMBB là 1e-4, nên 1e-6 không bao giờ đạt (Notion 3.1).
+  - Slice giữ tên nội bộ `embb` / `urllc` / `mmtc`; ý nghĩa theo câu chuyện (b) ghi ở đầu `v2.yaml`.
+  - mMTC giữ nguyên ngưỡng v1.1.
+  - Slice không có tải ở một bước thì mục tiêu bằng 1.
+  - URLLC: biên tin cậy lấy bằng 2 lần truyền (PER dư 1e-10).
+- **SUGGESTIONS:** chọn β bằng một phép thử nhỏ ở TIP 11: β nhỏ cho gradient mượt nhưng xa chỉ số thật; β lớn thì ngược lại.

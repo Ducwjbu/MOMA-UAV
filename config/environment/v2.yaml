@@ -1,0 +1,341 @@
+# ENVIRONMENT CONFIGURATION FOR UAV NETWORK SIMULATION: v2 (thesis), story (b)
+# ----------------------------------------------------
+# ma3.yaml (v1.1) plus the v2 keys of docs/v2/plan.md, each marked "v2 (TIP n)". Story (b): the terrestrial network
+# is down after a disaster and 3 UAVs serve the area for a while. The three slices keep their internal names:
+#   embb  = mission-critical video of the responders (5QI 67)
+#   urllc = road-side units of the traffic system (5QI 84), kept from v1.1
+#   mmtc  = sensors (TR 38.913)
+# Sources in the comments and in docs/v2/sources.md.
+
+# Physical entities parameters
+system:
+    num_uavs: 3   # MOMA-AC CTDE (config/train/moma_ac_ma3.yaml)
+    num_ues: 91  # Arriving/departing UEs: 31 eMBB + 60 mMTC (slicing.slice_probabilities); RSUs come on top
+    service_area: [2000, 2000] # [width, height] in meters
+    uav_fly_range_x: [0, 2000] # [min, max] radius from center in meters
+    uav_fly_range_y: [0, 2000] # [min, max] radius from center in meters
+    uav_fly_range_h: [50, 120] # [min, max] height in meters: 120 m civil limit; 50 m clears dense-urban rooftops (Rayleigh scale 20 m)
+    num_das_per_slice: 3
+    min_uav_separation: 50.0 # meters, enforced in step (no reward penalty); absent or 0 = off
+
+# Time parameters
+time:
+    T_L: 60.0 # Long-term period (seconds)
+    T_S: 0.01 # Short-term period (seconds)
+
+# Channel and propagation parameters
+channel:
+    noise_psd_dbm_hz: -174.0 # Thermal noise density
+    noise_figure_db: 9.0 # UE receiver noise figure (3GPP TR 38.864 Table B-1, FR1); noise per RB = PSD + NF + 10log10(rb_bandwidth)
+    carrier_frequency: 3.5e+9 # Hz (NR band n78, the band that carries 100 MHz at 30 kHz SCS)
+    rb_bandwidth: 360e3 # Hz (12 subcarriers x 30 kHz)
+    total_bandwidth: 98280000.0 # Hz per UAV (273 PRBs, the NR maximum for 100 MHz at 30 kHz SCS)
+    shannon_attenuation: 0.75 # Attenuated Shannon: SE = min(alpha * log2(1 + SINR), se_max)
+    max_spectral_efficiency: 7.4 # bps/Hz (256-QAM, CQI 15 of NR table 2)
+    # Mogensen et al., "LTE Capacity Compared to the Shannon Bound", IEEE VTC2007-Spring, Eq. 3 and Fig. 1: the AWGN
+    # fit pairs 0.75 with SNR_eff 1.25 dB. Fast fading is modelled separately (fast_fading), so the AWGN pair applies
+    snr_efficiency_db: 1.25
+    # TS 38.214 Table 5.2.2.1-3 (CQI table 2): CQI 1 = 0.1523 bit/s/Hz. Below it the rate is 0; with the line above
+    # that is an SINR of -7.0 dB
+    min_spectral_efficiency: 0.1523
+    # Link adaptation per slice. TS 38.214 Sec. 5.2.2.1: the CQI is the highest MCS whose transport block error
+    # probability is <= 0.1 (CQI tables 1-2) or <= 1e-5 (table 3). eMBB and mMTC: table 2 with HARQ, up to
+    # max_transmissions (assumed 4); URLLC: table 3 (Table 5.2.2.1-4: 0.0586-4.5234 bit/s/Hz), one shot, rate scaled by
+    # the finite-blocklength normal approximation (Polyanskiy, Poor & Verdu 2010) for its packet.
+    # harq_rtt_ms: assumed 8 ms (the LTE FDD HARQ round trip), conservative for NR at 30 kHz
+    link_adaptation:
+        harq_rtt_ms: 8.0
+        embb:
+            bler_target: 0.1
+            max_transmissions: 4
+        mmtc:
+            bler_target: 0.1
+            max_transmissions: 4
+        urllc:
+            bler_target: 0.00001
+            # v2 (TIP 1): 2 transmissions (the HARQ round trip, 8 ms, fits twice in the 25 ms budget), residual 1e-10.
+            # v1.1 used 1, whose residual 1e-5 equals the reliability target, so any drop or handover loss broke the
+            # SLA (report/05_han_che.md item 11). The budget left for drops and handovers is 1e-5 - 1e-10
+            max_transmissions: 2
+            min_spectral_efficiency: 0.0586
+            max_spectral_efficiency: 4.5234
+    # Log-normal shadowing, dB, by link state: 3GPP TR 38.901 Table 7.4.1-1 (UMa: LoS 4, NLoS 6) and Table 7.4.3-3
+    # (O2I < 6 GHz: 7). Exponentially correlated over the distance the UE and UAV move (TR 38.901 7.4.4, ITU-R
+    # P.1816), decorrelation distances of Table 7.5-6 (UMa). Measured A2G at 2.85 GHz, UAV at 150 m (Ao et al.,
+    # arXiv:2607.00541, Table IV): 4.54 / 5.43 dB. Used with the city section; without it, TR 36.777 UMa-AV
+    shadowing:
+        sigma_los: 4.0
+        sigma_nlos: 6.0
+        sigma_o2i: 7.0
+        decorrelation_los: 37.0 # m
+        decorrelation_nlos: 50.0 # m
+        decorrelation_o2i: 7.0 # m
+        sigma_los_scale: 4.64 # TR 36.777 Table B-3, only without the city section
+        sigma_los_decay: 0.0066 # 1/m
+    # Outdoor-to-indoor loss for UEs inside a footprint: TR 38.901 Table 7.4.3-3, the model for single-frequency
+    # simulations below 6 GHz: wall 20 dB, 0.5 dB per m of d_2D-in ~ U(0, 25 m), no extra spread
+    o2i:
+        wall_loss_db: 20.0
+        indoor_loss_per_m: 0.5
+        max_indoor_distance: 25.0 # m
+    # Fast fading, averaged over each step: Rician on outdoor LoS links with K ~ N(9, 3.5) dB (TR 38.901 Table
+    # 7.5-6 UMa LoS; measured A2G 9.16 +- 5.55 dB at 2.85 GHz, Ao et al. Table IV), Rayleigh otherwise (K N/A)
+    fast_fading:
+        k_factor_mean_db: 9.0
+        k_factor_std_db: 3.5
+
+# Quality of Service profiles for network slices
+# v2 (TIP 1): thresholds from the standardized 5QI table, 3GPP TS 23.501 Table 5.7.4-1. The env measures radio and
+# queue delay only, so the delay budget is the Packet Delay Budget minus the core-network share given in the notes
+# of that table. Reliability is 1 - Packet Error Rate
+qos_profiles:
+    embb: # Mission-critical video (5QI 67: GBR, PDB 100 ms, PER 1e-3; core share 10 ms, note 13 of the table)
+        min_rate: 2e6 # bps, PLACEHOLDER: TS 22.125 Table 7.2-2 (480p video for UAV control); a responder-video source
+                      # is still missing (docs/v2/sources.md)
+        max_latency: 90.0 # ms
+        min_reliability: 0.999
+    urllc: # Road-side units of an ITS, TS 22.261 Table 7.2.3.2-1 (10 Mbps); 5QI 84 (PDB 30 ms, PER 1e-5, core 5 ms)
+        min_rate: 10e6
+        max_latency: 25.0 # ms
+        min_reliability: 0.99999
+    mmtc: # Massive Machine-Type Communications (slice_type: 3)
+        min_rate: 0.0 # no rate requirement: the throughput term is whether the device is served
+        max_latency: 10000.0 # ms, TR 38.913 Sec. 7.6 (infrequent small packets: 10 s uplink)
+        min_reliability: 0.95 # kept from v0 (design)
+
+# Network slice parameters. URLLC users are the fixed RSUs of the rsu section, so arriving UEs are eMBB or mMTC.
+# The QoS objective averages within each slice and then weights the slices, so counts set load, not priority
+slicing:
+    slice_probabilities:
+        embb: 0.341 # 31 eMBB UEs: with the 260 Mbps of the RSUs, mean offered load = fleet capacity
+        urllc: 0.0 # (566 Mbps, 3 UAVs hovering at full power, all RBs to a mean covered UE). Sensitivity: eMBB x0.5, x1.5; rsu.spacing 2000
+        mmtc: 0.659 # 60 mMTC: 20 per UAV, enough points to measure coverage (design)
+    slice_weights: # equal: no operator priority assumed (policy, see Bellone et al.; Hossain & Ansari)
+        embb: 1.0
+        urllc: 1.0
+        mmtc: 1.0
+
+qos_weights:
+    embb:
+        throughput: 0.7
+        delay: 0.2
+        reliability: 0.1
+    urllc:
+        throughput: 0.1
+        delay: 0.5      # CRITICAL
+        reliability: 0.4  # CRITICAL
+    mmtc:
+        throughput: 0.2
+        delay: 0.1
+        reliability: 0.7
+
+# UAV constraints and capabilities
+uav_params:
+    max_power: 6.3 # Watts (38 dBm, Medium Range BS of 3GPP TS 38.104; EARTH micro BS), shared across the allocated RBs
+    battery_capacity: 1972800.0 # Joules (548 Wh: two DJI TB60 of the Matrice 300 RTK, about 22 min at hover + radio)
+    velocity_max: 17.0 # m/s maximum horizontal speed (DJI Matrice 300 RTK, P-mode)
+    velocity_max_vertical: 5.0 # m/s maximum climb rate (DJI Matrice 300 RTK, P-mode)
+    velocity_max_descent: 4.0 # m/s maximum descent rate (same)
+    initial_power: 3.15 # Watts, half of max_power until the first action
+    initial_battery: 1972800.0 # Initial battery level
+    beam_angle: 60.0 # degrees, only used without the antenna section
+    # Antenna element of 3GPP TR 38.901 Table 7.3-1, pointing down: G = 8 - min(12 (theta/65)^2, 30) dBi.
+    # A UE joins the UAV with the strongest reference signal if its SNR per RB reaches the minimum
+    antenna:
+        max_gain_dbi: 8.0
+        beamwidth_3db: 65.0 # degrees
+        max_attenuation_db: 30.0
+        min_association_snr_db: -7.0 # reference SNR where the rate model reaches CQI 1 (channel section)
+        handover_hysteresis_db: 3.0 # event A3 (TS 38.331) hysteresis, assumed: operators set it
+    buffer_size: 1000000  # bits
+    processing_delay_ms: 1.0 # gNB + UE processing per packet
+
+# User Equipment dynamics
+ue_dynamics:
+    arrival_rate: 0.3033 # New UEs per second: num_ues / session_duration_avg keeps the population near num_ues
+    max_ues_multiplier: 1.5 # max_ues = num_ues * multiplier
+    session_duration_avg: 300 # Average session duration in seconds (sets the per-step departure probability)
+    max_initial_velocity: 2.0 # m/s
+    patterns:
+        walk:
+            speed: 0.1 # m/s
+            probability: 0.5
+        vehicle:
+            speed: 1.0 # m/s
+            probability: 0.3
+        stationary:
+            speed: 0.0 # m/s
+            probability: 0.2
+    # With the city section: outdoor UEs walk along the streets, indoor UEs are stationary
+    pedestrian_speed: 0.833 # m/s, 3 km/h, TR 38.901 Table 7.2-1 (UMa)
+    ue_height: 1.5 # m, TR 38.901 Table 7.4.1-1 default h_UT
+    change_direction_prob: 0.3 # Probability of changing direction per large time-scale step
+
+# Traffic per slice, as the mean over each 60 s step:
+# eMBB: TS 22.261 Table 7.1-1 (urban macro): 50 Mbps experienced rate, activity factor 20 %
+# URLLC: TS 22.261 Table 7.2.3.2-1: 10 Mbps, payload small (<= 256 B) to big; 256 B chosen
+# mMTC: TR 45.820 Annex E (MAR periodic reports): payload Pareto(2.5, 20 B) capped at 200 B, report every 1 day /
+# 2 h / 1 h / 30 min with probability 40 / 40 / 15 / 5 %; TR 38.812 A.3.2: 29 B higher-layer overhead
+traffic_patterns:
+    embb:
+        packet_size: 1500 # bytes
+        peak_rate: 2e6 # v2 (TIP 1): the video rate of qos_profiles.embb, streamed all the time (PLACEHOLDER;
+        activity_factor: 1.0 # the UE count and the load are calibrated in TIP 6)
+    urllc:
+        packet_size: 256 # TS 22.261 allows small (<= 256 B) to big; small chosen
+        rate: 10e6 # Note 4 of the table: every application needs the experienced rate
+    mmtc:
+        payload_min: 20.0
+        payload_cap: 200.0
+        pareto_shape: 2.5
+        overhead: 29.0
+        report_intervals_s: [86400.0, 7200.0, 3600.0, 1800.0]
+        report_interval_probs: [0.4, 0.4, 0.15, 0.05]
+
+# Road-side infrastructure (URLLC): TS 22.261 Sec. 7.2.3.2: "deployed alongside streets ... every 1-2 km", on the
+# TR 36.885 urban road grid (Annex A.1.2: 433 m x 250 m blocks), antenna 5 m (A.1.4), snapped to the city's street
+# crossings. spacing 1000 m is the dense end (base); 2000 m the low-load scenario
+rsu:
+    block_size: [433.0, 250.0] # m
+    spacing: 1000.0 # m along the streets
+    antenna_height: 5.0 # m
+
+# Spatial traffic density (traffic_map.py), replacing the hotspots: Lee, Zhou, Zhong, Niu, Zhou, Zhang, "Spatial
+# Modeling of the Traffic Density in Cellular Networks", IEEE Wireless Commun. 21(1):80-88, 2014. Eq. 1-2: a
+# log-normal map from a sum of L = 10 sinusoids; Table 1, urban DL (measured in a city of over 8 million): sigma
+# 2.3991, coherence distance 71.4 m, omega_max 0.011592 rad/m; 10 m pixels (3/300 km, p. 82); a map off the
+# coherence distance by more than 30 m is redrawn (p. 85). mu (18.93) only scales the density and is left out: the
+# load calibration of the slicing section stands. Drawn at every reset and held for the episode. Only eMBB follows
+# the map, since the measured density is human data use (p. 87); mMTC sensors stay uniform
+traffic_map:
+    sigma: 2.3991
+    omega_max: 0.011592 # rad/m
+    n_sinusoids: 10
+    pixel: 10.0 # m
+    coherence_distance: 71.4 # m
+    coherence_tolerance: 30.0 # m
+    max_redraws: 50
+    slices: [embb]
+
+# Distance-based classification thresholds (used for DA formation)
+da_distance_thresholds:
+    near_max: 300.0 # meters - "Near" SINR level externally
+    medium_max: 600.0 # meters - "Medium" SINR level externally
+        # > 600m is "Far" SINR level externally
+
+# SINR thresholds for quality assessment
+sinr_thresholds:
+    low_max: 10.0 # dB
+    medium_max:
+        20.0 # dB
+        # > 20 dB is high quality
+
+# Environment behavior settings
+behavior:
+    print_stats: true # Print initialization statistics
+    boundary_handling: "bounce" # How UEs handle boundaries: "bounce", "wrap", "stop"
+    periodic_cleanup: true # Remove inactive UEs periodically
+
+# Fairness: Jain's index over active UEs with x_i = min(throughput / offered load, 1), the "fraction of
+# demand" metric of Jain, Chiu & Hawe 1984 (Sec. 5). Absent means throughput / slice min_rate, uncapped
+fairness_metric: fraction_of_demand
+
+# Per-UE QoS is the worst of its KPI satisfactions (rate, delay, reliability in orders of magnitude of the failure
+# rate): 1 exactly when the SLA is met, without per-KPI weights. Bellone et al. (IEEE DCOSS-IoT 2023) optimise the
+# SLA-satisfaction ratio; info reports that ratio per slice (sla_embb, sla_urllc, sla_mmtc). qos_weights are unused
+qos_aggregation: min
+
+# Reward function weights
+reward_weights:
+    qos: 2.0 # QoS satisfaction weight
+    energy: 0.8 # Energy efficiency weight
+    fairness: 0.5 # Fairness weight
+
+# Energy consumption models
+energy_models:
+    # Rotary-wing propulsion power (Zeng, Xu & Zhang 2019, Eq. 6), Table I of arXiv:1804.02238:
+    # W = 100 N, R = 0.5 m, Omega = 400 rad/s, delta = 0.012, k = 0.1. P0 and Pi follow from Eq. 61
+    blade_profile_power: 580.65 # W, P0
+    induced_power: 790.67 # W, Pi
+    rotor_tip_speed: 200.0 # m/s
+    mean_induced_velocity: 7.2 # m/s, hover
+    fuselage_drag_ratio: 0.3
+    air_density: 1.225 # kg/m^3
+    rotor_solidity: 0.05
+    rotor_disc_area: 0.79 # m^2
+    uav_weight: 100.0 # N, sets the climb power W * v_z
+    # Radio: EARTH D2.3 micro BS (Eq. 4-3, Table 8), N_TRX = 2, P0 = 56 W, dp = 2.6, load shared by the TRXs
+    radio_static_power: 112.0 # W, N_TRX * P0
+    radio_power_slope: 2.6 # dp
+
+# Air to ground channel model: Al-Hourani et al. 2014, dense urban (alpha 0.5, beta 300, gamma 20).
+# a and b from the polynomials of Tables I-II, eta from Section III (measured at 2 GHz)
+a2g:
+    a: 12.08
+    b: 0.11
+    eta_los: 1.6 # dB
+    eta_nlos: 23.0 # dB
+
+# Wireless backhaul: each UAV has its own band to one ground gateway, out of band with the access links.
+# mmWave of Galkin, Kibilda & DaSilva (arXiv:1710.10807, Table I). One gateway, not their network of them
+backhaul:
+    model: mmwave
+    gateway_position: [1000.0, 0.0, 30.0] # meters, x y h: edge of the service area, GS height 30 m
+    bandwidth: 1000000000.0 # Hz per UAV
+    tx_power: 10.0 # Watts (not added to the energy objective)
+    antenna_gain_db: 64.2 # dB: UAV 16 pi / omega^2 at omega = 10 deg (32.2) plus ground station (32)
+    path_loss_constant_db: 69.7 # c at 73 GHz
+    path_loss_exponent_los: 2.0
+    path_loss_exponent_nlos: 3.5
+    noise_power: 4.0e-11 # Watts over the band
+    buildings_per_km2: 300.0 # beta
+    built_up_ratio: 0.5 # delta
+    building_height_scale: 20.0 # m, kappa (Rayleigh)
+
+# Low Battery RTH as the DJI M300 RTK does it (User Manual v1.8, 2021.03, p. 22): "The thresholds for these warnings
+# are automatically determined based on the aircraft's current altitude and distance from the Home Point", the point
+# it took off from. An episode ends when a UAV's battery falls to the energy for flying back there: level flight at
+# velocity_max in the episode's wind (airspeed-limited), then the descent at velocity_max_descent, radio off. The
+# flight out from the Home Point to the starting position is charged at reset. Home Point: the gateway's ground station
+return_home:
+    position: [1000.0, 0.0] # m, x y on the ground (backhaul.gateway_position)
+
+# Explicit city of ITU-R P.1410-6 (Sec. 2.1.4-2.1.5), the parameters of the a2g section (dense urban): grid pitch
+# 1000/sqrt(beta) = 57.7 m, footprint 1000 sqrt(alpha/beta) = 40.8 m, streets 16.9 m, Rayleigh heights (mode
+# gamma). Regenerated each episode. LoS of access and backhaul links is geometric; UAVs keep roof_clearance
+# (assumed) above the roof under them
+city:
+    built_up_ratio: 0.5 # alpha
+    buildings_per_km2: 300.0 # beta
+    height_scale: 20.0 # m, gamma
+    roof_clearance: 10.0 # m, assumed
+
+# Horizontal wind, drawn once per episode (Dai et al., arXiv:2304.06909, Eq. 1-3): speed at reference_height from
+# Weibull(scale, shape), times (h / reference_height)^exponent (city range 0.4-0.6; Dai uses 0.5 and 50 m).
+# Hanoi: Global Wind Atlas (globalwindatlas.info), Tay Ho district, whole-area mean at 50 m: 4.35 m/s and
+# 85 W/m^2, giving shape ~2.2 and scale ~4.9 m/s from the energy pattern factor (rho 1.18-1.225). Check: 4.35 m/s
+# brought down to 10 m with exponent 0.5 is 1.95 m/s, the 1.9 m/s annual mean measured at Lang station.
+# Direction: the annual wind rose of Lang station (Hanoi), 1957-2000, 16 sectors the wind blows FROM, N first,
+# clockwise; occurrence % without calms (19.5 %), JICA Study Team, Appendix 14 Table A14.2.2.
+# max_speed is the DJI M300 RTK's wind resistance: the UAV stays below the height where the wind reaches it,
+# and an episode whose wind exceeds it even at the lowest altitude is redrawn. Airspeed is capped at velocity_max
+wind:
+    weibull_scale: 4.9 # m/s at reference_height
+    weibull_shape: 2.2
+    reference_height: 50.0 # m
+    exponent: 0.5
+    direction_frequencies: [5.88, 4.65, 11.76, 2.16, 6.73, 6.17, 21.92, 3.86, 3.75, 0.68, 1.74, 0.32, 2.45, 1.55, 5.22, 1.64]
+    max_speed: 12.0 # m/s
+    # Rotor (blade-profile and induced) power at the airspeed: aerodynamics depend on the air-relative velocity
+    # (wind-tunnel tests hold the vehicle still in the flow, Russell et al., AHS Forum 2016). Dai et al. Eq. 8 uses
+    # the ground speed ('ground'), so that hovering in wind costs almost nothing extra
+    rotor_speed: air
+
+# v2 (TIP 1): the reward vector, by name (environment.py, objectives). sla_<slice> is a smooth stand-in for the
+# share of the slice's UEs meeting their SLA: each UE scores sigmoid(sla_sharpness * m), m its smallest KPI margin in
+# natural log units (0 at a threshold); the binary share stays in info (sla_embb, ...). Fairness is reported only
+# (info fairness_level). sla_sharpness 4: a UE at 80% of its rate scores 0.29, at 120% 0.67 (design)
+objectives:
+    names: [sla_embb, sla_urllc, sla_mmtc, energy]
+    sla_sharpness: 4.0
+    sla_tolerance: 1.0e-9 # relative tolerance of the binary SLA test

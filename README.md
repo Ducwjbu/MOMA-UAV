@@ -27,6 +27,8 @@ Sau `v1.0` môi trường đổi hai lần, tạo thành `v1.1` (git tag `v1.1`)
 
 Muốn sửa môi trường thì bàn trước với cả nhóm. Nếu sửa, tạo tag mới (`v1.1`, ...) và chạy lại toàn bộ.
 
+**Môi trường v2 (khoá luận, đang xây):** `config/environment/v2.yaml`, kế hoạch trong `docs/v2/plan.md`. Mỗi tính năng v2 là một khoá config, không có khoá thì code chạy đúng như `v1.1`. Sau mỗi thay đổi code, chạy `py docs/v2/check_v11.py check` để chắc `ma3.yaml` và `default.yaml` vẫn cho kết quả giống `v1.1` từng bit (lần đầu chạy `record` trên code `v1.1` để có tham chiếu; tham chiếu nằm trong `runs/`, không commit).
+
 ## Cài đặt
 
 Cần Python 3.10 trở lên (đã thử với 3.12). GPU NVIDIA không bắt buộc nhưng nhanh hơn nhiều.

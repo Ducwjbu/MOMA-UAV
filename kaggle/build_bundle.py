@@ -17,6 +17,7 @@ FILES = [
     "config/environment/default.yaml",
     "config/environment/ma3.yaml",
     "config/environment/ma3_fleet.yaml",
+    "config/environment/v2.yaml",
     "config/train/moma_ac_random.yaml",
     "config/train/moma_ac_ols.yaml",
     "config/train/moma_ac_gpi_ls.yaml",
@@ -28,6 +29,7 @@ FILES = [
     "config/train/moma_ac_ma3_prior_pa.yaml",
     "config/train/moma_ac_ma3_prior_att.yaml",
     "config/train/moma_ac_ma3_prior_att_fleet.yaml",
+    "config/train/moma_ac_v2_prior.yaml",
     "kaggle/run_kaggle.py",
 ]
 

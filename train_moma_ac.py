@@ -88,6 +88,38 @@ def _hv_3d(points: np.ndarray, ref: np.ndarray) -> float:
     return max(0.0, hv)
 
 
+def _hv_nd(points: np.ndarray, ref: np.ndarray) -> float:
+    """Exact hypervolume in any dimension (maximization): the sweep of _hv_3d on the last objective, recursing down
+    to _hv_3d. Fine for the tens of points of an eval sweep (cost grows as n_points^(d-1))"""
+    pts = np.asarray(points, dtype=float)
+    d = pts.shape[1] if pts.ndim == 2 else len(ref)
+    if d == 2:
+        return _hv_2d(pts, ref) if len(pts) else 0.0
+    if d == 3:
+        return _hv_3d(pts, ref)
+    if len(pts) == 0:
+        return 0.0
+    pts = pts[np.all(pts > ref, axis=1)]
+    if len(pts) == 0:
+        return 0.0
+    pts = _pareto_filter(pts)
+    pts = pts[np.argsort(-pts[:, -1])]
+    hv = 0.0
+    for i in range(len(pts)):
+        lo = pts[i + 1, -1] if i + 1 < len(pts) else ref[-1]
+        width = pts[i, -1] - lo
+        if width > 0:
+            hv += width * _hv_nd(pts[:i + 1, :-1], ref[:-1])
+    return max(0.0, hv)
+
+
+def hv_ref_point(names) -> np.ndarray:
+    """HV reference point for the named objectives: -1.1 for energy (in [-1, 0]), -0.1 for the others (in [0, 1])"""
+    return np.array([-1.1 if n == "energy" else -0.1 for n in names])
+
+
+V11_OBJECTIVES = ["qos", "energy", "fair"]
+
 
 def _get(cfg_obj, key: str, default):
     """Safe config getter supporting dotted keys."""
@@ -192,6 +224,10 @@ class MOMA_AC_Trainer:
         self.uav_id = self.uav_ids[0]
         self.multi_uav = len(self.uav_ids) > 1
         self.obs_dim = len(obs_dict[self.uav_id])
+        # Objectives of the env's reward vector; the v1.1 vector keeps the v1.1 CSV columns and the 3D HV
+        self.obj_names = list(getattr(self.env, "objective_names", V11_OBJECTIVES))
+        self.legacy_objectives = self.obj_names == V11_OBJECTIVES
+        self.hv_ref = HV_REF_POINT if self.legacy_objectives else hv_ref_point(self.obj_names)
 
         # Infer act_dim from env config
         n_das_per_slice = int(_get(ecfg, "system.num_das_per_slice", 3))
@@ -207,7 +243,7 @@ class MOMA_AC_Trainer:
         self.agent = agent_cls(
             obs_dim   = self.obs_dim,
             act_dim   = self.act_dim,
-            n_objectives = 3,
+            n_objectives = len(self.obj_names),
             **agent_args,
             actor_lr  = self.cfg["actor_lr"],
             critic_lr = self.cfg["critic_lr"],
@@ -365,9 +401,7 @@ class MOMA_AC_Trainer:
                 elapsed = time.time() - t0
                 self.step_log.append({
                     "step":    step,
-                    "qos":     float(last_ep_val[0]),
-                    "energy":  float(last_ep_val[1]),
-                    "fair":    float(last_ep_val[2]),
+                    **{n: float(v) for n, v in zip(self.obj_names, last_ep_val)},
                     "noise":   self.agent.expl_noise,
                     "elapsed": elapsed,
                 })
@@ -376,9 +410,9 @@ class MOMA_AC_Trainer:
                 if self.guide is not None:
                     self.step_log[-1]["guide_prob"] = self.guide_p
                 pbar.set_postfix({
-                    "QoS":  f"{last_ep_val[0]:.3f}",
-                    "Eng":  f"{last_ep_val[1]:.3f}",
-                    "Fair": f"{last_ep_val[2]:.3f}",
+                    **({"QoS": f"{last_ep_val[0]:.3f}", "Eng": f"{last_ep_val[1]:.3f}",
+                        "Fair": f"{last_ep_val[2]:.3f}"} if self.legacy_objectives else
+                       {n: f"{v:.3f}" for n, v in zip(self.obj_names, last_ep_val)}),
                     "w":    str(np.round(omega, 2)),
                     "eps":  f"{self.agent.expl_noise:.3f}",
                 })
@@ -492,8 +526,13 @@ class MOMA_AC_Trainer:
         }
         sla = np.array(self.agent.sweep_sla)   # (n_omega, 3): share of UEs meeting their full SLA
         # Mean over the sweep, like avg_qos, and at the QoS corner (omega index 0)
-        metrics.update({f"avg_{k}": float(v) for k, v in zip(SLA_KEYS, nan_mean(sla))})
-        metrics.update({f"wqos_{k}": float(v) for k, v in zip(SLA_KEYS, sla[0])})
+        if self.legacy_objectives:
+            metrics.update({f"avg_{k}": float(v) for k, v in zip(SLA_KEYS, nan_mean(sla))})
+            metrics.update({f"wqos_{k}": float(v) for k, v in zip(SLA_KEYS, sla[0])})
+        else:   # The binary shares, beside the sla_* objectives; corner<j> is omega e_j
+            metrics.update({f"avg_{k}_share": float(v) for k, v in zip(SLA_KEYS, nan_mean(sla))})
+            for j, n in enumerate(self.obj_names):
+                metrics.update({f"at_{n}_{k}_share": float(v) for k, v in zip(SLA_KEYS, sla[j])})
         return metrics, results, omegas, sla
 
     def _eval_and_log(self, step: int):
@@ -501,15 +540,20 @@ class MOMA_AC_Trainer:
         # a like-for-like comparison with the random baseline
         use_gpi = self.agent.use_gpi
         metrics, results, omegas, sla = self._sweep_metrics(use_gpi)
-        row = {
-            "step":     step,
-            **metrics,
-            "avg_qos":  float(results[:, 0].mean()),
-            "avg_eng":  float(results[:, 1].mean()),
-            "avg_fair": float(results[:, 2].mean()),
-            "best_qos": float(results[:, 0].max()),
-            "best_fair":float(results[:, 2].max()),
-        }
+        if self.legacy_objectives:
+            row = {
+                "step":     step,
+                **metrics,
+                "avg_qos":  float(results[:, 0].mean()),
+                "avg_eng":  float(results[:, 1].mean()),
+                "avg_fair": float(results[:, 2].mean()),
+                "best_qos": float(results[:, 0].max()),
+                "best_fair":float(results[:, 2].max()),
+            }
+        else:
+            row = {"step": step, **metrics,
+                   **{f"avg_{n}": float(results[:, j].mean()) for j, n in enumerate(self.obj_names)},
+                   **{f"best_{n}": float(results[:, j].max()) for j, n in enumerate(self.obj_names)}}
         if self.agent.support is not None:
             row["support_size"] = len(self.agent.support.weights)
         if self.multi_uav:
@@ -521,8 +565,9 @@ class MOMA_AC_Trainer:
         self._log_pareto(step, "gpi" if use_gpi else "actor", results, omegas, sla)
         self.eval_log.append(row)
         self._save_eval_csv()
-        print(f"  HV={metrics['hv']:.4f}  EUM={metrics['eum']:.4f}  n_pareto={metrics['n_pareto']}  "
-              f"best_QoS={results[:,0].max():.3f}  best_Fair={results[:,2].max():.3f}")
+        best = (f"best_QoS={results[:,0].max():.3f}  best_Fair={results[:,2].max():.3f}" if self.legacy_objectives
+                else "  ".join(f"best_{n}={results[:, j].max():.3f}" for j, n in enumerate(self.obj_names)))
+        print(f"  HV={metrics['hv']:.4f}  EUM={metrics['eum']:.4f}  n_pareto={metrics['n_pareto']}  {best}")
 
     def _log_pareto(self, step: int, policy: str, results: np.ndarray, omegas: np.ndarray, sla: np.ndarray):
         """Keep each evaluated point, so the front can be analyzed without rerunning."""
@@ -530,16 +575,17 @@ class MOMA_AC_Trainer:
             self.pareto_log.append({
                 "step":   step,
                 "policy": policy,
-                "w_qos":  float(w[0]), "w_energy": float(w[1]), "w_fair": float(w[2]),
-                "qos":    float(rv[0]), "energy":  float(rv[1]), "fair":  float(rv[2]),
-                **{k: float(v) for k, v in zip(SLA_KEYS, sl)},
+                **{f"w_{n}": float(x) for n, x in zip(self.obj_names, w)},
+                **{n: float(x) for n, x in zip(self.obj_names, rv)},
+                # In v2 the binary SLA shares are reported next to the sla_* objectives (their smooth stand-ins)
+                **{(k if self.legacy_objectives else f"{k}_share"): float(v) for k, v in zip(SLA_KEYS, sl)},
             })
         pd.DataFrame(self.pareto_log).to_csv(
             os.path.join(self.model_dir, "pareto_points.csv"), index=False)
 
     def _compute_hv(self, pts: np.ndarray) -> float:
-        """Exact 3D HV via sweep-line, fixed ref point."""
-        return _hv_3d(pts, HV_REF_POINT)
+        """Exact HV, fixed ref point (3D sweep for the v1.1 objectives, the n-dimensional sweep otherwise)"""
+        return _hv_3d(pts, HV_REF_POINT) if self.legacy_objectives else _hv_nd(pts, self.hv_ref)
 
     def _count_pareto(self, pts: np.ndarray) -> int:
         """Count non-dominated points (3D strict Pareto)."""
