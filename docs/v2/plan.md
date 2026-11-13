@@ -145,6 +145,11 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
 - **Task:** config train v2, chạy pilot 300k trên Kaggle (bạn chạy): `ma3_prior` v2 (MLP) và attention v2.
 - **Đạt khi:** đường cong học tăng, SLA từng slice và năng lượng có đánh đổi thật (kiểm như phép thử đánh đổi giữa slice).
 - **Thí nghiệm tổng quát theo N (sau pilot, train 2–10):** đánh giá ở N = 2, 4, 6, 8, 10 (trong dải) và 11, 12 (ngoài dải). Tiêu chí "vẫn tốt" chốt trước khi chạy: ở mỗi N ngoài dải, HV của policy attention lớn hơn HV của baseline không train (UAV đứng yên ở vị trí k-means, cùng N, cùng episode), cận dưới CI của hiệu theo cặp > 0. Đạt cả 11 và 12 thì test thêm 13–15, không đạt thì dừng ở 12 và báo cáo đúng như vậy. Mạng MLP chỉ chạy được tới 10 (số khe cố định).
+- **Độ nhạy theo tải (đánh giá cuối):** đánh giá policy đã train ở ba mức tải eMBB, không train lại:
+  - **thấp:** tải PPDR của ECC Report 199, khoảng 10–15 Mbps cho 2 sự cố, tức trung bình khoảng 0.2 luồng mỗi UE;
+  - **danh nghĩa:** 2.4 (TIP 6);
+  - **cao:** 1.5 × danh nghĩa.
+  Kết luận chỉ đứng được nếu phương pháp hơn baseline ở cả ba mức.
 - **Chi phí đã đo** (v2, hành động ngẫu nhiên): một bước env 14.5 ms ở N = 2, 15.9 ms ở N = 3, 22.1 ms ở N = 6, 29.7 ms ở N = 10. Replay buffer của MLP 10 khe khoảng 5–6 GB mỗi run (3 UAV: khoảng 1 GB). Run dài cần `--resume` trên Kaggle.
 
 ---
