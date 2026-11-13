@@ -56,3 +56,11 @@ Cách tính SLA mỗi UE (v2): biên nhỏ nhất theo log tự nhiên, `m = min
 | `blade_profile_power`, `rotor_tip_speed` | 444.30 W, 175.6 m/s | Hiệu chỉnh: treo hết pin 548 Wh trong 31 phút ở 9 kg (Heliguy, "DJI M300 RTK v DJI M200 Series"; bảng của Coptrz). Tốc độ đầu cánh suy từ P0 theo Eq. 61 | P0 + Pi = 1060.65 W. Coi 31 phút là thời gian treo | Nguồn bên thứ ba, không phải trang DJI. DJI ghi 55 phút không tải, 43 phút với H20T; ba mốc không khớp cùng lúc với mô hình treo của Zeng, nên chỉ khớp ở 9 kg |
 
 Kết quả: treo cộng radio tối đa 1189 W, hết pin trong 27.7 phút (Table I của Zeng: 1500 W, 21.9 phút). Bay ngang 17 m/s: 725 W; công suất nhỏ nhất ở khoảng 19 m/s, trên giới hạn tốc độ. v1.1 (`ma3.yaml`) giữ Table I.
+
+## TIP 7. Prior theo nhu cầu
+
+| Tham số | Giá trị | Nguồn | Phần dùng | Trạng thái |
+|---|---|---|---|---|
+| `prior_mode` | `demand` | Thiết kế | Đỉnh của prior = k-means có trọng số của nhu cầu dự kiến trong episode, k = số vị trí đang phục vụ | — |
+| Thuật toán | Lloyd có trọng số, khởi tạo k-means++ có trọng số, tốt nhất trong 8 lần | D. Arthur, S. Vassilvitskii, "k-means++: The Advantages of Careful Seeding", Proc. ACM-SIAM SODA 2007, pp. 1027–1035 | Khởi tạo D² | — |
+| Trọng số nhu cầu | Mỗi slice có khối lượng bằng `slice_weights` | Thiết kế, theo cách tính mục tiêu | QoS và SLA lấy trung bình trong slice rồi qua các slice, nên mỗi slice nặng như nhau, không theo số UE. eMBB rải theo bản đồ mật độ của episode (Lee et al. 2014, `traffic_map`), mMTC đều trên vùng, RSU ở đúng vị trí; ô 40 m | — |

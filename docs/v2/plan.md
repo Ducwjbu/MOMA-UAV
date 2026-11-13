@@ -294,3 +294,32 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
   - Không trừ thêm hệ số dung lượng thực tế: các ngưỡng đã giữ năng lượng cho chặng về, và gió được mô phỏng riêng.
   - Công suất vượt dự báo chỉ làm người thay tới muộn, vì UAV cũ vẫn về ở ngưỡng an toàn, nên vị trí trống một lúc. Ở bộ kiểm (công suất không đổi) điều này không xảy ra.
 - **DEVIATIONS:** khối lượng trạm phát chưa có nguồn; giả định dùng hết tải 2.7 kg.
+
+### TIP 7. Prior theo nhu cầu (2026-11-14)
+
+- **STATUS:** xong.
+- **FILES CHANGED:**
+  - `prior.py`: `demand_points`, `weighted_kmeans`, `demand_vertices`; `assign_vertices` và `attach` nhận `mode` (`ngon` | `demand`); `env.prior_targets`.
+  - `train_moma_ac.py`: khoá train `prior_mode` (mặc định `ngon`).
+  - `config/train/moma_ac_v2_prior.yaml`: `prior_mode: demand`.
+  - Mới: `docs/v2/check_tip7.py`.
+- **TEST RESULTS:**
+  - **`check_tip7.py`** (prior không có phần dư, công suất 1, chia slice đều, 3 ca validation × 60 bước, từ bước 6). PASS theo tiêu chí đặt trước: coverage trung bình theo S 0.625 với demand, 0.572 với ngon; SLA trung bình 0.491 / 0.451.
+
+    | S | Coverage ngon → demand | SLA trung bình ngon → demand |
+    |---|---|---|
+    | 2 | 0.376 → 0.414 | 0.178 → 0.209 |
+    | 3 | 0.517 → 0.528 | 0.370 → 0.307 |
+    | 6 | 0.662 → 0.746 | 0.573 → 0.655 |
+    | 10 | 0.732 → 0.814 | 0.685 → 0.792 |
+
+  - **Thời gian k-means:** 0.06 s (S = 2) đến 0.33 s (S = 10), tính lúc reset và khi số vị trí đang phục vụ đổi.
+  - **v1.1 không đổi** (`check_v11.py`). Smoke train v2 với `prior_mode: demand` chạy hết.
+- **ISSUES:**
+  - Ở S = 3, k-means phủ hơn nhưng SLA URLLC thấp hơn tam giác (0.179 so với 0.380). Coverage dùng khoảng cách bình phương làm đại diện, không theo SINR, và RSU nằm trên lưới đường: tam giác r = 600 m tình cờ hợp với lưới RSU. Policy học phần dư có thể sửa chỗ này; nếu không, có thể thay khoảng cách bằng suy hao theo mô hình A2G.
+  - k-means dựa trên bản đồ mật độ của episode, tức là giả định nhà mạng biết phân bố tải dự kiến (ở mức non-RT RIC), không phải vị trí từng UE.
+  - Đỉnh ở độ cao tối đa như prior cũ.
+- **DEVIATIONS:**
+  - Plan ghi "trên bản đồ có điểm nóng lệch tâm"; bản kiểm dùng bản đồ thật của các episode validation, với S từ 2 đến 10.
+  - Trọng số theo slice (mỗi slice nặng như nhau) không có trong plan.
+- **SUGGESTIONS:** baseline "đứng yên ở đỉnh k-means" của thí nghiệm tổng quát theo N (TIP 11) chính là `check_tip7.py` ở chế độ demand với hành động 0; nên đưa nó vào `eval_heuristics.py` ở TIP 8.

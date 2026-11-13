@@ -47,37 +47,137 @@ def move_to(env, position: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.array([xy[0], xy[1], np.clip(dh / (rate * env.T_L), -1.0, 1.0)])
 
 
-def assign_vertices(env, uav_ids, radius: float) -> dict:
-    """With a fleet or shift section (active UAVs change): the regular n-gon of the n active UAVs, each vertex
-    given to one of them so that the total distance is smallest (Hungarian algorithm, scipy linear_sum_assignment)"""
+SLICES = ("embb", "urllc", "mmtc")
+
+
+def _pool(density: np.ndarray, f: int) -> np.ndarray:
+    """Sum f x f blocks of a 2D array (the last blocks may be smaller)"""
+    rows = np.add.reduceat(density, np.arange(0, density.shape[0], f), axis=0)
+    return np.add.reduceat(rows, np.arange(0, density.shape[1], f), axis=1)
+
+
+def demand_points(env, cell: float = 40.0):
+    """
+    Where demand is expected this episode, as weighted points (n, 2) and weights (n,): each slice with a
+    positive slice weight and UEs gets mass equal to its slice weight (the QoS and SLA objectives average within
+    a slice, then over slices), spread as the env places its UEs. Fixed UEs (the RSUs) at their positions; a
+    slice of traffic_map.slices on the episode's density map, summed into cells of `cell` m; any other slice
+    uniform over the area on the same cells. Only the slices and the map of the episode are read, not where the
+    UEs happen to be now
+    """
+    width, height = env.service_area
+    map_slices = set(env.traffic_map_params["slices"]) if env.traffic_map is not None else set()
+    if env.traffic_map is not None:
+        f = max(1, int(round(cell / env.traffic_map.pixel)))
+        dens = _pool(env.traffic_map.density, f)
+        step = f * env.traffic_map.pixel
+    else:
+        step = cell
+        dens = np.ones((int(np.ceil(width / step)), int(np.ceil(height / step))))
+    gx, gy = np.meshgrid(np.minimum((np.arange(dens.shape[0]) + 0.5) * step, width),
+                         np.minimum((np.arange(dens.shape[1]) + 0.5) * step, height), indexing="ij")
+    grid = np.stack([gx.ravel(), gy.ravel()], axis=1)
+    points, weights = [], []
+    for sl in SLICES:
+        w_slice = float(env.slice_weights[sl]) if sl in env.slice_weights else 0.0
+        ues = [ue for ue in env.ues.values() if ue.is_active and ue.slice_type == sl]
+        if w_slice <= 0 or not ues:
+            continue
+        fixed = np.array([ue.position[:2] for ue in ues if getattr(ue, "fixed", False)])
+        if len(fixed) == len(ues):
+            points.append(fixed)
+            weights.append(np.full(len(fixed), w_slice / len(fixed)))
+        else:
+            w = dens.ravel() if sl in map_slices else np.ones(grid.shape[0])
+            points.append(grid)
+            weights.append(w_slice * w / w.sum())
+    return np.concatenate(points), np.concatenate(weights)
+
+
+def weighted_kmeans(points: np.ndarray, weights: np.ndarray, k: int, n_init: int = 8, iters: int = 100,
+                    seed: int = 0) -> np.ndarray:
+    """Lloyd's algorithm on weighted points, k-means++ seeding (Arthur & Vassilvitskii 2007) with weights, best
+    of n_init by weighted inertia. Its own RandomState, so the env's random stream is not touched"""
+    rng = np.random.RandomState(seed)
+    p = weights / weights.sum()
+    best, best_inertia = None, np.inf
+    for _ in range(n_init):
+        centres = [points[rng.choice(len(points), p=p)]]
+        for _ in range(1, k):
+            d2 = np.min(((points[:, None, :] - np.array(centres)[None]) ** 2).sum(-1), axis=1)
+            q = p * d2
+            q = q / q.sum() if q.sum() > 0 else p
+            centres.append(points[rng.choice(len(points), p=q)])
+        c = np.array(centres, dtype=np.float64)
+        for _ in range(iters):
+            label = np.argmin(((points[:, None, :] - c[None]) ** 2).sum(-1), axis=1)
+            new = c.copy()
+            for j in range(k):
+                m = label == j
+                if weights[m].sum() > 0:
+                    new[j] = (weights[m, None] * points[m]).sum(0) / weights[m].sum()
+            converged = np.allclose(new, c, atol=1e-6)
+            c = new
+            if converged:
+                break
+        inertia = float((weights * np.min(((points[:, None, :] - c[None]) ** 2).sum(-1), axis=1)).sum())
+        if inertia < best_inertia:
+            best, best_inertia = c, inertia
+    return best
+
+
+def demand_vertices(env, n: int) -> np.ndarray:
+    """k-means (k = n) of the episode's expected demand (demand_points), at the top altitude"""
+    points, weights = demand_points(env)
+    c = weighted_kmeans(points, weights, n)
+    return np.concatenate([c, np.full((n, 1), float(env.uav_fly_range_h[1]))], axis=1)
+
+
+def assign_vertices(env, uav_ids, radius: float, mode: str = "ngon", cache: dict = None) -> dict:
+    """The formation of the n active UAVs (mode ngon: the regular n-gon; demand: demand_vertices, kept in `cache`
+    per n), each vertex given to one of them so that the total distance is smallest (Hungarian algorithm, scipy
+    linear_sum_assignment)"""
     from scipy.optimize import linear_sum_assignment
     active = [uid for uid in uav_ids if env.uavs[uid].active]
     if not active:
         return {}
-    vertices = formation_vertices(env, radius, len(active))
+    if mode == "demand":
+        cache = {} if cache is None else cache
+        if len(active) not in cache:
+            cache[len(active)] = demand_vertices(env, len(active))
+        vertices = cache[len(active)]
+    else:
+        vertices = formation_vertices(env, radius, len(active))
     positions = np.array([env.uavs[uid].position for uid in active])
     cost = np.linalg.norm(positions[:, None, :2] - vertices[None, :, :2], axis=2)
     rows, cols = linear_sum_assignment(cost)
     return {active[r]: vertices[c] for r, c in zip(rows, cols)}
 
 
-def attach(env, uav_ids, radius: float) -> np.ndarray:
-    """Make env.step add the prior to the movement of every UAV; returns the vertices.
+def attach(env, uav_ids, radius: float, mode: str = "ngon"):
+    """Make env.step add the prior to the movement of every UAV; returns the fixed vertices (None for demand).
 
-    Without a fleet or shift section UAV i takes vertex i of the N-gon, for the whole run. With one, the n-gon of
-    the active UAVs is reassigned whenever the active set changes (a reset, a withdrawal, a position left empty
-    or filled again in a shift)."""
-    vertices = formation_vertices(env, radius, len(uav_ids))
-    fixed = {uid: vertices[i] for i, uid in enumerate(uav_ids)}
-    cache = {"active": None, "targets": fixed}
+    mode ngon, without a fleet or shift section: UAV i takes vertex i of the N-gon, for the whole run. With one,
+    the n-gon of the active UAVs is reassigned whenever the active set changes (a reset, a withdrawal, a position
+    left empty or filled again in a shift). mode demand (v2, TIP 7): the vertices are the weighted k-means of the
+    episode's expected demand for the number of active UAVs (demand_vertices), recomputed at each reset and
+    reassigned whenever the active set changes."""
+    if mode not in ("ngon", "demand"):
+        raise ValueError(f"prior mode must be ngon or demand, got {mode}")
+    vertices = formation_vertices(env, radius, len(uav_ids)) if mode == "ngon" else None
+    fixed = {uid: vertices[i] for i, uid in enumerate(uav_ids)} if mode == "ngon" else None
+    cache = {"active": None, "targets": fixed, "kmeans": {}}
     inner_step = env.step
 
     def targets():
-        if getattr(env, "fleet", None) is None and getattr(env, "shift", None) is None:
+        if mode == "ngon" and getattr(env, "fleet", None) is None and getattr(env, "shift", None) is None:
             return fixed
         active = tuple(uid for uid in uav_ids if env.uavs[uid].active)
+        if env.current_time == 0.0:   # A new episode: new map and RSUs, so a new k-means
+            cache["kmeans"] = {}
         if active != cache["active"] or env.current_time == 0.0:   # Reassign at every reset too
-            cache["active"], cache["targets"] = active, assign_vertices(env, uav_ids, radius)
+            cache["active"] = active
+            cache["targets"] = assign_vertices(env, uav_ids, radius, mode, cache["kmeans"])
         return cache["targets"]
 
     def step(actions):
@@ -93,6 +193,7 @@ def attach(env, uav_ids, radius: float) -> np.ndarray:
 
     env.step = step
     env.prior_vertices = vertices
+    env.prior_targets = targets
     return vertices
 
 

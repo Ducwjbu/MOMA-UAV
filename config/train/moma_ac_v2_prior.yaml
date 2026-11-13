@@ -20,10 +20,12 @@ max_steps_per_episode: 240    # one shift (v2.yaml shift.duration_steps); the en
 omega_sampling: "random"
 corner_warmup_episodes: 0
 
-# Formation prior: each serving position flies to its vertex of the regular n-gon of the positions serving now
-# (reassigned when one is left empty or filled again), at the top altitude, and the actor learns a residual on that
-# movement. r = 600 m suits n = 3 only; TIP 7 replaces it with k-means for the current n
+# Formation prior (TIP 7): each serving position flies to its vertex, at the top altitude, and the actor learns a
+# residual on that movement. The vertices are the weighted k-means of the episode's expected demand (eMBB on the
+# traffic map, mMTC uniform, the RSUs; mass by slice weight) for the number of positions serving now, reassigned
+# when one is left empty or filled again (prior.py). prior_radius is used only by prior_mode ngon
 formation_prior: true
+prior_mode: demand
 prior_radius: 600.0
 
 # TD3 hyperparameters

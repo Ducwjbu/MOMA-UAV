@@ -167,6 +167,8 @@ class MOMA_AC_Trainer:
             # Formation prior (prior.py): the actor learns a residual on top of a fixed formation
             "formation_prior": bool( _get(tcfg, "formation_prior", False)),
             "prior_radius":    float(_get(tcfg, "prior_radius",    600.0)),
+            # v2 (TIP 7): ngon (the regular n-gon of prior_radius) or demand (k-means of the episode's demand)
+            "prior_mode":      str(  _get(tcfg, "prior_mode",      "ngon")),
             # Several UAVs: share of episodes with one omega per UAV (0: one team omega, as in the paper),
             # and the per-step probability of a new omega within an episode (MOMA_CTDE_Agent)
             "omega_per_agent":   float(_get(tcfg, "omega_per_agent",   0.0)),
@@ -276,9 +278,12 @@ class MOMA_AC_Trainer:
                 raise ValueError("formation_prior and the formation guide (guide_prob > 0) can't be combined")
             # Both envs, so that evaluation adds the same prior. The zero start is overwritten by a checkpoint
             for env in (self.env, self.eval_env):
-                vertices = prior.attach(env, self.uav_ids, self.cfg["prior_radius"])
+                vertices = prior.attach(env, self.uav_ids, self.cfg["prior_radius"], self.cfg["prior_mode"])
             prior.zero_movement_output(self.agent)
-            print(f"[MOMA-AC] Formation prior, r={self.cfg['prior_radius']:.0f} m: {np.round(vertices, 1).tolist()}")
+            if vertices is None:
+                print("[MOMA-AC] Formation prior: k-means of each episode's demand, for the UAVs serving")
+            else:
+                print(f"[MOMA-AC] Formation prior, r={self.cfg['prior_radius']:.0f} m: {np.round(vertices, 1).tolist()}")
 
         if checkpoint_path and os.path.exists(checkpoint_path):
             self.agent.load(checkpoint_path)
