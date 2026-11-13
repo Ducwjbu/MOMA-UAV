@@ -17,6 +17,7 @@ Bắt đầu 2026-11-13. Nguồn yêu cầu: trang Notion "Khoá luận MOMA-UAV
 | Câu chuyện triển khai (Q1) | (b) khẩn cấp: mạng mặt đất hỏng, UAV phục vụ tạm | (a): đổi bảng slice trong config, thêm trạm macro (TIP để sau) |
 | Mục tiêu (Q2) | Vector 4 chiều: SLA dịch vụ dữ liệu, SLA dịch vụ khẩn cấp (URLLC), SLA mMTC, năng lượng. Công bằng chỉ báo cáo | Giữ 3 mục tiêu cũ: khoá `reward.objectives` |
 | Phạm vi (Q3) | Ca trực nhiều chuyến, đổi pin, 2–3 loại sự kiện | Episode 18 bước: tắt `shift` |
+| Số UAV (chốt 2026-11-13) | Mỗi ca rút số UAV của đội trong 2–10 khi train. Test trong dải và ở 11–12; chỉ test 13–15 nếu 11–12 đạt tiêu chí của TIP 11 | Dải khác: đổi `fleet` trong config |
 | Baseline tối ưu (Q4) | Có (TIP 9) | — |
 | Lý thuyết (Q5) | Định lý đầy đủ cho tầng đội, mệnh đề + thí nghiệm cho tầng UAV (TIP 10) | — |
 
@@ -75,7 +76,7 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
 
 ### TIP 4. Ca trực và đổi pin
 
-- **Task:** khoá `shift`: một episode là một ca (ví dụ 4 giờ = 240 bước). UAV quay về Home Point khi chạm năng lượng quay về (đã có), đổi pin mất `swap_steps` bước (nguồn: thời gian đổi TB60 của DJI M300), rồi bay ra lại. Dùng cơ chế `fleet` để đánh dấu UAV không hoạt động. Có `n_spare` UAV dự phòng.
+- **Task:** khoá `shift`: một episode là một ca (ví dụ 4 giờ = 240 bước). UAV quay về Home Point khi chạm năng lượng quay về (đã có), đổi pin mất `swap_steps` bước (nguồn: thời gian đổi TB60 của DJI M300), rồi bay ra lại. Dùng cơ chế `fleet` để đánh dấu UAV không hoạt động: UAV đang bay về, đổi pin hoặc bay ra không phục vụ. Số UAV của đội rút mỗi ca trong 2–10 (`fleet`, mạng MLP dùng 10 khe có che). Policy không quyết định lúc đổi pin (theo luật Low Battery RTH). Kết thúc ca là terminal; quan sát thêm thời gian còn lại của ca và trạng thái UAV. Mức pin lúc bắt đầu ca so le để các UAV không cùng về một lúc. Giả định trạm mặt đất luôn có pin đã sạc; số trạm cần tăng theo N (khoảng 1 cặp TB60 mỗi UAV mỗi 25 phút, một BS60 sạc khoảng 1 cặp mỗi giờ), ghi rõ trong báo cáo. Độ dài ca mặc định 4 giờ (240 bước).
 - **Đạt khi:** trong một ca, mỗi UAV có ít nhất một lần đổi pin; số UAV hoạt động khớp log; năng lượng có hậu quả (thời gian không phục vụ).
 
 ### TIP 5. Tải theo giờ và sự kiện
@@ -86,11 +87,13 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
 ### TIP 6. UE có trọng số và hiệu chỉnh tải
 
 - **Task:** mỗi UE mô phỏng đại diện `w` người dùng (tải và đếm SLA nhân `w`). Hiệu chỉnh tải danh nghĩa để policy tốt đạt các ngưỡng (Notion 3.1, điều kiện 1).
+- **Tải theo kịch bản, không theo đội:** số UE và tải cố định theo vùng, số UAV thay đổi, nên đánh đổi số UAV–SLA–năng lượng là có thật. HV báo cáo theo từng N, không gộp.
 - **Đạt khi:** ở tải danh nghĩa, tam giác đứng yên với phân bổ hợp lý đạt khoảng 0.8–0.9 mỗi slice khẩn cấp (để ngưỡng 0.95 khó nhưng với tới được); bảng hiệu chỉnh ghi trong `sources.md`.
 
 ### TIP 7. Prior theo nhu cầu
 
 - **Task:** đỉnh của prior = k-means có trọng số trên bản đồ mật độ (đã có `traffic_map`) thay cho tam giác cố định, gán bằng Hungarian (đã có). Khoá `prior_mode: demand | ngon`.
+- **Bắt buộc khi N thay đổi:** đa giác đều bán kính 600 m chỉ gần vị trí phủ tốt ở N = 3 (lệch 0.46% so với 3-means). Ở N = 10 nó để trống giữa vùng và các đỉnh cách nhau 371 m. Prior tính k-means cho đúng số UAV đang phục vụ, tính lại khi số đó đổi trong ca (đổi pin, hỏng).
 - **Đạt khi:** trên bản đồ có điểm nóng lệch tâm, prior theo nhu cầu cho coverage cao hơn tam giác khi đứng yên.
 
 ### TIP 8. Đánh giá 4 mục tiêu và bộ điều khiển nhiều ràng buộc
@@ -118,6 +121,8 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
 
 - **Task:** config train v2, chạy pilot 300k trên Kaggle (bạn chạy): `ma3_prior` v2 (MLP) và attention v2.
 - **Đạt khi:** đường cong học tăng, SLA từng slice và năng lượng có đánh đổi thật (kiểm như phép thử đánh đổi giữa slice).
+- **Thí nghiệm tổng quát theo N (sau pilot, train 2–10):** đánh giá ở N = 2, 4, 6, 8, 10 (trong dải) và 11, 12 (ngoài dải). Tiêu chí "vẫn tốt" chốt trước khi chạy: ở mỗi N ngoài dải, HV của policy attention lớn hơn HV của baseline không train (UAV đứng yên ở vị trí k-means, cùng N, cùng episode), cận dưới CI của hiệu theo cặp > 0. Đạt cả 11 và 12 thì test thêm 13–15, không đạt thì dừng ở 12 và báo cáo đúng như vậy. Mạng MLP chỉ chạy được tới 10 (số khe cố định).
+- **Chi phí đã đo** (v2, hành động ngẫu nhiên): một bước env 14.5 ms ở N = 2, 15.9 ms ở N = 3, 22.1 ms ở N = 6, 29.7 ms ở N = 10. Replay buffer của MLP 10 khe khoảng 5–6 GB mỗi run (3 UAV: khoảng 1 GB). Run dài cần `--resume` trên Kaggle.
 
 ---
 
