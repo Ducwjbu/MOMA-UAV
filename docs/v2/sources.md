@@ -18,3 +18,13 @@ Mỗi tham số mới của `config/environment/v2.yaml` có một dòng ở đ�
 | `objectives.sla_tolerance` | 1e-9 | Thiết kế | Dung sai tương đối của phép so ngưỡng | — |
 
 Cách tính SLA mỗi UE (v2): biên nhỏ nhất theo log tự nhiên, `m = min(log(rate / rate yêu cầu), log(ngân sách trễ / trễ), log(ngân sách lỗi / tỉ lệ lỗi))`. UE không được cấp RB thì `m = −∞`. Slice dùng trung bình `sigmoid(β m)` trên các UE có tải. Slice không có UE có tải ở bước đó thì giá trị là 1.
+
+## TIP 2. Hành động theo slice và bộ lập lịch
+
+| Tham số | Giá trị | Nguồn | Phần dùng | Trạng thái |
+|---|---|---|---|---|
+| `action.mode` | `slice_share` | 3GPP TS 28.541, "Management and orchestration; 5G Network Resource Model (NRM)", RRMPolicyRatio (`rRMPolicyMinRatio`, `rRMPolicyMaxRatio`) | Tỉ lệ tài nguyên theo slice là phần đảm bảo tối thiểu; phần không dùng được chia lại | Như v1.1 (`rb_sharing`) |
+| Bộ lập lịch trong slice | Proportional fair có trần nhu cầu | F. Kelly, "Charging and rate control for elastic traffic", European Transactions on Telecommunications 8(1):33–37, 1997 | Tối đa Σ log(thông lượng). Với tốc độ mỗi RB cố định trong bước và trần bằng nhu cầu, nghiệm là số RB bằng nhau có trần (water-filling) | Lập luận trong docstring `_schedule_slices` |
+| Thang thời gian | Tỉ lệ slice mỗi bước 60 s, lập lịch bên trong | O-RAN Alliance WG1, "O-RAN Architecture Description" (non-RT RIC: vòng điều khiển ≥ 1 s; near-RT RIC: 10 ms – 1 s) | Đặt hành động ở thang non-RT RIC | **Chưa đọc bản chính thức** (Notion mục 6) |
+| `slicing.per_slice_queues` | true | Thiết kế (khoá có từ v1.1), mỗi slice một phần ba buffer | Sửa hạn chế 4: năng lực của mMTC không còn phục vụ gói eMBB | — |
+| Tải mục tiêu của bộ lập lịch | Drop = 1/10 ngân sách lỗi | Thiết kế; công thức M/M/1/K của env | eMBB 0.75, URLLC 0.93, mMTC 0.95 | — |

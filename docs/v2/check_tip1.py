@@ -38,7 +38,7 @@ def run(sharpness, n_ep=5, seed_base=100000, kpi_log=None):
             env.reset()
         for _ in range(18):
             acts = {u: np.concatenate([act_rng.uniform(-1, 1, 3), act_rng.uniform(0.05, 1, 1),
-                                       act_rng.dirichlet(np.ones(9))]) for u in env.uavs}
+                                       act_rng.dirichlet(np.ones(env.act_dim - 4))]) for u in env.uavs}
             with contextlib.redirect_stdout(io.StringIO()):
                 _, _, done, info = env.step(acts)
             rv = info["reward_vector"]

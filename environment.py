@@ -385,6 +385,17 @@ class NetworkSlicingEnv:
             raise ValueError(f"slicing.rb_sharing must be none, idle or all, got {self.rb_sharing}")
         # One queue per slice at each UAV instead of one shared queue (absent: false), see _update_uavs_queuing_stats
         self.per_slice_queues = bool(getattr(env_config.slicing, 'per_slice_queues', False))
+        # v2 (docs/v2/plan.md, TIP 2): what the bandwidth part of the action means. "demand_areas" (absent, v1.1):
+        # 9 fractions, one per demand area (slice x distance), round robin inside each. "slice_share": 3 shares, one
+        # per slice, as minimum guarantees, and a scheduler inside the step (_allocate_rbs_slices) that is
+        # work-conserving across slices and proportional fair within a slice
+        act_cfg = getattr(env_config, 'action', None)
+        self.action_mode = 'demand_areas' if act_cfg is None else str(getattr(act_cfg, 'mode', 'demand_areas'))
+        if self.action_mode not in ('demand_areas', 'slice_share'):
+            raise ValueError(f"action.mode must be demand_areas or slice_share, got {self.action_mode}")
+        self.act_dim = 4 + (3 if self.action_mode == 'slice_share' else 3 * self.num_das_per_slice)
+        self._slice_shares = {}
+        self._target_load = None   # per slice, set on first use by _scheduler_target_loads
         # Active UAVs change (thesis; absent: every UAV is active for the whole episode). num_uavs is then the
         # fleet size: the observation and action keep a slot for every UAV, see _draw_fleet
         fleet = getattr(env_config, 'fleet', None)
@@ -948,7 +959,10 @@ class NetworkSlicingEnv:
         self._update_ue_traffic_patterns()
 
         # Apply bandwidth allocation actions to DAs
-        for uav_id, action in actions.items():
+        if self.action_mode == 'slice_share':   # v2: per-slice shares, read by _allocate_rbs_slices
+            self._slice_shares = {uav_id: np.asarray(action[4:7], dtype=np.float64)
+                                  for uav_id, action in actions.items()}
+        for uav_id, action in (actions.items() if self.action_mode == 'demand_areas' else ()):
             uav_das = [da for da in self.demand_areas.values() if da.uav_id == uav_id]
             if len(uav_das) > 0:
                 # Normalized bandwidth allocation
@@ -958,8 +972,11 @@ class NetworkSlicingEnv:
                     da.raw_allocated_action = bandwidth_actions[i]
                     da.allocated_bandwidth = bandwidth_actions[i] * self.uavs[uav_id].max_bandwidth
 
-        # Bandwidth allocation to DAs
-        self._allocate_rbs_fairly()
+        # Bandwidth allocation to DAs (v2 slice_share: to slices, by the scheduler)
+        if self.action_mode == 'slice_share':
+            self._allocate_rbs_slices()
+        else:
+            self._allocate_rbs_fairly()
 
         # Update SINR, throughput, delay, reliability caches
         self._update_sinr_cache()
@@ -2746,6 +2763,192 @@ class NetworkSlicingEnv:
                 uav.RBs[rb_id].allocated_da_id = da.id
                 da.RB_ids_list.append(rb_id)
             pos += c
+
+    # ============================================
+    # v2 SCHEDULER (action.mode: slice_share, TIP 2)
+    # ============================================
+
+    def _provisional_rb_rates(self, ues: List[UE]) -> Dict[int, float]:
+        """Rate (bps) one RB would give each UE if every UAV with traffic used all its RBs, which the scheduler
+        then does (it hands out every RB while a UE with traffic remains), so the SINR is the one the caches will
+        compute: power P / total_rbs per RB, interference P_j / total_rbs from the other busy UAVs. Only the
+        scheduler's decisions use it; throughput is computed afterwards by the usual caches"""
+        if not ues:
+            return {}
+        uav_list = list(self.uavs.values())
+        index = {uav.id: i for i, uav in enumerate(uav_list)}
+        busy = {ue.assigned_uav for ue in ues}
+        per_rb = np.array([uav.current_power / self.total_rbs for uav in uav_list], dtype=np.float32)
+        interference = np.array([uav.current_power / self.total_rbs if uav.id in busy else 0.0
+                                 for uav in uav_list], dtype=np.float32)
+        serving = np.array([index[ue.assigned_uav] for ue in ues], dtype=np.int32)
+        if self.antenna is not None:
+            sinr_db = self._sinr_db(ues, per_rb, serving, interference)
+        else:
+            sinr_db = calculate_sinr_batch_numba_a2g(
+                np.array([ue.position for ue in ues], dtype=np.float32),
+                np.array([uav.position for uav in uav_list], dtype=np.float32), per_rb, serving,
+                self.noise_power, self.carrier_frequency, interference, self.sidelobe_gain)
+        return {ue.id: self.rb_bandwidth * self._spectral_efficiency(float(s), ue) for ue, s in zip(ues, sinr_db)}
+
+    def _scheduler_target_loads(self) -> Dict[str, float]:
+        """Load (offered / served bits) the scheduler aims at in each slice's queue. A scheduler that gives a UE
+        exactly its offered load runs the queue at load 1, where the M/D/1 delay and the M/M/1/K drop rate blow
+        up. The target is the largest load whose drop rate (the M/M/1/K formula of _queue_delay_drop, buffer in
+        packets of the slice) stays within a tenth of the slice's failure budget left after the link residual,
+        1 - min_reliability - bler^max_transmissions; the other nine tenths are left for handovers and the error
+        of the rate estimate. Clipped to [0.05, 0.95]. Depends only on the config"""
+        if self._target_load is not None:
+            return self._target_load
+        tp = self.traffic_patterns
+        packet_bytes = {'embb': float(tp.embb.packet_size), 'urllc': float(tp.urllc.packet_size),
+                        'mmtc': float(tp.mmtc.payload_cap) + float(tp.mmtc.overhead)}
+        buffer_bits = self.uav_buffer_size / (3.0 if self.per_slice_queues else 1.0)
+        out = {}
+        for s in ('embb', 'urllc', 'mmtc'):
+            residual = 0.0
+            if self.link_adaptation is not None:
+                la = self.link_adaptation[s]
+                residual = float(la['bler_target'] ** la['max_transmissions'])
+            budget = 0.1 * max(1.0 - self.qos_profiles[s].min_reliability - residual, 0.0)
+            bits = 8.0 * packet_bytes[s] + (0.0 if self.backhaul is not None else 1e3)
+            k = buffer_bits / bits
+
+            def drop(rho):
+                return rho ** k * (1.0 - rho) / (1.0 - rho ** (k + 1.0))
+
+            lo, hi = 0.05, 0.95
+            if drop(hi) <= budget:
+                out[s] = hi
+                continue
+            for _ in range(60):   # Bisection: drop rises with the load below 1
+                mid = 0.5 * (lo + hi)
+                lo, hi = (mid, hi) if drop(mid) <= budget else (lo, mid)
+            out[s] = lo
+        self._target_load = out
+        return out
+
+    @staticmethod
+    def _waterfill(n: int, caps: np.ndarray) -> np.ndarray:
+        """n RBs split as equally as possible with no entry above its cap (integers; the last odd RBs go to the
+        lowest indices). Returns the counts; their sum is below n only if every cap is reached"""
+        alloc = np.zeros(len(caps), dtype=np.int64)
+        active = [i for i in range(len(caps)) if caps[i] > 0]
+        remaining = int(n)
+        while remaining > 0 and active:
+            share = remaining // len(active)
+            if share == 0:
+                for i in active[:remaining]:
+                    alloc[i] += 1
+                break
+            still = []
+            for i in active:
+                give = int(min(share, caps[i] - alloc[i]))
+                alloc[i] += give
+                remaining -= give
+                if alloc[i] < caps[i]:
+                    still.append(i)
+            active = still
+        return alloc
+
+    def _schedule_slices(self, total: int, shares: np.ndarray, ues: List[UE],
+                         rate: Dict[int, float]) -> Dict[int, int]:
+        """RB counts per UE of one UAV.
+
+        Within a slice the rates are fixed for the step, so proportional fairness (max sum log throughput,
+        Kelly 1997) with each UE capped at its need reduces to equal RB counts capped at the need, which
+        _waterfill gives. The need is the RBs that carry the UE's offered load at the slice's target load
+        (_scheduler_target_loads), ceil(demand / (target x rate per RB)).
+        Across slices the action's shares (scaled to sum 1 if above) are minimum guarantees: (1) each slice
+        fills its UEs' needs from its guarantee; (2) the RBs left over (unreserved or not needed) go to slices
+        with unmet need, in proportion to their shares (equally if all are 0), until no need is left or no RB;
+        (3) any RBs still left are spread over all UEs with traffic the same way, so no RB is idle while a UE
+        has traffic (they lower the queueing delay). Draws no random numbers."""
+        slices = ('embb', 'urllc', 'mmtc')
+        members = {s: [ue for ue in ues if ue.slice_type == s] for s in slices}
+        target = self._scheduler_target_loads()
+        need = {ue.id: max(1, int(np.ceil(ue.demand_bps / (target[ue.slice_type] * rate[ue.id])))) for ue in ues}
+        w = np.clip(np.nan_to_num(np.asarray(shares, dtype=np.float64)[:3]), 0.0, 1.0)
+        if w.sum() > 1.0:
+            w = w / w.sum()
+        got = {ue.id: 0 for ue in ues}
+
+        def fill(s, n, capped=True):
+            """Give up to n RBs to slice s by water-filling; returns how many were used"""
+            us = members[s]
+            caps = np.array([need[u.id] - got[u.id] if capped else 10 ** 9 for u in us], dtype=np.int64)
+            add = self._waterfill(n, caps)
+            for u, a in zip(us, add):
+                got[u.id] += int(a)
+            return int(add.sum())
+
+        def weights(keys):
+            v = np.array([w[slices.index(s)] for s in keys])
+            return v if v.sum() > 0 else np.ones(len(keys))
+
+        # (1) guarantees
+        reserved = int(np.floor(w.sum() * total + 1e-9))
+        budgets = self._split_counts(reserved, w) if reserved > 0 else np.zeros(3, dtype=int)
+        pool = total
+        for s, b in zip(slices, budgets):
+            if members[s]:
+                pool -= fill(s, int(b))
+        # (2) unmet needs, by share
+        while pool > 0:
+            short = [s for s in slices if any(got[u.id] < need[u.id] for u in members[s])]
+            if not short:
+                break
+            used = 0
+            for s, n in zip(short, self._split_counts(pool, weights(short))):
+                used += fill(s, int(n))
+            if used == 0:   # Every short slice got 0 RBs this round: give one round to the first ones
+                used = fill(short[0], pool)
+            pool -= used
+        # (3) the rest, over all UEs with traffic
+        present = [s for s in slices if members[s]]
+        if pool > 0 and present:
+            for s, n in zip(present, self._split_counts(pool, weights(present))):
+                fill(s, int(n), capped=False)
+        return got
+
+    def _allocate_rbs_slices(self):
+        """v2 (TIP 2): RBs to UEs by _schedule_slices, per UAV, from the per-slice shares of the action. A UE is
+        scheduled if it has traffic, a serving UAV and a non-zero rate. Each UAV still takes its RBs in a random
+        order (one permutation per UAV), as the interference model assumes. Demand areas keep their UEs (the
+        observation reads them) and record the RBs their UEs got"""
+        for uav in self.uavs.values():
+            for rb in uav.RBs:
+                rb.allocated_da_id = -1
+                rb.allocated_ue_id = -1
+        for da in self.demand_areas.values():
+            da.RB_ids_list = []
+        for ue in self.ues.values():
+            if ue.is_active:
+                ue.assigned_rb = []
+
+        candidates = [ue for ue in self.ues.values() if ue.is_active and ue.assigned_uav is not None
+                      and getattr(ue, 'demand_bps', 0.0) > 0]
+        rate = self._provisional_rb_rates(candidates)
+        da_of = {ue_id: da for da in self.demand_areas.values() for ue_id in da.user_ids}
+        for uav_id, uav in self.uavs.items():
+            total = len(uav.RBs)
+            rb_order = np.random.permutation(total)
+            ues = [ue for ue in candidates if ue.assigned_uav == uav_id and rate[ue.id] > 0]
+            if not ues:
+                continue
+            counts = self._schedule_slices(total, self._slice_shares.get(uav_id, np.full(3, 1.0 / 3.0)), ues, rate)
+            pos = 0
+            for ue in ues:
+                da = da_of.get(ue.id)
+                for rb_id in rb_order[pos:pos + counts[ue.id]]:
+                    rb = uav.RBs[int(rb_id)]
+                    rb.allocated_ue_id = ue.id
+                    if da is not None:
+                        rb.allocated_da_id = da.id
+                        da.RB_ids_list.append(int(rb_id))
+                    ue.assigned_rb.append(rb)
+                pos += counts[ue.id]
+        self._invalidate_sinr_cache()
 
     # ============================================
     # REWARD CALCULATION METHODS

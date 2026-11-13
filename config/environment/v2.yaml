@@ -110,6 +110,10 @@ slicing:
         embb: 0.341 # 31 eMBB UEs: with the 260 Mbps of the RSUs, mean offered load = fleet capacity
         urllc: 0.0 # (566 Mbps, 3 UAVs hovering at full power, all RBs to a mean covered UE). Sensitivity: eMBB x0.5, x1.5; rsu.spacing 2000
         mmtc: 0.659 # 60 mMTC: 20 per UAV, enough points to measure coverage (design)
+    # v2 (TIP 2): one queue per slice, served by the slice's own rates, with a third of the buffer each (assumed).
+    # v1.1 had one queue per UAV, so the rate of mMTC UEs (almost no load) served eMBB and URLLC packets
+    # (report/05_han_che.md, item 4)
+    per_slice_queues: true
     slice_weights: # equal: no operator priority assumed (policy, see Bellone et al.; Hossain & Ansari)
         embb: 1.0
         urllc: 1.0
@@ -339,3 +343,13 @@ objectives:
     names: [sla_embb, sla_urllc, sla_mmtc, energy]
     sla_sharpness: 4.0
     sla_tolerance: 1.0e-9 # relative tolerance of the binary SLA test
+
+# v2 (TIP 2): the bandwidth part of each UAV's action is 3 shares, one per slice (embb, urllc, mmtc), instead of 9
+# fractions per demand area; the action has 7 dims. The shares are minimum guarantees (scaled to sum 1 if above),
+# like rRMPolicyMinRatio of 3GPP TS 28.541 (RRMPolicyRatio). Inside the step a scheduler gives each UE with traffic
+# the RBs that carry its load (proportional fair with the load as a cap: equal RB counts within a slice), moves the
+# RBs a slice does not need to slices that do, and spreads the rest, so no RB is idle while a UE has traffic.
+# This matches the time scales of O-RAN (the non-RT RIC sets slice policies over seconds or more, the MAC scheduler
+# runs every TTI)
+action:
+    mode: slice_share

@@ -233,6 +233,8 @@ class MOMA_AC_Trainer:
         n_das_per_slice = int(_get(ecfg, "system.num_das_per_slice", 3))
         n_slices        = 3
         self.act_dim    = 4 + n_das_per_slice * n_slices   # 4 pose+power + N BW alloc
+        # The env knows its action layout (v2 action.mode: slice_share has 3 shares instead of 9 fractions)
+        self.act_dim    = int(getattr(self.env, "act_dim", self.act_dim))
         print(f"[MOMA-AC] obs_dim={self.obs_dim}, act_dim={self.act_dim}")
 
         # ── Agent ────────────────────────────────────────────────

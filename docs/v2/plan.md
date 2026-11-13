@@ -167,3 +167,29 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
   - Slice không có tải ở một bước thì mục tiêu bằng 1.
   - URLLC: biên tin cậy lấy bằng 2 lần truyền (PER dư 1e-10).
 - **SUGGESTIONS:** chọn β bằng một phép thử nhỏ ở TIP 11: β nhỏ cho gradient mượt nhưng xa chỉ số thật; β lớn thì ngược lại.
+
+### TIP 2. Hành động theo slice và bộ lập lịch bên trong (2026-11-13)
+
+- **STATUS:** xong.
+- **FILES CHANGED:**
+  - `environment.py`: khoá `action.mode`, `act_dim`, `_provisional_rb_rates`, `_scheduler_target_loads`, `_waterfill`, `_schedule_slices`, `_allocate_rbs_slices`.
+  - `train_moma_ac.py`: `act_dim` lấy từ env.
+  - `config/environment/v2.yaml`: `action.mode: slice_share`, `per_slice_queues: true`.
+  - Mới: `docs/v2/check_tip2.py`.
+  - `docs/v2/check_tip1.py`: hành động theo `act_dim`.
+- **TEST RESULTS:**
+  - **Tam giác đứng yên, chia đều, 10 episode validation (`check_tip2.py`):** SLA eMBB / URLLC / mMTC từ 0.212 / 0.148 / 0.450 (9 phần DA đều; 17% RB bỏ trống ở mọi bước có tải) lên 0.327 / 0.353 / 0.450, không còn RB bỏ trống. PASS.
+  - **Bản đầu không có tải mục tiêu** (cấp đúng bằng tải): eMBB giảm còn 0.131, vì hàng đợi chạy gần tải 1 nên drop trung vị 9.3e-4, sát ngân sách 1e-3. Đã sửa bằng `_scheduler_target_loads`.
+  - **v1.1 không đổi:** `check_v11.py` 0 lệch, env và train.
+  - **Kiểm khác:** smoke train v2 (hành động 7 chiều mỗi UAV) chạy hết. Kiểm TIP 1 vẫn PASS.
+  - **Thời gian mỗi bước:** 18.6 ms, so với 17.6 ms khi không có bộ lập lịch và 15.8 ms với `ma3.yaml`.
+- **ISSUES:**
+  - mMTC bằng nhau ở hai chế độ: bị giới hạn bởi độ phủ, không phải băng thông.
+  - Tốc độ mỗi RB ước lượng trước khi chia RB, giả sử mọi UAV bận dùng hết RB. Giả định này đúng với bộ lập lịch, trừ UAV mà mọi UE có tốc độ 0. Khi đó nhiễu thật nhỏ hơn ước lượng một chút.
+  - Bộ lập lịch không tính giới hạn backhaul (v2 gần như không chạm, như v1.1).
+  - Các công cụ v1.1 đọc hành động 13 chiều (`eval_trajectories.py`, `eval_heuristics.py`, `visualize/`) chưa hỗ trợ 7 chiều. Làm ở TIP 8.
+- **DEVIATIONS:**
+  - Plan ghi "proportional fair"; bản cài là nghiệm của proportional fair khi tốc độ mỗi RB cố định trong bước, có trần nhu cầu (water-filling số RB). Không mô phỏng từng TTI.
+  - Thêm tải mục tiêu mỗi slice (plan không có), suy từ SLA của slice.
+  - Hàng đợi riêng mỗi slice dùng khoá `per_slice_queues` có sẵn.
+- **SUGGESTIONS:** heuristic và baseline tối ưu (TIP 9) nên dùng cùng bộ lập lịch này, để so sánh chỉ khác ở vị trí và tỉ lệ slice.
