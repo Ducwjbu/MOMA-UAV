@@ -3,7 +3,7 @@ check_tip7.py (TIP 7 of docs/v2/plan.md)
 ========================================
 The formation prior with no residual (every movement action 0, power 1, even slice shares) on
 config/environment/v2.yaml, with the shift's serving positions fixed at S = 2, 3, 6 and 10, 3 validation episodes
-(100000+) of 60 steps each. Two prior modes:
+(100000+) of 60 steps each. Three prior modes:
   ngon     the regular S-gon of radius 600 m around the middle (the v1.1 prior, made for S = 3)
   demand   the weighted k-means of the episode's expected demand for the positions serving (prior.demand_vertices)
   uniform  the k-means of the area itself, every cell the same (prior.uniform_vertices): reported only, added after
