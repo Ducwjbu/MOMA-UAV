@@ -11,21 +11,54 @@ from numba import njit
 
 
 class City:
-    def __init__(self, area, built_up_ratio, buildings_per_km2, height_scale, rng=np.random):
+    def __init__(self, area, built_up_ratio, buildings_per_km2, height_scale, rng=np.random, shift=None):
+        """shift (v2): the grid is moved by -shift (m, 0 <= shift < pitch per axis), so that the street grid sits
+        differently in the area each episode; None keeps the grid at the origin, as in v1.1. Inside, positions
+        are taken in grid coordinates, xy + shift"""
         self.area = np.asarray(area, dtype=np.float64)  # (width, height) in m
         self.pitch = 1000.0 / np.sqrt(buildings_per_km2)
         self.width = 1000.0 * np.sqrt(built_up_ratio / buildings_per_km2)
         self.street = self.pitch - self.width
         self.offset = self.street / 2.0  # each footprint is centred in its grid cell
-        self.n_cells = np.ceil(self.area / self.pitch).astype(int)  # (nx, ny), the last cells may overhang
+        self.shift = None if shift is None else np.asarray(shift, dtype=np.float64)
+        span = self.area if self.shift is None else self.area + self.shift
+        self.n_cells = np.ceil(span / self.pitch).astype(int)  # (nx, ny), the last cells may overhang
         self.heights = rng.rayleigh(height_scale, size=(self.n_cells[0], self.n_cells[1]))
         # Footprint edges along each axis: every cell contributes its two edges
         self.edges = [np.sort(np.concatenate([np.arange(n) * self.pitch + self.offset,
                                               np.arange(n) * self.pitch + self.offset + self.width]))
                       for n in self.n_cells]
 
+    def _grid(self, xy: np.ndarray) -> np.ndarray:
+        """Area coordinates (..., 2) to grid coordinates"""
+        return xy if self.shift is None else xy + self.shift
+
+    def _grid3(self, p: np.ndarray) -> np.ndarray:
+        """Segment ends (N, 3) to grid coordinates (heights unchanged)"""
+        if self.shift is None:
+            return p
+        q = p.copy()
+        q[:, :2] += self.shift
+        return q
+
+    def nearest_crossing(self, xy: np.ndarray) -> np.ndarray:
+        """The street crossing nearest to each point (crossings are at the grid lines), in area coordinates"""
+        if self.shift is None:
+            return np.round(xy / self.pitch) * self.pitch
+        return np.round((xy + self.shift) / self.pitch) * self.pitch - self.shift
+
+    def in_street(self, xy: np.ndarray) -> np.ndarray:
+        """Per axis, True where the coordinate lies in a street (x: a north-south street, y: an east-west one)"""
+        g = self._grid(xy)
+        local = g - np.floor(g / self.pitch) * self.pitch
+        return (local < self.offset) | (local >= self.offset + self.width)
+
     def building_at(self, xy: np.ndarray):
         """Cell indices (i, j) of the footprint containing each point, -1 where the point is on a street"""
+        return self._building_at_grid(self._grid(np.atleast_2d(xy)))
+
+    def _building_at_grid(self, xy: np.ndarray):
+        """building_at for points already in grid coordinates"""
         xy = np.atleast_2d(xy)
         cell = np.floor(xy / self.pitch).astype(int)
         local = xy - cell * self.pitch
@@ -48,8 +81,8 @@ class City:
     def line_of_sight(self, start: np.ndarray, end: np.ndarray) -> np.ndarray:
         """Same result as line_of_sight_numpy, computed segment by segment in numba: each segment only visits
         the cuts it crosses, instead of sorting all footprint edges for every segment (about 10x faster)."""
-        start = np.ascontiguousarray(np.atleast_2d(start), dtype=np.float64)
-        end = np.ascontiguousarray(np.atleast_2d(end), dtype=np.float64)
+        start = np.ascontiguousarray(self._grid3(np.atleast_2d(start).astype(np.float64)), dtype=np.float64)
+        end = np.ascontiguousarray(self._grid3(np.atleast_2d(end).astype(np.float64)), dtype=np.float64)
         return _los_segments(start, end, self.edges[0], self.edges[1], self.pitch, self.offset, self.width,
                              self.n_cells[0], self.n_cells[1], self.heights)
 
@@ -60,8 +93,8 @@ class City:
         on a street; a piece inside a footprint blocks when the segment's lower end over it is below the roof.
         The building containing `start` is skipped: an indoor UE's own walls are the O2I loss.
         """
-        start = np.atleast_2d(start).astype(np.float64)
-        end = np.atleast_2d(end).astype(np.float64)
+        start = self._grid3(np.atleast_2d(start).astype(np.float64))
+        end = self._grid3(np.atleast_2d(end).astype(np.float64))
         delta = end - start
         cuts = [np.zeros((len(start), 1)), np.ones((len(start), 1))]
         for axis in range(2):
@@ -79,7 +112,7 @@ class City:
         inside = np.all((local >= self.offset) & (local < self.offset + self.width), axis=2)
         inside &= np.all((cell >= 0) & (cell < self.n_cells), axis=2)
         inside &= t1 > t0
-        own = self.building_at(start[:, :2])
+        own = self._building_at_grid(start[:, :2])
         inside &= ~((cell[..., 0] == own[:, 0:1]) & (cell[..., 1] == own[:, 1:2]))
         roof = np.zeros(inside.shape)
         roof[inside] = self.heights[cell[inside][:, 0], cell[inside][:, 1]]

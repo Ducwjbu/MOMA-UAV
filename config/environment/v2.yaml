@@ -91,8 +91,8 @@ channel:
 # of that table. Reliability is 1 - Packet Error Rate
 qos_profiles:
     embb: # Mission-critical video (5QI 67: GBR, PDB 100 ms, PER 1e-3; core share 10 ms, note 13 of the table)
-        min_rate: 2e6 # bps, PLACEHOLDER: TS 22.125 Table 7.2-2 (480p video for UAV control); a responder-video source
-                      # is still missing (docs/v2/sources.md)
+        min_rate: 2e6 # bps: TS 22.125 Table 7.2-2 (480p video); within mission-critical video's 150 kbps - 5 Mbps
+                      # (Ericsson, arXiv:2103.02434) and near NIST PSCR's 1.5 Mb/s standard video (docs/v2/sources.md)
         max_latency: 90.0 # ms
         min_reliability: 0.999
     urllc: # Road-side units of an ITS, TS 22.261 Table 7.2.3.2-1 (10 Mbps); 5QI 84 (PDB 30 ms, PER 1e-5, core 5 ms)
@@ -160,6 +160,8 @@ ue_dynamics:
     arrival_rate: 0.3033 # New UEs per second: num_ues / session_duration_avg keeps the population near num_ues
     max_ues_multiplier: 1.5 # max_ues = num_ues * multiplier
     session_duration_avg: 300 # Average session duration in seconds (sets the per-step departure probability)
+    stationary: true # v2 (TIP 6): Poisson(num_ues) UEs at reset and num_ues x departure probability arrivals per
+                     # step, so the population is stationary with mean num_ues (v1.1 drifts up to ~100)
     max_initial_velocity: 2.0 # m/s
     patterns:
         walk:
@@ -184,8 +186,8 @@ ue_dynamics:
 traffic_patterns:
     embb:
         packet_size: 1500 # bytes
-        peak_rate: 2e6 # v2 (TIP 1): the video rate of qos_profiles.embb, streamed all the time (PLACEHOLDER;
-        activity_factor: 1.0 # the UE count and the load are calibrated in TIP 6)
+        peak_rate: 2e6 # v2 (TIP 1): the video rate of qos_profiles.embb, streamed all the time. Mission-critical video
+        activity_factor: 1.0 # needs 150 kbps - 5 Mbps (Ericsson, arXiv:2103.02434); NIST PSCR uses 1.5 Mb/s standard video
     urllc:
         packet_size: 256 # TS 22.261 allows small (<= 256 B) to big; small chosen
         rate: 10e6 # Note 4 of the table: every application needs the experienced rate
@@ -204,6 +206,7 @@ rsu:
     block_size: [433.0, 250.0] # m
     spacing: 1000.0 # m along the streets
     antenna_height: 5.0 # m
+    random_offset: true # v2: the road grid's origin uniform within a block each episode (v1.1: half a block in)
 
 # Spatial traffic density (traffic_map.py), replacing the hotspots: Lee, Zhou, Zhong, Niu, Zhou, Zhang, "Spatial
 # Modeling of the Traffic Density in Cellular Networks", IEEE Wireless Commun. 21(1):80-88, 2014. Eq. 1-2: a
@@ -309,7 +312,8 @@ backhaul:
 # velocity_max in the episode's wind (airspeed-limited), then the descent at velocity_max_descent, radio off. The
 # flight out from the Home Point to the starting position is charged at reset. Home Point: the gateway's ground station
 return_home:
-    position: [1000.0, 0.0] # m, x y on the ground (backhaul.gateway_position)
+    position: [1000.0, 0.0] # m, x y on the ground (backhaul.gateway_position); unused with random_edge
+    random_edge: true # v2: Home Point (and backhaul gateway) uniform on the area's edge each episode, at the nearest street crossing
 
 # Explicit city of ITU-R P.1410-6 (Sec. 2.1.4-2.1.5), the parameters of the a2g section (dense urban): grid pitch
 # 1000/sqrt(beta) = 57.7 m, footprint 1000 sqrt(alpha/beta) = 40.8 m, streets 16.9 m, Rayleigh heights (mode
@@ -320,6 +324,7 @@ city:
     buildings_per_km2: 300.0 # beta
     height_scale: 20.0 # m, gamma
     roof_clearance: 10.0 # m, assumed
+    random_offset: true # v2: the building grid shifted by a uniform fraction of the pitch each episode
 
 # Horizontal wind, drawn once per episode (Dai et al., arXiv:2304.06909, Eq. 1-3): speed at reference_height from
 # Weibull(scale, shape), times (h / reference_height)^exponent (city range 0.4-0.6; Dai uses 0.5 and 50 m).

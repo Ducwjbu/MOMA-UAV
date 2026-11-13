@@ -8,7 +8,7 @@ Mỗi tham số mới của `config/environment/v2.yaml` có một dòng ở đ�
 |---|---|---|---|---|
 | `qos_profiles.embb.max_latency` | 90 ms | 3GPP TS 23.501, "System architecture for the 5G System (5GS)", Table 5.7.4-1 (standardized 5QI to QoS characteristics mapping) | 5QI 67 (Mission Critical Video user plane): PDB 100 ms; ghi chú của bảng: 10 ms cho phần mạng lõi với các 5QI mission critical, nên còn 90 ms cho vô tuyến và hàng đợi | Đọc từ bản dựng lại v20.2.0 (whatthespec.net), chưa đối chiếu PDF chính thức |
 | `qos_profiles.embb.min_reliability` | 0.999 | Như trên | 5QI 67: PER 1e-3 | Như trên |
-| `qos_profiles.embb.min_rate`, `traffic_patterns.embb.peak_rate` | 2 Mbps | 3GPP TS 22.125, "Unmanned Aerial System (UAS) support in 3GPP", Table 7.2-2 | Tốc độ video 480p cho điều khiển UAV. **Giá trị tạm**: chưa có nguồn cho tốc độ video của lực lượng cứu hộ | Bản scrape (itecspec.com) |
+| `qos_profiles.embb.min_rate`, `traffic_patterns.embb.peak_rate` | 2 Mbps | 3GPP TS 22.125, "Unmanned Aerial System (UAS) support in 3GPP", Table 7.2-2 | Tốc độ video 480p cho điều khiển UAV. Nguồn cho video cứu hộ: xem mục "Vùng phục vụ ngẫu nhiên" bên dưới (150 kbps – 5 Mbps; 1.5 Mb/s) | Bản scrape (itecspec.com) |
 | `traffic_patterns.embb.activity_factor` | 1.0 | Thiết kế | Video phát liên tục; số UE và tải hiệu chỉnh ở TIP 6 | — |
 | `qos_profiles.urllc.max_latency` | 25 ms | TS 23.501 Table 5.7.4-1 | 5QI 84 (Intelligent Transport Systems): PDB 30 ms, ghi chú: 5 ms cho mạng lõi | Bản dựng lại v20.2.0 |
 | `qos_profiles.urllc.min_reliability` | 0.99999 | TS 23.501 Table 5.7.4-1; TS 22.261 Table 7.2.3.2-1 | 5QI 84: PER 1e-5; TS 22.261 (road-side infrastructure): 99.999% | Như v1.1 |
@@ -64,3 +64,14 @@ Kết quả: treo cộng radio tối đa 1189 W, hết pin trong 27.7 phút (Tab
 | `prior_mode` | `demand` | Thiết kế | Đỉnh của prior = k-means có trọng số của nhu cầu dự kiến trong episode, k = số vị trí đang phục vụ | — |
 | Thuật toán | Lloyd có trọng số, khởi tạo k-means++ có trọng số, tốt nhất trong 8 lần | D. Arthur, S. Vassilvitskii, "k-means++: The Advantages of Careful Seeding", Proc. ACM-SIAM SODA 2007, pp. 1027–1035 | Khởi tạo D² | — |
 | Trọng số nhu cầu | Mỗi slice có khối lượng bằng `slice_weights` | Thiết kế, theo cách tính mục tiêu | QoS và SLA lấy trung bình trong slice rồi qua các slice, nên mỗi slice nặng như nhau, không theo số UE. eMBB rải theo bản đồ mật độ của episode (Lee et al. 2014, `traffic_map`), mMTC đều trên vùng, RSU ở đúng vị trí; ô 40 m | — |
+
+## Vùng phục vụ ngẫu nhiên theo episode và dân số dừng (2026-11-14)
+
+| Tham số | Giá trị | Nguồn | Phần dùng | Trạng thái |
+|---|---|---|---|---|
+| Kích thước vùng | 2 km × 2 km (giữ) | 3GPP TR 38.901, Table 7.2-1 | So mật độ: UMa ISD 500 m (khoảng 0.22 km² mỗi trạm), UMi 200 m; 10 UAV trên 4 km² là 0.4 km² mỗi UAV (ISD tương đương khoảng 680 m), vẫn thưa hơn UMa | Như v1.1 |
+| `city.random_offset` | Lưới nhà dời đều trong một bước lưới | Thiết kế | Bố cục phố khác nhau theo episode; vẫn là lưới ITU-R P.1410 | — |
+| `rsu.random_offset` | Gốc lưới đường TR 36.885 đều trong một khối | Thiết kế | RSU ở chỗ khác nhau theo episode, vẫn cách 1 km theo đường và ở ngã tư | — |
+| `return_home.random_edge` | Home Point và gateway đều trên mép vùng, ở ngã tư gần nhất | Thiết kế | Đội cứu hộ dựng trạm mặt đất ở chỗ tiện, không cố định | — |
+| `ue_dynamics.stationary` | Poisson(91) UE đến lúc reset; số đến mỗi bước Poisson(91 × xác suất rời) | Hàng đợi M/M/∞: dân số dừng là Poisson với trung bình λ/μ (vd. L. Kleinrock, Queueing Systems Vol. 1, Wiley 1975, Sec. 3.4) | Đếm ở cuối bước, các UE đến trong bước còn ở lại tới cuối bước là Poisson(λ (1 − e^{−μT}) / μ) = 91 × xác suất rời; trung bình dừng đúng 91. v1.1: 91 lúc đầu, trôi lên khoảng 100 | Sửa hạn chế 12 |
+| `traffic_patterns.embb.peak_rate` | 2 Mbps (bỏ nhãn tạm) | Ericsson, "5G NR for public safety", arXiv:2103.02434: video nhiệm vụ 150 kbps – 5 Mbps tuỳ chất lượng; NIST PSCR, "Evaluating multicast capability in LTE public safety networks": "Standard Video 1.5 Mb/s" | Trong khoảng của các nguồn | Đọc qua kết quả tìm kiếm, chưa đọc bản đầy đủ. Video nhiệm vụ thật chủ yếu là đường lên; env mô phỏng đường xuống |

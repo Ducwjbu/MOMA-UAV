@@ -515,6 +515,8 @@ class NetworkSlicingEnv:
         self.return_home = getattr(env_config, 'return_home', None)
         if self.return_home is not None:
             self.home_position = np.array([*self.return_home.position, 0.0], dtype=np.float64)
+            # v2: random_edge draws the Home Point on the area's edge at each reset (_draw_home), and the
+            # backhaul gateway with it (the gateway's ground station is the Home Point)
 
         # UE dynamics parameters
         self.ue_id_pool = set()  # Pool of available IDs for reuse
@@ -523,6 +525,12 @@ class NetworkSlicingEnv:
         self.ue_arrival_rate = self.ue_dynamics.arrival_rate  # New UEs per second
         # Probability of a UE leaving per T_L, from exponential session durations
         self.ue_departure_rate = 1.0 - np.exp(-self.T_L / self.ue_dynamics.session_duration_avg)
+        # v2 (TIP 6): start and stay at the stationary population of the arrival-departure process. In continuous
+        # time it is M/M/inf, whose population is Poisson with mean arrival rate x session = num_ues. Counted at
+        # step ends, the arrivals of a step that are still there at its end are Poisson with mean
+        # num_ues x (1 - exp(-T_L / session)), the departure probability per step; with that the stationary mean is
+        # num_ues exactly. Absent: num_ues UEs at reset and arrival_rate x T_L arrivals per step (v1.1, mean ~100)
+        self.ue_stationary = bool(self.ue_dynamics.get('stationary', False))
         self.ue_max_initial_velocity = self.ue_dynamics.max_initial_velocity  # m/s
         self.max_ues = int(self.num_ues * self.ue_dynamics.max_ues_multiplier)  # Maximum UEs allowed
         self.change_direction_prob = self.ue_dynamics.change_direction_prob  # Probability of changing direction
@@ -630,9 +638,15 @@ class NetworkSlicingEnv:
         # A new city and a new wind every episode, from the seeded global RNG
         if self.city_params is not None:
             cp = self.city_params
-            self.city = City(self.service_area, cp['built_up_ratio'], cp['buildings_per_km2'], cp['height_scale'])
+            shift = None
+            if cp.get('random_offset', False):   # v2: the street grid sits differently in the area each episode
+                shift = np.random.uniform(0.0, 1.0, 2) * (1000.0 / np.sqrt(cp['buildings_per_km2']))
+            self.city = City(self.service_area, cp['built_up_ratio'], cp['buildings_per_km2'], cp['height_scale'],
+                             shift=shift)
         if self.wind_params is not None:
             self._draw_wind()
+        if self.return_home is not None and self.return_home.get('random_edge', False):
+            self._draw_home()
 
         # Initialize UAVs at random positions within service area
         self.uavs = {}
@@ -692,7 +706,8 @@ class NetworkSlicingEnv:
         self.ue_id_pool = set()
         self.next_ue_id = 0
 
-        for i in range(self.num_ues):
+        n_initial = np.random.poisson(self.num_ues) if self.ue_stationary else self.num_ues
+        for i in range(n_initial):
             self._add_new_ue()
         self._add_rsus()
 
@@ -1188,6 +1203,28 @@ class NetworkSlicingEnv:
             energy += power * height / rate
             duration += height / rate
         return energy, duration
+
+    def _draw_home(self):
+        """
+        v2 (return_home.random_edge): the Home Point uniform on the edge of the service area (where a response
+        team sets up its ground station), moved to the nearest street crossing when there is a city. The backhaul
+        gateway stands there, at its configured height
+        """
+        width, height = self.service_area
+        t = np.random.uniform(0.0, 2.0 * (width + height))
+        if t < width:
+            xy = np.array([t, 0.0])
+        elif t < width + height:
+            xy = np.array([width, t - width])
+        elif t < 2.0 * width + height:
+            xy = np.array([2.0 * width + height - t, height])
+        else:
+            xy = np.array([0.0, 2.0 * (width + height) - t])
+        if self.city is not None:
+            xy = np.clip(self.city.nearest_crossing(xy), 0.0, self.service_area)
+        self.home_position = np.array([xy[0], xy[1], 0.0], dtype=np.float64)
+        if self.backhaul is not None:
+            self.backhaul_gateway = np.array([xy[0], xy[1], self.backhaul_gateway[2]], dtype=np.float64)
 
     def charge_outbound_flight(self, uav):
         """Battery left after the flight from the Home Point to the UAV's position; call it after placing a UAV"""
@@ -1692,8 +1729,8 @@ class NetworkSlicingEnv:
                     # Turn into another street: a perpendicular one is entered at the nearest crossing
                     d = [np.array([1.0, 0.0]), np.array([-1.0, 0.0]), np.array([0.0, 1.0]), np.array([0.0, -1.0])][np.random.randint(4)]
                     if not any(np.allclose(d, a) for a in self._street_directions(ue.position[:2])):
-                        ue.position[:2] = np.clip(np.round(ue.position[:2] / self.city.pitch) * self.city.pitch,
-                                                  0.0, self.service_area)
+                        ue.position[:2] = np.clip(self.city.nearest_crossing(ue.position[:2]), 0.0,
+                                                  self.service_area)
                     ue.velocity[:2] = speed * d
             elif direction_changes[i]:
                 speed = np.linalg.norm(ue.velocity[:2])
@@ -1759,9 +1796,14 @@ class NetworkSlicingEnv:
         rp = self.rsu_params
         gx, gy = rp['block_size']
         width, height = self.service_area
-        # Road segments as (start, direction, length): north-south roads at x = gx/2 + k gx, east-west at y = ...
-        roads = [(np.array([x, 0.0]), np.array([0.0, 1.0]), height) for x in np.arange(gx / 2.0, width, gx)]
-        roads += [(np.array([0.0, y]), np.array([1.0, 0.0]), width) for y in np.arange(gy / 2.0, height, gy)]
+        # The first road of each direction: half a block in (v1.1), or anywhere within a block (v2 random_offset)
+        if rp.get('random_offset', False):
+            x0, y0 = np.random.uniform(0.0, gx), np.random.uniform(0.0, gy)
+        else:
+            x0, y0 = gx / 2.0, gy / 2.0
+        # Road segments as (start, direction, length): north-south roads at x = x0 + k gx, east-west at y = y0 + k gy
+        roads = [(np.array([x, 0.0]), np.array([0.0, 1.0]), height) for x in np.arange(x0, width, gx)]
+        roads += [(np.array([0.0, y]), np.array([1.0, 0.0]), width) for y in np.arange(y0, height, gy)]
         total = sum(length for _, _, length in roads)
         spacing = rp['spacing']
         targets = np.arange(spacing / 2.0, total, spacing)  # arc-length positions along the joined roads
@@ -1771,14 +1813,15 @@ class NetworkSlicingEnv:
             origin, direction, _ = roads[k]
             pos = np.array([*(origin + direction * (s - start_of[k])), rp['antenna_height']])
             if self.city is not None:
-                pos[:2] = np.clip(np.round(pos[:2] / self.city.pitch) * self.city.pitch, 0.0, self.service_area)
+                pos[:2] = np.clip(self.city.nearest_crossing(pos[:2]), 0.0, self.service_area)
             self._add_new_ue(slice_type='urllc', position=pos, fixed=True)
 
     def _handle_arrivals(self):
         """Separate function for handling arrivals (cleaner code)"""
         # RSUs are fixed infrastructure, outside the arriving and departing population
         active_ue_count = len([ue for ue in self.ues.values() if ue.is_active and not getattr(ue, 'fixed', False)])
-        expected_arrivals = self.ue_arrival_rate * self.T_L
+        expected_arrivals = (self.num_ues * self.ue_departure_rate if self.ue_stationary
+                             else self.ue_arrival_rate * self.T_L)
         num_arrivals = min(
             np.random.poisson(expected_arrivals),
             self.max_ues - active_ue_count
@@ -1895,8 +1938,7 @@ class NetworkSlicingEnv:
     def _street_directions(self, xy: np.ndarray) -> List[np.ndarray]:
         """Unit directions a pedestrian at xy can walk: along a north-south street +-y, along an east-west street
         +-x, all four at a crossing, none inside a footprint"""
-        local = xy - np.floor(xy / self.city.pitch) * self.city.pitch
-        in_street = (local < self.city.offset) | (local >= self.city.offset + self.city.width)
+        in_street = self.city.in_street(xy)
         directions = []
         if in_street[0]:  # x lies in a north-south street
             directions += [np.array([0.0, 1.0]), np.array([0.0, -1.0])]

@@ -323,3 +323,29 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
   - Plan ghi "trên bản đồ có điểm nóng lệch tâm"; bản kiểm dùng bản đồ thật của các episode validation, với S từ 2 đến 10.
   - Trọng số theo slice (mỗi slice nặng như nhau) không có trong plan.
 - **SUGGESTIONS:** baseline "đứng yên ở đỉnh k-means" của thí nghiệm tổng quát theo N (TIP 11) chính là `check_tip7.py` ở chế độ demand với hành động 0; nên đưa nó vào `eval_heuristics.py` ở TIP 8.
+
+### Vùng ngẫu nhiên theo episode, dân số dừng (2026-11-14, trước TIP 6)
+
+- **STATUS:** xong. Bạn hỏi map có phải chỉ một không: chiều cao nhà, bản đồ mật độ, gió và UE đã đổi theo episode, nhưng bố cục phố, vị trí RSU và Home Point cố định. Bạn đồng ý giữ 2 km × 2 km (10 UAV vẫn thưa hơn mạng macro UMa) và làm theo đề xuất.
+- **FILES CHANGED:**
+  - `city.py`: `shift` (dời lưới), `nearest_crossing`, `in_street`, `_building_at_grid`; LoS và `building_at` làm trên toạ độ lưới.
+  - `environment.py`:
+    - `city.random_offset`, `rsu.random_offset`, `return_home.random_edge` (`_draw_home`, gateway backhaul đi theo);
+    - `ue_dynamics.stationary`;
+    - bám phố của UE và RSU qua `City.nearest_crossing` / `in_street`.
+  - `config/environment/v2.yaml`: bật cả bốn khoá; bỏ nhãn tạm của 2 Mbps.
+- **TEST RESULTS:**
+  - **Lưới dời:**
+    - LoS numba và numpy khớp trên 100k đoạn (5 lưới dời);
+    - lưới dời cho đúng LoS và ô nhà của lưới gốc dịch tương ứng (60k đoạn, 0 lệch);
+    - trong nhà khi và chỉ khi không nằm trên phố (100k điểm).
+  - **Dân số dừng:** trung bình UE đến 90.0 (10 episode × 31 bước; mục tiêu 91), không còn trôi.
+  - **v1.1 không đổi.** TIP 1, 2, 4, 7 PASS trên v2 mới.
+  - **TIP 7 với RSU ngẫu nhiên:** điểm yếu URLLC ở S = 3 biến mất (k-means 0.380, tam giác 0.178; trước đó 0.179 và 0.380). Tam giác trước đây thắng vì tình cờ khớp lưới RSU cố định. Giờ k-means hơn ở mọi S: SLA trung bình 0.534 so với 0.459, coverage 0.640 so với 0.589.
+  - **Chẩn đoán cho TIP 6** (k-means đứng yên, chia slice đều, 3 ca × 60 bước):
+    - eMBB và mMTC trượt SLA gần như chỉ vì không được phủ (eMBB 12–53%, mMTC 27–68% số UE-bước, S = 10 → 2);
+    - chỉ URLLC trượt vì tốc độ, trễ, lỗi gói, chủ yếu khi S nhỏ;
+    - năng lực hiếm khi là ràng buộc với tải hiện tại.
+- **ISSUES:**
+  - Kết quả các TIP trước trên v2 đổi số vì vùng ngẫu nhiên (bảng trong các Completion Report là số lúc đó).
+  - Video nhiệm vụ thật chủ yếu là đường lên, env chỉ có đường xuống.
