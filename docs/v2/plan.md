@@ -263,3 +263,34 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
   - Quan sát chỉ thêm thời gian còn lại của ca; trạng thái của vị trí (đang phục vụ hay trống) đã thể hiện bằng công suất 0, như với `fleet`.
   - UAV về sớm hơn một bước so với ngưỡng năng lượng bay về, vì env kiểm mỗi bước 60 s còn M300 kiểm liên tục. Bản đầu về đúng ngưỡng, và 14–28 chặng về mỗi ca bị thiếu năng lượng.
 - **SUGGESTIONS:** TIP 5 có thể thêm sự kiện "trạm sạc hỏng" hoặc "thiếu pin" bằng cách đổi số trạm giữa ca: env đã đo được hậu quả (vị trí trống, bước chờ pin).
+
+### TIP 4b. Mô hình năng lượng theo M300 và ngưỡng thay ca sát thực tế (2026-11-13)
+
+- **STATUS:** xong. Bạn hỏi 17 phút giữa hai lần thay ca có ít quá không. Có hai nguyên nhân: mô hình năng lượng bi quan hơn M300 thật, và luật thay ca giữ dự phòng quá dày.
+- **FILES CHANGED:**
+  - `config/environment/v2.yaml`: `energy_models` hiệu chỉnh theo M300 ở 9 kg; `shift.relay_power_margin`, `shift.power_smoothing`; `stations_per_uav` 1.5.
+  - `environment.py`:
+    - `_step_energy_bound` (mức tối đa một bước có thể tiêu, chính xác thay cho `max_total_power × T_L`);
+    - `_leave_threshold` dùng nó;
+    - `_relay_threshold` dùng công suất gần đây của vị trí (trung bình mũ trong `shift_state['power']`) cộng 10%.
+- **TEST RESULTS:**
+  - **Năng lượng:** treo cộng radio tối đa 1189 W (trước 1500 W); pin đầy treo được 27.7 phút (trước 21.9).
+  - **Ngưỡng ở giữa vùng (theo phần pin):**
+
+    | Ngưỡng | Trước | Sau |
+    |---|---|---|
+    | Chặng về | — | 3.5% |
+    | Phải về | 11% | 7.5% |
+    | Gọi người thay | 41% | 23% |
+
+  - **`check_tip4.py` PASS:**
+    - Khoảng thay ca khi treo ở công suất tối đa từ khoảng 17 phút lên khoảng 26 phút (S = 3: 28 lần thay mỗi ca cho 3 vị trí).
+    - Với 1 BS60 mỗi vị trí, tỉ lệ vị trí trống từ 24% xuống 5%.
+  - **Quét trang bị:** 1.5 BS60 và 0.5 dự phòng mỗi vị trí cho 0% trống ở S = 3 và 10, nên mặc định đổi từ 2 xuống 1.5.
+  - **Kiểm khác:** v1.1 không đổi (`check_v11.py` 0 lệch). TIP 1, TIP 2 PASS với số cũ.
+- **ISSUES:**
+  - Hiệu chỉnh chỉ khớp ở 9 kg: ba mốc của DJI (55 phút không tải, 43 phút với H20T, 31 phút ở 9 kg) không khớp cùng lúc với mô hình treo của Zeng.
+  - Con số 31 phút là của bên thứ ba và được coi là thời gian treo; nếu DJI đo khi bay, công suất treo thật cao hơn.
+  - Không trừ thêm hệ số dung lượng thực tế: các ngưỡng đã giữ năng lượng cho chặng về, và gió được mô phỏng riêng.
+  - Công suất vượt dự báo chỉ làm người thay tới muộn, vì UAV cũ vẫn về ở ngưỡng an toàn, nên vị trí trống một lúc. Ở bộ kiểm (công suất không đổi) điều này không xảy ra.
+- **DEVIATIONS:** khối lượng trạm phát chưa có nguồn; giả định dùng hết tải 2.7 kg.

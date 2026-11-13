@@ -5,7 +5,7 @@ Whole shifts of config/environment/v2.yaml (240 steps), with the serving positio
 power and even slice shares, on validation seeds (100000+). Two set-ups, each with n_serving fixed:
   A  S = 3 with 6 BS60 and 3 spares: enough charged pairs and airframes, so relays should leave no position empty
   B  S = 10 with 3 BS60 for the team: the depot can't keep up, so airframes wait for a charged pair
-and, for the record, the v2 defaults (2 BS60 and 0.5 spare per serving position) and an under-equipped team
+and, for the record, the v2 defaults (1.5 BS60 and 0.5 spare per serving position) and an under-equipped team
 (1 BS60 per position), each at S = 3 and S = 10.
 
 Checked at every step: the episode ends with done exactly at step 240; no serving battery below 0 and no airframe

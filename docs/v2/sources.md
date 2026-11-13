@@ -40,7 +40,19 @@ Cách tính SLA mỗi UE (v2): biên nhỏ nhất theo log tự nhiên, `m = min
 | `shift.charge` | 20→90% trong 30 phút, đầy trong 60 phút (220 V) | DJI Store; Advexure | "approximately 60 minutes to fully charge two TB60"; 20–90% trong 30 phút; 110 V: 70 và 40 phút. Giả định "đầy" tính từ 0% | Như trên. B&H ghi "70 min (1 x TB60)" ở 110 V, mâu thuẫn với các nguồn khác |
 | Một cặp tại một thời điểm, cặp đầy nhất trước | Cơ chế của kho | Advexure; Heliguy, "How many batteries can the M300 Battery Station (BS60) charge at the same time?" | Sạc 2 TB60 cùng lúc; "selects the battery with the highest battery level to be recharged first" | Trang đại lý |
 | `shift.launch_soc` | 0.9 | Thiết kế | Hết đoạn sạc dòng không đổi (CC); đoạn 90–100% chậm gấp 5 lần | — |
-| `shift.stations_per_uav` | 2 BS60 mỗi vị trí | Thiết kế, đo bằng `docs/v2/check_tip4.py` | 1 trạm mỗi vị trí: vị trí trống khoảng 25% thời gian (S = 3 và 10); 1.5: 2–3%; 2: dưới 1% | — |
-| `shift.spares_per_uav` | 0.5 | Thiết kế, cùng script | Với 2 trạm mỗi vị trí: 0.25 dự phòng → trống 1%, 0.5 → 0.1% (S = 3), 0 (S = 10) | — |
+| `shift.stations_per_uav` | 1.5 BS60 mỗi vị trí | Thiết kế, đo bằng `docs/v2/check_tip4.py` (mô hình năng lượng TIP 4b) | 1 trạm mỗi vị trí: vị trí trống khoảng 5% thời gian (S = 3 và 10); 1.5 và 2: 0% | — |
+| `shift.spares_per_uav` | 0.5 | Thiết kế, cùng script | Với 1.5 trạm mỗi vị trí: 0.25 dự phòng → trống 1.9% (S = 3), 0 (S = 10); 0.5 → 0 | — |
+| `shift.relay_power_margin`, `shift.power_smoothing` | 0.1, 0.5 | Thiết kế | Ngưỡng gọi người thay dùng công suất gần đây (trung bình mũ) + 10%; ngưỡng phải về dùng mức tối đa một bước có thể tiêu (bay ngang nhanh nhất gió cho phép, radio tối đa, leo hết dải độ cao) | — |
 | `shift.n_serving` | 2–10 | Quyết định 2026-11-13 (`plan.md`) | Test thêm 11–12, rồi 13–15 nếu đạt | — |
-| `shift.duration_steps` | 240 (4 giờ) | Thiết kế | Đủ để mỗi vị trí được thay ca khoảng 14 lần và kho pin kịp hụt nếu thiếu trạm | — |
+| `shift.duration_steps` | 240 (4 giờ) | Thiết kế | Mỗi vị trí được thay ca khoảng 9 lần (treo ở công suất tối đa), kho pin kịp hụt nếu thiếu trạm | — |
+
+### TIP 4b. Mô hình năng lượng theo M300 (chỉ v2)
+
+| Tham số | Giá trị | Nguồn | Phần dùng | Trạng thái |
+|---|---|---|---|---|
+| `energy_models.uav_weight` | 88.26 N (9 kg) | DJI, trang hỗ trợ Matrice 300 RTK (specs) | Max Takeoff Weight 9 kg; tải tối đa 2.7 kg (Heliguy). Thiết kế: trạm phát dùng hết tải | Trang hỗ trợ |
+| `energy_models.rotor_disc_area` | 0.894 m² | DJI, specs M300 (cánh quạt 2110) | 4 cánh 21 inch; đường kính suy từ tên 2110, không thấy ghi trực tiếp | Suy luận |
+| `induced_power`, `mean_induced_velocity` | 616.35 W, 6.35 m/s | Zeng, Xu & Zhang, "Energy Minimization for Wireless Communication With Rotary-Wing UAV", IEEE TWC 18(4), 2019 (arXiv:1804.02238), Eq. 61 | Pi = (1 + k) W^1.5 / sqrt(2 rho A), v0 = sqrt(W / (2 rho A)), k = 0.1 (Table I) | Như v1.1 |
+| `blade_profile_power`, `rotor_tip_speed` | 444.30 W, 175.6 m/s | Hiệu chỉnh: treo hết pin 548 Wh trong 31 phút ở 9 kg (Heliguy, "DJI M300 RTK v DJI M200 Series"; bảng của Coptrz). Tốc độ đầu cánh suy từ P0 theo Eq. 61 | P0 + Pi = 1060.65 W. Coi 31 phút là thời gian treo | Nguồn bên thứ ba, không phải trang DJI. DJI ghi 55 phút không tải, 43 phút với H20T; ba mốc không khớp cùng lúc với mô hình treo của Zeng, nên chỉ khớp ở 9 kg |
+
+Kết quả: treo cộng radio tối đa 1189 W, hết pin trong 27.7 phút (Table I của Zeng: 1500 W, 21.9 phút). Bay ngang 17 m/s: 725 W; công suất nhỏ nhất ở khoảng 19 m/s, trên giới hạn tốc độ. v1.1 (`ma3.yaml`) giữ Table I.

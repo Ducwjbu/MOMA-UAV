@@ -420,6 +420,8 @@ class NetworkSlicingEnv:
             'station_count': getattr(shift, 'station_count', None),
             'pairs_per_station': int(getattr(shift, 'pairs_per_station', 4)),
             'charge': {k: float(v) for k, v in vars(getattr(shift, 'charge', NestedDict({}))).items()},
+            'relay_power_margin': float(getattr(shift, 'relay_power_margin', 0.1)),
+            'power_smoothing': float(getattr(shift, 'power_smoothing', 0.5)),
         }
         if self.shift is not None:
             if self.fleet is not None:
@@ -1201,18 +1203,29 @@ class NetworkSlicingEnv:
             return self._propulsion_power(0.0, 0.0)
         return self._propulsion_power(0.0, 0.0, float(np.linalg.norm(self._wind_at(height))))
 
-    def _leave_threshold(self, position: np.ndarray) -> float:
-        """Battery (J) at which a serving airframe leaves for the Home Point: the return leg plus one step at the
-        highest total power draw, so that the battery still covers the return after the next step (the check
-        runs once per step, the M300's Low Battery RTH continuously)"""
-        return self._home_leg(position, outbound=False)[0] + self.max_total_power * self.T_L
+    def _step_energy_bound(self) -> float:
+        """Most energy a serving airframe can draw in one step: the fastest level flight the wind allows (from
+        _init_energy_bounds) with the radio at full power, plus the climb over the whole height range or a step of
+        climbing, whichever is less. Exact, unlike max_total_power x T_L, which assumes a full step of climbing"""
+        level_and_radio = self.max_total_power - (self._propulsion_power(0.0, self.velocity_max_vertical)
+                                                  - self._propulsion_power(0.0, 0.0))
+        climb = min(self.velocity_max_vertical * self.T_L, self.uav_fly_range_h[1] - self.uav_fly_range_h[0])
+        return level_and_radio * self.T_L + self.energy_models['uav_weight'] * climb
 
-    def _relay_threshold(self, position: np.ndarray) -> float:
-        """Battery (J) at which a serving position calls its relay: the leave threshold plus the steps a spare
-        needs to fly out, and one more because the check runs once per step. Then the relay arrives before the
-        serving airframe has to leave, at any power"""
+    def _leave_threshold(self, position: np.ndarray) -> float:
+        """Battery (J) at which a serving airframe leaves for the Home Point: the return leg plus the most one
+        step can draw, so that the battery still covers the return after the next step whatever the policy does
+        (the check runs once per step, the M300's Low Battery RTH continuously)"""
+        return self._home_leg(position, outbound=False)[0] + self._step_energy_bound()
+
+    def _relay_threshold(self, position: np.ndarray, role: int) -> float:
+        """Battery (J) at which a serving position calls its relay: the leave threshold plus the energy of the
+        steps a spare needs to fly out, and of one more because the check runs once per step, at the position's
+        recent power draw plus relay_power_margin. A draw above that only makes the relay late: the airframe
+        then leaves at the leave threshold and the position is empty until the relay arrives"""
         steps_out = max(1, int(np.ceil(self._home_leg(position, outbound=True)[1] / self.T_L - 1e-9)))
-        return self._leave_threshold(position) + self.max_total_power * self.T_L * (steps_out + 1)
+        power = self.shift_state['power'][role] * (1.0 + self.shift['relay_power_margin'])
+        return self._leave_threshold(position) + power * self.T_L * (steps_out + 1)
 
     def _start_shift(self):
         """
@@ -1229,6 +1242,9 @@ class NetworkSlicingEnv:
         roles = sorted(np.random.choice(ids, S, replace=False).tolist())
         phases = (np.random.permutation(S) + np.random.uniform(size=S)) / S
         airframes = []
+        # Recent power draw per position (exponential average, see _shift_update); hover at full radio to start
+        self.shift_state = {'power': {r: self._hover_power(self.uavs[r].position[2])
+                                      + self._radio_power(self.uavs[r].max_power) for r in roles}}
         for uid in ids:
             uav = self.uavs[uid]
             if uid not in roles:
@@ -1237,7 +1253,7 @@ class NetworkSlicingEnv:
                 continue
             uav.active = True
             top = uav.battery_capacity - self._home_leg(uav.position, outbound=True)[0]
-            low = min(self._relay_threshold(uav.position), top)
+            low = min(self._relay_threshold(uav.position, uid), top)
             uav.current_battery = low + (top - low) * phases[roles.index(uid)]
             airframes.append({'id': len(airframes), 'state': 'serving', 'role': uid, 'battery': 0.0,
                               'timer': 0, 'swaps': 0})
@@ -1246,13 +1262,13 @@ class NetworkSlicingEnv:
                               'battery': float(self.uav_params.battery_capacity), 'timer': 0, 'swaps': 0})
         n_stations = int(sh['station_count']) if sh['station_count'] is not None else \
             int(np.ceil(sh['stations_per_uav'] * S - 1e-9))
-        self.shift_state = {
+        self.shift_state.update({
             'step': 0, 'S': S, 'roles': roles, 'airframes': airframes, 'n_stations': n_stations,
             'pool': [1.0] * (n_stations * sh['pairs_per_station']),
             'inbound': {},      # role -> airframe id flying out to it
             'vacancy': {},      # role -> position it was left at, while nobody serves it
             'relays': 0, 'gaps': 0, 'battery_short': 0,
-        }
+        })
 
     def _charge_soc(self, soc: float, minutes: float) -> float:
         """State of charge after charging for some minutes on the CC-CV curve of shift.charge"""
@@ -1300,6 +1316,11 @@ class NetworkSlicingEnv:
         cap = float(self.uav_params.battery_capacity)
         n_serving_step = sum(self.uavs[r].active for r in st['roles'])
         st['step'] += 1
+        a_pow = self.shift['power_smoothing']
+        for r in st['roles']:   # Recent power draw of each serving position, for its relay threshold
+            if self.uavs[r].active:
+                drawn = sum(self.uavs[r].energy_used.values()) / self.T_L
+                st['power'][r] = (1.0 - a_pow) * st['power'][r] + a_pow * drawn
         transit_energy, relays = 0.0, 0
         frames = st['airframes']
 
@@ -1356,7 +1377,7 @@ class NetworkSlicingEnv:
         for role in sorted(st['vacancy']):
             if role not in st['inbound']:
                 transit_energy += self._dispatch(role, st['vacancy'][role])
-        due = [(self.uavs[r].current_battery - self._relay_threshold(self.uavs[r].position), r)
+        due = [(self.uavs[r].current_battery - self._relay_threshold(self.uavs[r].position, r), r)
                for r in st['roles'] if self.uavs[r].active and r not in st['inbound']]
         for margin, role in sorted(due):
             if margin <= 0:

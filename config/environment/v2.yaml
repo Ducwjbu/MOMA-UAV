@@ -137,7 +137,7 @@ qos_weights:
 # UAV constraints and capabilities
 uav_params:
     max_power: 6.3 # Watts (38 dBm, Medium Range BS of 3GPP TS 38.104; EARTH micro BS), shared across the allocated RBs
-    battery_capacity: 1972800.0 # Joules (548 Wh: two DJI TB60 of the Matrice 300 RTK, about 22 min at hover + radio)
+    battery_capacity: 1972800.0 # Joules (548 Wh: two DJI TB60 of the Matrice 300 RTK, about 28 min at hover + full radio with the v2 fit below)
     velocity_max: 17.0 # m/s maximum horizontal speed (DJI Matrice 300 RTK, P-mode)
     velocity_max_vertical: 5.0 # m/s maximum climb rate (DJI Matrice 300 RTK, P-mode)
     velocity_max_descent: 4.0 # m/s maximum descent rate (same)
@@ -258,17 +258,23 @@ reward_weights:
 
 # Energy consumption models
 energy_models:
-    # Rotary-wing propulsion power (Zeng, Xu & Zhang 2019, Eq. 6), Table I of arXiv:1804.02238:
-    # W = 100 N, R = 0.5 m, Omega = 400 rad/s, delta = 0.012, k = 0.1. P0 and Pi follow from Eq. 61
-    blade_profile_power: 580.65 # W, P0
-    induced_power: 790.67 # W, Pi
-    rotor_tip_speed: 200.0 # m/s
-    mean_induced_velocity: 7.2 # m/s, hover
+    # Rotary-wing propulsion power (Zeng, Xu & Zhang 2019, Eq. 6 and 61, arXiv:1804.02238), v2: fitted to the DJI
+    # Matrice 300 RTK at its maximum takeoff weight, the base-station payload taken to fill the 2.7 kg payload limit
+    # (design). W = 9 kg (MTOW, DJI support page) x g = 88.26 N; A = 4 rotors of 21 in (the 2110 propellers;
+    # diameter read from the name) = 0.894 m^2; k = 0.1, delta = 0.012, s = 0.05, d0 = 0.3, rho as Table I.
+    # Pi = (1 + k) W^1.5 / sqrt(2 rho A) = 616.35 W, v0 = sqrt(W / (2 rho A)) = 6.35 m/s (momentum theory).
+    # P0 is fitted so that the 548 Wh battery lasts 31 min at hover (M300 at 9 kg: Heliguy, Coptrz; DJI's own
+    # page gives 55 min without payload): P0 + Pi = 1060.65 W, P0 = 444.30 W, i.e. a tip speed of 175.6 m/s in
+    # Eq. 61. The 31 min are taken as a hover figure. v1.1 (ma3.yaml) keeps Table I (W = 100 N, hover 1.37 kW)
+    blade_profile_power: 444.30 # W, P0
+    induced_power: 616.35 # W, Pi
+    rotor_tip_speed: 175.6 # m/s
+    mean_induced_velocity: 6.35 # m/s, hover
     fuselage_drag_ratio: 0.3
     air_density: 1.225 # kg/m^3
     rotor_solidity: 0.05
-    rotor_disc_area: 0.79 # m^2
-    uav_weight: 100.0 # N, sets the climb power W * v_z
+    rotor_disc_area: 0.894 # m^2
+    uav_weight: 88.26 # N, sets the climb power W * v_z
     # Radio: EARTH D2.3 micro BS (Eq. 4-3, Table 8), N_TRX = 2, P0 = 56 W, dp = 2.6, load shared by the TRXs
     radio_static_power: 112.0 # W, N_TRX * P0
     radio_power_slope: 2.6 # dp
@@ -362,15 +368,17 @@ action:
 shift:
     duration_steps: 240        # 4 h at T_L = 60 s; terminal at the end
     n_serving: [2, 10]         # serving positions per shift, uniform (docs/v2/plan.md, decided 2026-11-13)
-    spares_per_uav: 0.5        # spare airframes = ceil(0.5 S): design, sized with docs/v2/check_tip4.py (with 2
-                               # BS60 per position, 0.5 leaves a position empty 0.1% of the time at S = 3, 0 at
-                               # S = 10; 0.25 leaves 1.0% and 0.9%)
+    spares_per_uav: 0.5        # spare airframes = ceil(0.5 S): design, sized with docs/v2/check_tip4.py (with 1.5
+                               # BS60 per position: 0.25 leaves a position empty 1.9% of the time at S = 3, 0.5 never)
     swap_steps: 1              # hot swap of the TB60 pair in 60 s: Lee, Zhou & Lin, ICUAS 2015, pp. 118-124
                                # (cited by Galkin & DaSilva, arXiv:1807.00996, Sec. V)
     launch_soc: 0.9            # an airframe takes off with a pair at least this full (end of the fast CC phase): design
-    stations_per_uav: 2.0      # BS60 stations = ceil(2.0 S); station_count: K fixes the number instead. Design, a
+    relay_power_margin: 0.1    # relay call: the position's recent power draw + 10% over the steps a spare needs to
+                               # fly out (design); the leave threshold uses the most one step can draw instead
+    power_smoothing: 0.5       # weight of the last step in the recent power draw (exponential average): design
+    stations_per_uav: 1.5      # BS60 stations = ceil(1.5 S); station_count: K fixes the number instead. Design, a
                                # well-equipped team: with 1 per position the depot can't keep up and a position is
-                               # empty about 25% of the time (S = 3 and 10), with 2 almost never (check_tip4.py)
+                               # empty about 5% of the time (S = 3 and 10), with 1.5 never (check_tip4.py)
     pairs_per_station: 4       # BS60 holds 8 TB60 (DJI Store, Advexure); full at the start of the shift
     charge:                    # BS60 on 220 V (DJI Store, Advexure): two TB60 (one pair) at a time, fullest first
         soc_low: 0.2           #   (Heliguy); 20% -> 90% in 30 min, full in 60 min, "full" assumed from empty
