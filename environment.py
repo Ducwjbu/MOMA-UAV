@@ -531,6 +531,9 @@ class NetworkSlicingEnv:
         # num_ues x (1 - exp(-T_L / session)), the departure probability per step; with that the stationary mean is
         # num_ues exactly. Absent: num_ues UEs at reset and arrival_rate x T_L arrivals per step (v1.1, mean ~100)
         self.ue_stationary = bool(self.ue_dynamics.get('stationary', False))
+        # v2 (TIP 6): each eMBB UE carries streams_per_ue co-located video streams (demand and required rate scale;
+        # it counts once in the slice's SLA share, like every eMBB UE). Absent: 1
+        self.embb_streams = float(env_config.traffic_patterns.embb.get('streams_per_ue', 1))
         self.ue_max_initial_velocity = self.ue_dynamics.max_initial_velocity  # m/s
         self.max_ues = int(self.num_ues * self.ue_dynamics.max_ues_multiplier)  # Maximum UEs allowed
         self.change_direction_prob = self.ue_dynamics.change_direction_prob  # Probability of changing direction
@@ -1777,6 +1780,9 @@ class NetworkSlicingEnv:
             ue.packet_bytes = self.packet_bytes[ue.slice_type]
             if ue.slice_type == 'embb':
                 ue.demand_bps = tp.embb.peak_rate if np.random.random() < tp.embb.activity_factor else 0.0
+                if self.embb_streams != 1:   # v2 (TIP 6): one simulated UE carries several co-located streams
+                    ue.streams = self.embb_streams
+                    ue.demand_bps *= self.embb_streams
             elif ue.slice_type == 'urllc':
                 ue.demand_bps = tp.urllc.rate
             else:
@@ -3413,6 +3419,13 @@ class NetworkSlicingEnv:
 
         return qos_reward, breakdown
 
+    def _required_rate(self, ue) -> float:
+        """The rate a UE's SLA asks for: the slice's min_rate per stream, times the streams it carries (v2 TIP 6,
+        traffic_patterns.embb.streams_per_ue; 1 otherwise)"""
+        rate = self.qos_profiles[ue.slice_type].min_rate
+        streams = getattr(ue, 'streams', 1)
+        return rate if streams == 1 else rate * streams
+
     def _sla_margin(self, ue, throughput_bps: float, delay_ms: float) -> float:
         """Smallest KPI margin of a UE with demand, in natural log units (>= 0: its SLA holds): log(rate / required
         rate), log(delay budget / delay), log(failure budget / failure rate). -inf without RBs (not served);
@@ -3423,7 +3436,7 @@ class NetworkSlicingEnv:
         tiny = 1e-300
         margins = [np.log(prof.max_latency / max(delay_ms, tiny))]
         if prof.min_rate > 0:
-            margins.append(np.log(max(throughput_bps, tiny) / prof.min_rate))
+            margins.append(np.log(max(throughput_bps, tiny) / self._required_rate(ue)))
         margins.append(np.log((1.0 - prof.min_reliability) / max(ue.failure_rate, tiny)))
         return float(min(margins))
 
@@ -3447,7 +3460,7 @@ class NetworkSlicingEnv:
         
         # Normalize by minimum required rate. mMTC reports (tens of bytes every hour or so) need no rate:
         # its throughput term is whether the device is served at all
-        min_rate = self.qos_profiles[ue.slice_type].min_rate
+        min_rate = self._required_rate(ue)
         satisfaction = 1.0 if min_rate <= 0 else min(ue_throughput / min_rate, 1.0)
 
         ue.throughput_satisfaction = satisfaction
@@ -3669,7 +3682,7 @@ class NetworkSlicingEnv:
                 # load as its demand. Allocating more than the demand does not make the user any happier
                 throughputs.append(min(ue_throughput / ue.demand_bps, 1.0))
             else:
-                throughputs.append(ue_throughput / min_rates[ue.slice_type])
+                throughputs.append(ue_throughput / (min_rates[ue.slice_type] * getattr(ue, 'streams', 1)))
         
         if not throughputs:
             return 0.0
@@ -3771,7 +3784,7 @@ class NetworkSlicingEnv:
                 continue
             ue_throughput = self._get_cached_throughput(ue)
 
-            min_rate = self.qos_profiles[ue.slice_type].min_rate
+            min_rate = self._required_rate(ue)
             satisfaction = min(ue_throughput / min_rate, 1.0) if min_rate > 0 else 1.0
             
             ue_info[ue.id] = (ue_throughput, min_rate, satisfaction)

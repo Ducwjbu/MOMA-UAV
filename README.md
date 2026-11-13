@@ -237,6 +237,7 @@ Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt
 | `action.mode: slice_share` | config môi trường (v2) | Hành động 7 chiều: di chuyển, công suất, tỉ lệ RB mỗi slice; bộ lập lịch trong bước (TIP 2) |
 | `shift` | config môi trường (v2) | Ca trực 240 bước kết thúc thật; mỗi ca rút 2–10 vị trí phục vụ; UAV dự phòng bay ra thay ca, UAV về đổi pin, trạm BS60 sạc theo đúng thời gian của DJI (TIP 4, kiểm bằng `py docs/v2/check_tip4.py`) |
 | `city.random_offset`, `rsu.random_offset`, `return_home.random_edge` | config môi trường (v2) | Lưới phố, lưới RSU và Home Point/gateway đổi theo episode |
+| `traffic_patterns.embb.streams_per_ue` | config môi trường (v2) | Số luồng video trung bình mỗi UE eMBB (tải và tốc độ yêu cầu nhân theo); 2.6 hiệu chỉnh bằng `py docs/v2/check_tip6.py calibrate` (TIP 6) |
 | `ue_dynamics.stationary` | config môi trường (v2) | Số UE bắt đầu và giữ ở trạng thái dừng (trung bình đúng `num_ues`) |
 | `prior_mode` | config train | `ngon` (đa giác đều bán kính `prior_radius`, như v1.1) hoặc `demand`: đỉnh của prior là k-means của nhu cầu dự kiến trong episode, cho đúng số UAV đang phục vụ (TIP 7, kiểm bằng `py docs/v2/check_tip7.py`) |
 | `omega_per_agent` | config train (3 UAV) | Tỉ lệ episode mà mỗi UAV có omega riêng; critic nhận omega của mọi UAV |

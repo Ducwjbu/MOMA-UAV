@@ -188,6 +188,9 @@ traffic_patterns:
         packet_size: 1500 # bytes
         peak_rate: 2e6 # v2 (TIP 1): the video rate of qos_profiles.embb, streamed all the time. Mission-critical video
         activity_factor: 1.0 # needs 150 kbps - 5 Mbps (Ericsson, arXiv:2103.02434); NIST PSCR uses 1.5 Mb/s standard video
+        streams_per_ue: 2.6 # v2 (TIP 6): mean co-located video streams per simulated eMBB UE (a team's cameras): the
+                            # largest value on a 0.1 grid for which 6 serving UAVs (k-means prior, even shares) still
+                            # meet the SLA of 80% of covered eMBB UEs (docs/v2/check_tip6.py calibrate). Design
     urllc:
         packet_size: 256 # TS 22.261 allows small (<= 256 B) to big; small chosen
         rate: 10e6 # Note 4 of the table: every application needs the experienced rate

@@ -67,7 +67,7 @@ def run(sharpness, n_ep=5, seed_base=100000, kpi_log=None):
                     if not ue.assigned_rb:
                         kpi_log.append((ue.slice_type, "not served"))
                         continue
-                    if p.min_rate > 0 and ue.throughput < p.min_rate * (1 - 1e-9):
+                    if p.min_rate > 0 and ue.throughput < env._required_rate(ue) * (1 - 1e-9):
                         kpi_log.append((ue.slice_type, "rate"))
                     if ue.latency_ms > p.max_latency * (1 + 1e-9):
                         kpi_log.append((ue.slice_type, "delay"))

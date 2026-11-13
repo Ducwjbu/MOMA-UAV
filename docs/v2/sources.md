@@ -75,3 +75,10 @@ Kết quả: treo cộng radio tối đa 1189 W, hết pin trong 27.7 phút (Tab
 | `return_home.random_edge` | Home Point và gateway đều trên mép vùng, ở ngã tư gần nhất | Thiết kế | Đội cứu hộ dựng trạm mặt đất ở chỗ tiện, không cố định | — |
 | `ue_dynamics.stationary` | Poisson(91) UE đến lúc reset; số đến mỗi bước Poisson(91 × xác suất rời) | Hàng đợi M/M/∞: dân số dừng là Poisson với trung bình λ/μ (vd. L. Kleinrock, Queueing Systems Vol. 1, Wiley 1975, Sec. 3.4) | Đếm ở cuối bước, các UE đến trong bước còn ở lại tới cuối bước là Poisson(λ (1 − e^{−μT}) / μ) = 91 × xác suất rời; trung bình dừng đúng 91. v1.1: 91 lúc đầu, trôi lên khoảng 100 | Sửa hạn chế 12 |
 | `traffic_patterns.embb.peak_rate` | 2 Mbps (bỏ nhãn tạm) | Ericsson, "5G NR for public safety", arXiv:2103.02434: video nhiệm vụ 150 kbps – 5 Mbps tuỳ chất lượng; NIST PSCR, "Evaluating multicast capability in LTE public safety networks": "Standard Video 1.5 Mb/s" | Trong khoảng của các nguồn | Đọc qua kết quả tìm kiếm, chưa đọc bản đầy đủ. Video nhiệm vụ thật chủ yếu là đường lên; env mô phỏng đường xuống |
+
+## TIP 6. Hiệu chỉnh tải
+
+| Tham số | Giá trị | Nguồn | Phần dùng | Trạng thái |
+|---|---|---|---|---|
+| `traffic_patterns.embb.streams_per_ue` | 2.6 | Thiết kế, `docs/v2/check_tip6.py calibrate` | Số luồng video trung bình mỗi UE eMBB mô phỏng (camera của một đội cứu hộ, cùng chỗ). Giá trị lớn nhất trên lưới 0.1 mà đội tham chiếu 6 UAV (prior k-means, chia slice đều) vẫn đạt SLA cho ít nhất 80% UE eMBB đã được phủ (mức 0.8–0.9 của plan). Không có nguồn cho số lực lượng cứu hộ trên mỗi km²; kịch bản cháy lớn có 29–65 xe (Urgent Communications, "Cell-sector capacity is the key to public safety broadband") | — |
+| Đội tham chiếu | S = 6 | Thiết kế | Giữa dải train 2–10 | — |

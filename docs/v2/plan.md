@@ -349,3 +349,49 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
 - **ISSUES:**
   - Kết quả các TIP trước trên v2 đổi số vì vùng ngẫu nhiên (bảng trong các Completion Report là số lúc đó).
   - Video nhiệm vụ thật chủ yếu là đường lên, env chỉ có đường xuống.
+
+### TIP 6. Hiệu chỉnh tải (2026-11-14)
+
+- **STATUS:** xong một phần.
+  - Dân số dừng: xong (commit trước).
+  - Hiệu chỉnh tải: xong, nhưng kiểm (c) trượt sát nút (xem TEST RESULTS).
+  - Bạn chọn phương án B: tăng tải eMBB để năng lực thật sự là ràng buộc ở đội cỡ giữa.
+- **FILES CHANGED:**
+  - `environment.py`:
+    - `traffic_patterns.embb.streams_per_ue` (`self.embb_streams`, `ue.streams`): tải và tốc độ yêu cầu nhân theo;
+    - `_required_rate` dùng cho SLA, độ thoả mãn tốc độ và fairness `min_rate`.
+  - `config/environment/v2.yaml`: `streams_per_ue: 2.6`.
+  - Mới: `docs/v2/check_tip6.py` (`calibrate`, `check`).
+  - `docs/v2/check_tip1.py`: KPI tốc độ theo `_required_rate`.
+- **TEST RESULTS:**
+  - **Bản đầu (tải bằng năng lực của 6 UAV, như cách v1.1 làm cho 3 UAV):** 17 luồng mỗi UE. Bản này PASS bộ tiêu chí lúc đó nhưng không dùng được: SLA eMBB chỉ 0.07 ở S = 6 và 0.17 ở S = 10 (năng lực dư gần gấp đôi). Tải dồn vào từng UE (34 Mbps mỗi UE), UE ở rìa ô không nhận đủ dù chia slice thế nào. Năng lực tính theo tốc độ trung bình mỗi RB bỏ qua chỗ tải nằm.
+  - **Quét lại** theo mức 0.8 của plan (covered = trong các UE eMBB đã được phủ):
+
+    | w | 1.0 | 2.0 | 2.5 | 2.6 | 2.7 | 3.0 |
+    |---|---|---|---|---|---|---|
+    | Đạt SLA (covered) | 0.993 | 0.899 | 0.816 | 0.801 | 0.785 | 0.722 |
+    | Trượt vì tốc độ (covered) | 0.003 | 0.054 | 0.094 | 0.100 | 0.107 | 0.132 |
+
+    Chọn 2.6.
+  - **`check_tip6.py check` với 2.6:**
+
+    | S | Năng lực Mbps | Tải Mbps | eMBB covered đạt / trượt vì tốc độ | SLA eMBB / URLLC / mMTC |
+    |---|---|---|---|---|
+    | 2 | 352 | 400 | 0.247 / 0.425 | 0.129 / 0.031 / 0.344 |
+    | 4 | 856 | 414 | 0.583 / 0.212 | 0.430 / 0.840 / 0.510 |
+    | 6 | 1335 | 417 | 0.801 / 0.100 | 0.610 / 0.582 / 0.595 |
+    | 8 | 1615 | 413 | 0.776 / 0.099 | 0.674 / 0.797 / 0.705 |
+    | 10 | 2205 | 403 | 0.955 / 0.028 | 0.875 / 0.951 / 0.727 |
+
+    - (a) dân số 90.2: ok.
+    - (b) 0.801 nằm trong [0.80, 0.90]: ok.
+    - (d) chia slice có tác dụng: (0.6, 0.2, 0.2) cho eMBB 0.680, URLLC 0.536; (0.2, 0.6, 0.2) cho eMBB 0.525, URLLC 0.790: ok.
+    - **(c) FAIL sát nút:** 246/2468 = 0.0997 < 0.10. Hai tiêu chí đặt trước (b ≥ 0.80 và c ≥ 0.10) không cùng thoả trên lưới 0.1 (2.7 cho c 0.107 nhưng b 0.785). Không đổi ngưỡng sau khi thấy số; chờ bạn quyết.
+  - **Kiểm khác:** v1.1 không đổi; TIP 1, 2, 4, 7 chạy lại trên v2 mới (xem commit).
+- **ISSUES:**
+  - Mức tải là thiết kế (không có nguồn cho số đội cứu hộ trên mỗi km²).
+  - S = 8 có tỉ lệ đạt (0.776) thấp hơn S = 6 (0.801): k-means đặt UAV theo cả ba slice, và 3 episode là mẫu nhỏ.
+  - Tỉ số tải / năng lực ở S = 6 chỉ 0.31: năng lực trung bình không phải thước đo đúng, ràng buộc nằm ở UE sóng yếu.
+- **DEVIATIONS:**
+  - Plan ghi "UE có trọng số (tải và đếm SLA nhân w)". Bản cài nhân tải và tốc độ yêu cầu; mỗi UE vẫn đếm một lần trong tỉ lệ SLA của slice, vì mọi UE eMBB cùng w nên trung bình không đổi.
+  - Ngưỡng hiệu chỉnh lúc đầu là 0.75 (lệch plan), sửa về 0.80 của plan.
