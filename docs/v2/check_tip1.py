@@ -3,7 +3,8 @@ check_tip1.py (TIP 1 of docs/v2/plan.md)
 ========================================
 1. With sla_sharpness very large, each sla_<slice> objective of the reward vector must equal the binary share of the
    slice's UEs meeting their SLA (info['sla_<slice>']; a slice without demand counts 1 in the objective, nan in info)
-   at every step. Run on 5 validation episodes (100000+) of config/environment/v2.yaml with random actions.
+   at every step. Run on 5 validation episodes (100000+) of config/environment/v2.yaml (3 UAVs, without the shift
+   section of TIP 4) with random actions.
 2. At the default sharpness, prints the mean objective next to the mean binary share, and the share of UE-steps in
    each slice that fail on each KPI (rate, delay, reliability), to see where the v2 thresholds bind.
 
@@ -24,9 +25,23 @@ CONFIG = "config/environment/v2.yaml"
 SLICES = ("embb", "urllc", "mmtc")
 
 
+def v2_config():
+    """v2.yaml as it was at TIP 1: 3 UAVs, one sortie (no shift section)"""
+    import tempfile
+    import yaml
+    with open(CONFIG, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    cfg.pop("shift", None)
+    cfg["system"]["num_uavs"] = 3
+    path = os.path.join(tempfile.mkdtemp(prefix="check_tip1_"), "v2_tip1.yaml")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+    return path
+
+
 def run(sharpness, n_ep=5, seed_base=100000, kpi_log=None):
     with contextlib.redirect_stdout(io.StringIO()):
-        env = NetworkSlicingEnv(config_path=CONFIG)
+        env = NetworkSlicingEnv(config_path=v2_config())
     if sharpness is not None:
         env.sla_sharpness = sharpness
     names = env.objective_names

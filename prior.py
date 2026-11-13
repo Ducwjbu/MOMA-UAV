@@ -48,10 +48,12 @@ def move_to(env, position: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 
 def assign_vertices(env, uav_ids, radius: float) -> dict:
-    """With a fleet section (active UAVs change): the regular n-gon of the n active UAVs, each vertex given to
-    one of them so that the total distance is smallest (Hungarian algorithm, scipy linear_sum_assignment)"""
+    """With a fleet or shift section (active UAVs change): the regular n-gon of the n active UAVs, each vertex
+    given to one of them so that the total distance is smallest (Hungarian algorithm, scipy linear_sum_assignment)"""
     from scipy.optimize import linear_sum_assignment
     active = [uid for uid in uav_ids if env.uavs[uid].active]
+    if not active:
+        return {}
     vertices = formation_vertices(env, radius, len(active))
     positions = np.array([env.uavs[uid].position for uid in active])
     cost = np.linalg.norm(positions[:, None, :2] - vertices[None, :, :2], axis=2)
@@ -62,15 +64,16 @@ def assign_vertices(env, uav_ids, radius: float) -> dict:
 def attach(env, uav_ids, radius: float) -> np.ndarray:
     """Make env.step add the prior to the movement of every UAV; returns the vertices.
 
-    Without a fleet section UAV i takes vertex i of the N-gon, for the whole run. With one, the n-gon of the
-    active UAVs is reassigned whenever the active set changes (a reset, a withdrawal)."""
+    Without a fleet or shift section UAV i takes vertex i of the N-gon, for the whole run. With one, the n-gon of
+    the active UAVs is reassigned whenever the active set changes (a reset, a withdrawal, a position left empty
+    or filled again in a shift)."""
     vertices = formation_vertices(env, radius, len(uav_ids))
     fixed = {uid: vertices[i] for i, uid in enumerate(uav_ids)}
     cache = {"active": None, "targets": fixed}
     inner_step = env.step
 
     def targets():
-        if getattr(env, "fleet", None) is None:
+        if getattr(env, "fleet", None) is None and getattr(env, "shift", None) is None:
             return fixed
         active = tuple(uid for uid in uav_ids if env.uavs[uid].active)
         if active != cache["active"] or env.current_time == 0.0:   # Reassign at every reset too

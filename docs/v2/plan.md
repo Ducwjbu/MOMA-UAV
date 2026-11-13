@@ -74,10 +74,33 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
 - **Task:** khoá `substeps: 6` (10 s): UAV đi theo đoạn thẳng của bước; ở mỗi bước con tính LoS, association, SINR, rate, queue; KPI của bước là trung bình các bước con. Handover đếm ở bước con. Năng lượng không đổi (Zeng đã tính theo quãng bay).
 - **Đạt khi:** với UAV đứng yên, kết quả trùng `substeps: 1`; thời gian chạy env được đo và ghi lại; trình xem hiện các bước con là khung thật.
 
-### TIP 4. Ca trực và đổi pin
+### TIP 4. Ca trực, thay ca bằng UAV dự phòng, trạm sạc
 
-- **Task:** khoá `shift`: một episode là một ca (ví dụ 4 giờ = 240 bước). UAV quay về Home Point khi chạm năng lượng quay về (đã có), đổi pin mất `swap_steps` bước (nguồn: thời gian đổi TB60 của DJI M300), rồi bay ra lại. Dùng cơ chế `fleet` để đánh dấu UAV không hoạt động: UAV đang bay về, đổi pin hoặc bay ra không phục vụ. Số UAV của đội rút mỗi ca trong 2–10 (`fleet`, mạng MLP dùng 10 khe có che). Policy không quyết định lúc đổi pin (theo luật Low Battery RTH). Kết thúc ca là terminal; quan sát thêm thời gian còn lại của ca và trạng thái UAV. Mức pin lúc bắt đầu ca so le để các UAV không cùng về một lúc. Giả định trạm mặt đất luôn có pin đã sạc; số trạm cần tăng theo N (khoảng 1 cặp TB60 mỗi UAV mỗi 25 phút, một BS60 sạc khoảng 1 cặp mỗi giờ), ghi rõ trong báo cáo. Độ dài ca mặc định 4 giờ (240 bước).
-- **Đạt khi:** trong một ca, mỗi UAV có ít nhất một lần đổi pin; số UAV hoạt động khớp log; năng lượng có hậu quả (thời gian không phục vụ).
+Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (240 bước) của một chiến dịch đang chạy.
+
+- **Vị trí phục vụ và thân máy tách nhau.** `num_uavs` là số vị trí phục vụ tối đa (10). Mỗi vị trí là một khe của quan sát và hành động, như hiện nay. Mỗi ca rút S trong `n_serving` (2–10) vị trí được dùng, chọn ngẫu nhiên trong các khe. Đội có S + ceil(`spares_per_uav` × S) thân máy. Policy điều khiển vị trí phục vụ; thân máy đang bay ra, bay về, đổi pin hay chờ ở mặt đất thì env tự điều khiển và không phục vụ.
+- **Thay ca (relay).**
+  - Khi pin của vị trí i còn bằng năng lượng bay về cộng năng lượng chờ người thay bay tới (công suất tối đa × (thời gian bay ra + 1 bước)), env phái một thân máy dự phòng sẵn sàng bay tới vị trí đó.
+  - Người thay tới nơi thì nhận vị trí: vị trí giữ nguyên chỗ đứng, pin bằng pin của người thay. Thân máy cũ bay về Home Point.
+  - Không có dự phòng sẵn sàng, hoặc người thay chưa tới khi pin chạm mức bay về, thì thân máy cũ vẫn về (Low Battery RTH). Vị trí bị bỏ trống (gap) cho tới khi có thân máy tới.
+  - Thời gian và năng lượng của chặng bay ra, bay về tính bằng `_home_leg_energy` (gió, airspeed). Chặng bay ra tính tới chỗ của vị trí lúc phái đi.
+- **Đổi pin.** Thân máy về tới nơi, đổi pin nóng mất `swap_steps` = 1 bước (60 s, Lee et al. 2015). Cặp pin cũ vào kho; thân máy lấy cặp đầy nhất nếu cặp đó đạt `launch_soc` (0.9), nếu không thì chờ.
+- **Trạm sạc (BS60, 220 V).**
+  - Kho chung có `pairs_per_station` = 4 cặp mỗi trạm, đầy lúc đầu ca.
+  - Mỗi trạm sạc một cặp tại một thời điểm, cặp còn nhiều pin nhất trước.
+  - Đường sạc CC–CV khớp số của DJI: 20→90% trong 30 phút, đầy trong 60 phút. Giả định "đầy" tính từ 0%: 2.33%/phút tới 90%, rồi 0.47%/phút tới 100%.
+  - Số trạm: `stations_per_uav` × S (làm tròn lên) hoặc `station_count` cố định. Điện không giới hạn.
+- **Đầu ca.** Pin của S vị trí so le đều trong khoảng dùng được (pha (k + U)/S), như một chiến dịch đang chạy. Dự phòng ở mặt đất, pin đầy.
+- **Kết thúc ca là terminal** (`done` ở bước 240). Luật kết thúc khi một UAV chạm năng lượng bay về của `return_home` không áp dụng nữa. Quan sát thêm 1 chiều: thời gian còn lại của ca.
+- **Mục tiêu năng lượng** vẫn là trung bình trên các vị trí đang phục vụ (phần policy điều khiển). Năng lượng của các chặng bay ra, bay về ghi riêng trong `info`.
+- Prior đội hình gán lại đỉnh khi tập vị trí đang phục vụ đổi, như với `fleet`. Không dùng chung với `fleet`.
+- **Đạt khi:**
+  - (`docs/v2/check_tip4.py`) ca kết thúc đúng bước 240 với `done`;
+  - mọi vị trí được dùng có ít nhất một lần thay ca;
+  - pin không âm; số cặp pin bảo toàn;
+  - với S = 3, đủ dự phòng và trạm thì không có gap;
+  - với S = 10 và ít trạm thì xuất hiện chờ pin;
+  - `check_v11` không đổi; smoke train v2 chạy hết.
 
 ### TIP 5. Tải theo giờ và sự kiện
 
@@ -198,3 +221,45 @@ TIP 11 (pilot v2 trên Kaggle)                                                 [
   - Thêm tải mục tiêu mỗi slice (plan không có), suy từ SLA của slice.
   - Hàng đợi riêng mỗi slice dùng khoá `per_slice_queues` có sẵn.
 - **SUGGESTIONS:** heuristic và baseline tối ưu (TIP 9) nên dùng cùng bộ lập lịch này, để so sánh chỉ khác ở vị trí và tỉ lệ slice.
+
+### TIP 4. Ca trực, thay ca bằng UAV dự phòng, trạm sạc (2026-11-13)
+
+- **STATUS:** xong.
+- **FILES CHANGED:**
+  - `environment.py`: khoá `shift`; `_home_leg` (năng lượng và thời gian, `_home_leg_energy` gọi nó, số học không đổi); `_hover_power`, `_leave_threshold`, `_relay_threshold`, `_start_shift`, `_charge_soc`, `_send_home`, `_dispatch`, `_shift_update`; quan sát thêm thời gian còn lại; `done` ở cuối ca; `info` thêm `n_serving_target`, `n_serving_step`, `relays`, `gaps`, `waiting_battery`, `transit_energy_j`, `depot_mean_soc`.
+  - `prior.py`: gán lại đỉnh khi tập vị trí đang phục vụ đổi trong ca; tập rỗng trả về `{}`.
+  - `config/environment/v2.yaml`: `num_uavs: 10` (vị trí phục vụ), mục `shift`.
+  - `config/train/moma_ac_v2_prior.yaml`: `max_steps_per_episode` và `eval_steps` 240.
+  - Mới: `docs/v2/check_tip4.py`. `check_tip1.py`, `check_tip2.py` cố định 3 UAV, không có ca, như lúc viết.
+- **TEST RESULTS:**
+  - **`check_tip4.py`, 2 ca validation mỗi bộ, các vị trí đứng yên ở chỗ xuất phát, công suất 1 (PASS):**
+
+    | Bộ | Thay ca | Tỉ lệ vị trí trống | Bước chờ pin (thân máy) | Đổi pin mỗi thân máy |
+    |---|---|---|---|---|
+    | A: S = 3, 6 BS60, 3 dự phòng | 86 | 0.000 | 0 | 7.1 |
+    | B: S = 10, 3 BS60 | 34 | 0.684 | 5143 | 3.0 |
+    | v2: S = 3 | 83 | 0.001 | 0 | 8.4 |
+    | v2: S = 10 | 278 | 0.000 | 0 | 9.1 |
+    | S = 3, 1 BS60 mỗi vị trí | 40 | 0.237 | 732 | 6.4 |
+    | S = 10, 1 BS60 mỗi vị trí | 127 | 0.241 | 2007 | 7.0 |
+
+    Mọi bộ: ca kết thúc đúng bước 240, pin không âm, không chặng về nào thiếu năng lượng, số cặp pin bảo toàn, mọi vị trí được thay ca ít nhất một lần.
+  - **Mỗi vị trí được thay khoảng 14 lần mỗi ca** (khoảng 17 phút một lần khi treo ở công suất tối đa), không phải 25 phút như ước lượng trước: ngưỡng gọi người thay giữ lại năng lượng cho chặng về, cho người thay bay ra và một bước dự phòng.
+  - **Quét trang bị** (S = 3 và 10, trống / bước chờ): 1 trạm mỗi vị trí trống 24–26%; 1.5 trạm 2–3%; 2 trạm dưới 1%. Với 2 trạm, 0.25 dự phòng trống 1%, 0.5 dự phòng 0–0.1%.
+  - **v1.1 không đổi:** `check_v11.py` 0 lệch (env 4224 mảng, train 96 tensor). `check_tip1.py`, `check_tip2.py` PASS với đúng số cũ.
+  - **Smoke train v2** (10 khe, hành động 7 chiều, 4 mục tiêu) chạy hết với mạng MLP và attention.
+  - **Thời gian mỗi bước** (đứng yên, 10 khe): 24 ms với S = 3, 33 ms với S = 10.
+- **ISSUES:**
+  - Mặc định trang bị (2 BS60, 0.5 dự phòng mỗi vị trí) là thiết kế, đo để gần như không hở; chưa có nguồn cho trang bị thật của đội cứu hộ.
+  - Chặng bay ra tính tới chỗ của vị trí lúc phái đi; người thay nhận vị trí ở chỗ hiện tại (vị trí chỉ dịch quanh đỉnh của prior).
+  - Năng lượng các chặng bay ra, bay về không nằm trong mục tiêu năng lượng (policy không điều khiển chúng), chỉ ghi trong `info`.
+  - Nếu mọi vị trí cùng trống, mục tiêu năng lượng bằng 0 (tốt nhất) ở bước đó. Với trang bị mặc định thì không xảy ra.
+  - Eval 240 bước × 30 ω × 3 episode khá tốn (khoảng 7 phút mỗi lần eval). Xem lại ở TIP 8/11.
+  - Replay buffer với 10 khe: khoảng 2.8 GB cho 500k mẫu.
+  - Prior vẫn là đa giác đều r = 600 m (chỉ hợp với 3). TIP 7 thay bằng k-means theo số vị trí đang phục vụ.
+- **DEVIATIONS:**
+  - Vị trí phục vụ (khe của policy) tách khỏi thân máy. Thay ca là đổi thân máy dưới một vị trí, nên quan sát và hành động chỉ cần 10 khe, không cần thêm khe cho dự phòng.
+  - Không dùng `fleet` (plan cũ); `shift` tự quản lý vị trí đang phục vụ, và không dùng chung với `fleet`.
+  - Quan sát chỉ thêm thời gian còn lại của ca; trạng thái của vị trí (đang phục vụ hay trống) đã thể hiện bằng công suất 0, như với `fleet`.
+  - UAV về sớm hơn một bước so với ngưỡng năng lượng bay về, vì env kiểm mỗi bước 60 s còn M300 kiểm liên tục. Bản đầu về đúng ngưỡng, và 14–28 chặng về mỗi ca bị thiếu năng lượng.
+- **SUGGESTIONS:** TIP 5 có thể thêm sự kiện "trạm sạc hỏng" hoặc "thiếu pin" bằng cách đổi số trạm giữa ca: env đã đo được hậu quả (vị trí trống, bước chờ pin).

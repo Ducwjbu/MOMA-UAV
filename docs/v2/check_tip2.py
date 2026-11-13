@@ -1,7 +1,8 @@
 """
 check_tip2.py (TIP 2 of docs/v2/plan.md)
 ========================================
-The hovering r=600 triangle at power 1 on config/environment/v2.yaml, 10 validation episodes (100000+), with the
+The hovering r=600 triangle at power 1 on config/environment/v2.yaml (3 UAVs, without the shift section of TIP 4),
+10 validation episodes (100000+), with the
 bandwidth split evenly in two ways:
   demand_areas   the v1.1 action: 9 fractions of 1/9, round robin inside each demand area (v2.yaml without the
                  action section)
@@ -33,11 +34,15 @@ CONFIG = "config/environment/v2.yaml"
 SLICES = ("embb", "urllc", "mmtc")
 
 
-def config_without_action():
+def v2_config(action=True):
+    """v2.yaml as it was at TIP 2: 3 UAVs, one sortie (no shift section); without the action section if asked"""
     with open(CONFIG, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    cfg.pop("action", None)
-    path = os.path.join(tempfile.mkdtemp(prefix="check_tip2_"), "v2_demand_areas.yaml")
+    cfg.pop("shift", None)
+    cfg["system"]["num_uavs"] = 3
+    if not action:
+        cfg.pop("action", None)
+    path = os.path.join(tempfile.mkdtemp(prefix="check_tip2_"), "v2_tip2.yaml")
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
     return path
@@ -79,7 +84,7 @@ def run(config, n_ep=10, seed_base=100000):
 
 
 def main():
-    res = {"demand_areas": run(config_without_action()), "slice_share": run(CONFIG)}
+    res = {"demand_areas": run(v2_config(action=False)), "slice_share": run(v2_config())}
     print("mode           SLA share eMBB / URLLC / mMTC     UAV-steps with idle RBs   idle share then")
     for mode, (sla, idle, share) in res.items():
         print(f"{mode:14s} {sla[0]:.3f} / {sla[1]:.3f} / {sla[2]:.3f}            {idle:.2f}                      "

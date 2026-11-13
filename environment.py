@@ -1,7 +1,7 @@
 
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from utils import Configuration
+from utils import Configuration, NestedDict
 from city import City
 from traffic_map import TrafficMap
 from dataclasses import dataclass, field
@@ -407,6 +407,38 @@ class NetworkSlicingEnv:
         if self.fleet is not None and not 1 <= self.fleet['n_active_min'] <= self.num_uavs:
             raise ValueError("fleet.n_active_min must be between 1 and num_uavs")
         self.withdraw_at = None  # (step, uav_id) of this episode's withdrawal, if any
+        # v2 (TIP 4): a shift with relays by spare airframes and a charging depot (absent: one sortie, see
+        # return_home). num_uavs is then the number of serving positions (slots); see _start_shift
+        shift = getattr(env_config, 'shift', None)
+        self.shift = None if shift is None else {
+            'duration_steps': int(getattr(shift, 'duration_steps', 240)),
+            'n_serving': [int(v) for v in getattr(shift, 'n_serving', [self.num_uavs, self.num_uavs])],
+            'spares_per_uav': float(getattr(shift, 'spares_per_uav', 0.25)),
+            'swap_steps': int(getattr(shift, 'swap_steps', 1)),
+            'launch_soc': float(getattr(shift, 'launch_soc', 0.9)),
+            'stations_per_uav': float(getattr(shift, 'stations_per_uav', 1.0)),
+            'station_count': getattr(shift, 'station_count', None),
+            'pairs_per_station': int(getattr(shift, 'pairs_per_station', 4)),
+            'charge': {k: float(v) for k, v in vars(getattr(shift, 'charge', NestedDict({}))).items()},
+        }
+        if self.shift is not None:
+            if self.fleet is not None:
+                raise ValueError("shift and fleet can't be combined: shift sets the active positions itself")
+            if getattr(env_config, 'return_home', None) is None:
+                raise ValueError("shift needs a return_home section (the Home Point)")
+            lo, hi = self.shift['n_serving']
+            if not 1 <= lo <= hi <= self.num_uavs:
+                raise ValueError("shift.n_serving must lie within [1, num_uavs]")
+            c = {'soc_low': 0.2, 'soc_cc_end': 0.9, 'minutes_low_to_cc_end': 30.0, 'minutes_full': 60.0,
+                 **self.shift['charge']}
+            # CC-CV charging through DJI's two BS60 figures: soc_low -> soc_cc_end in minutes_low_to_cc_end, and
+            # 0 -> 1 in minutes_full (assumed to start from empty): constant rate up to soc_cc_end, then slower
+            cc_rate = (c['soc_cc_end'] - c['soc_low']) / c['minutes_low_to_cc_end']
+            cv_minutes = c['minutes_full'] - c['soc_cc_end'] / cc_rate
+            if cv_minutes <= 0:
+                raise ValueError("shift.charge: minutes_full too short for the constant-current rate")
+            self.shift['charge'] = {**c, 'cc_rate': cc_rate, 'cv_rate': (1.0 - c['soc_cc_end']) / cv_minutes}
+        self.shift_state = None
 
         # Channel parameters
         self.carrier_frequency = env_config.channel.carrier_frequency  # Hz
@@ -637,6 +669,8 @@ class NetworkSlicingEnv:
         if self.return_home is not None:
             for uav in self.uavs.values():
                 self.charge_outbound_flight(uav)
+        if self.shift is not None:
+            self._start_shift()
 
         # Episodes start with two active hotspots, so UEs are clustered from step 0; with a traffic map, a new map
         # instead (it holds for the whole episode: Lee et al. measure hourly densities, an episode is 18-19 min)
@@ -850,6 +884,9 @@ class NetworkSlicingEnv:
                 # Wind at the UAV's altitude, which the flight controller estimates
                 obs.extend(self._wind_at(uav.position[2]) / self.wind_params['max_speed'])
 
+            if self.shift is not None:   # v2 (TIP 4): share of the shift left, so its end can be seen
+                obs.append(1.0 - self.shift_state['step'] / self.shift['duration_steps'])
+
             observations[uav_id] = np.array(obs, dtype=np.float32)
             # print(f"UAV {uav_id} observations: {obs}")
 
@@ -857,6 +894,7 @@ class NetworkSlicingEnv:
             expected_dims = 80 if self.num_uavs == 1 else 30 + 4 * (self.num_uavs - 1)
             expected_dims += self.backhaul is not None
             expected_dims += 2 * (self.wind_params is not None)
+            expected_dims += self.shift is not None
             assert len(obs) == expected_dims, f"Expected {expected_dims} dims, got {len(obs)}"
 
         return observations
@@ -864,7 +902,7 @@ class NetworkSlicingEnv:
     def step(self, actions: Dict[int, np.ndarray]) -> Tuple[Dict[int, np.ndarray], float, bool, Dict]:
         """Execute actions and return next observations, reward, done, info"""
 
-        if self.fleet is not None:
+        if self.fleet is not None or self.shift is not None:
             self._apply_withdrawal()
             for uav in self.uavs.values():
                 if not uav.active:
@@ -1006,7 +1044,11 @@ class NetworkSlicingEnv:
         
         # Check termination conditions. With return_home, Low Battery RTH: the mission ends when a UAV has
         # just the energy left to fly back to the Home Point
-        if self.return_home is None:
+        if self.shift is not None:
+            # v2 (TIP 4): relays and battery swaps replace the end of the sortie; the shift's end is terminal
+            shift_info = self._shift_update()
+            done = self.shift_state['step'] >= self.shift['duration_steps']
+        elif self.return_home is None:
             done = any(uav.current_battery <= 0 for uav in self.uavs.values() if uav.active)
         else:
             done = any(uav.current_battery <= self._home_leg_energy(uav.position, outbound=False)
@@ -1046,7 +1088,9 @@ class NetworkSlicingEnv:
             # Share of UEs meeting their full SLA, per slice (nan when the slice has no demand this step)
             'sla_embb': self.sla_ratio['embb'], 'sla_urllc': self.sla_ratio['urllc'], 'sla_mmtc': self.sla_ratio['mmtc'],
         }
-        
+        if self.shift is not None:
+            info.update(shift_info)
+
         return observations, reward, done, info
 
     # ============================================
@@ -1101,30 +1145,36 @@ class NetworkSlicingEnv:
         return u * min(speed, max(reach, 0.0))
 
     def _home_leg_energy(self, position: np.ndarray, outbound: bool) -> float:
+        """Joules for the flight between the Home Point and a position, radio off (see _home_leg)"""
+        return self._home_leg(position, outbound)[0]
+
+    def _home_leg(self, position: np.ndarray, outbound: bool) -> Tuple[float, float]:
         """
-        Joules for the flight between the Home Point (on the ground) and a position, radio off: the climb at the
-        Home Point, then level flight out at the position's height (outbound), or level flight back, then the
-        descent at the Home Point. Level flight at velocity_max, cut by the airspeed limit in the episode's
-        wind: the power still falls up to the energy-optimal speed (about 21 m/s), so velocity_max is also the
-        cheapest speed per metre. The wind on the vertical leg is the one at half the height. Descent is not
-        credited back, as in step
+        (Joules, seconds) for the flight between the Home Point (on the ground) and a position, radio off: the
+        climb at the Home Point, then level flight out at the position's height (outbound), or level flight back,
+        then the descent at the Home Point. Level flight at velocity_max, cut by the airspeed limit in the
+        episode's wind: the power still falls up to the energy-optimal speed (about 21 m/s), so velocity_max is
+        also the cheapest speed per metre. The wind on the vertical leg is the one at half the height. Descent is
+        not credited back, as in step
         """
         delta = position[:2] - self.home_position[:2]
         if not outbound:
             delta = -delta
         dist = float(np.linalg.norm(delta))
         v_max = self.uav_params.velocity_max
-        energy = 0.0
+        energy, duration = 0.0, 0.0
         if dist > 1e-9:
             if self.wind_params is None:
                 energy += self._propulsion_power(v_max, 0.0) * dist / v_max
+                duration += dist / v_max
             else:
                 wind = self._wind_at(position[2])
                 ground = self._limit_airspeed(delta / dist * v_max, wind, v_max)
                 speed = float(np.linalg.norm(ground))
                 if speed < 1e-9:
-                    return np.inf
+                    return np.inf, np.inf
                 energy += self._propulsion_power(speed, 0.0, float(np.linalg.norm(ground - wind))) * dist / speed
+                duration += dist / speed
         height = float(position[2] - self.home_position[2])
         if height > 0:
             rate = self.velocity_max_vertical if outbound else self.velocity_max_descent
@@ -1134,11 +1184,195 @@ class NetworkSlicingEnv:
             else:
                 power = self._propulsion_power(0.0, v_z, float(np.linalg.norm(self._wind_at(height / 2.0))))
             energy += power * height / rate
-        return energy
+            duration += height / rate
+        return energy, duration
 
     def charge_outbound_flight(self, uav):
         """Battery left after the flight from the Home Point to the UAV's position; call it after placing a UAV"""
         uav.current_battery = uav.battery_capacity - self._home_leg_energy(uav.position, outbound=True)
+
+    # ============================================
+    # SHIFT: RELAYS, BATTERY SWAPS, CHARGING DEPOT (v2, TIP 4)
+    # ============================================
+
+    def _hover_power(self, height: float) -> float:
+        """Propulsion power hovering at a height, in the episode's wind"""
+        if self.wind_params is None:
+            return self._propulsion_power(0.0, 0.0)
+        return self._propulsion_power(0.0, 0.0, float(np.linalg.norm(self._wind_at(height))))
+
+    def _leave_threshold(self, position: np.ndarray) -> float:
+        """Battery (J) at which a serving airframe leaves for the Home Point: the return leg plus one step at the
+        highest total power draw, so that the battery still covers the return after the next step (the check
+        runs once per step, the M300's Low Battery RTH continuously)"""
+        return self._home_leg(position, outbound=False)[0] + self.max_total_power * self.T_L
+
+    def _relay_threshold(self, position: np.ndarray) -> float:
+        """Battery (J) at which a serving position calls its relay: the leave threshold plus the steps a spare
+        needs to fly out, and one more because the check runs once per step. Then the relay arrives before the
+        serving airframe has to leave, at any power"""
+        steps_out = max(1, int(np.ceil(self._home_leg(position, outbound=True)[1] / self.T_L - 1e-9)))
+        return self._leave_threshold(position) + self.max_total_power * self.T_L * (steps_out + 1)
+
+    def _start_shift(self):
+        """
+        One episode is a window of a running operation. S serving positions are drawn uniform in n_serving and
+        placed in random slots (the others stay out of the mission for the whole shift); the team has S + spares
+        airframes, ceil(spares_per_uav S) spares on the ground with full batteries. The serving batteries are
+        staggered over their usable range, phase (k + U) / S for a random order k, between the relay threshold
+        and a full battery less the flight out, so that relays are spread as in steady state. The depot holds
+        pairs_per_station full pairs per station
+        """
+        sh = self.shift
+        ids = sorted(self.uavs)
+        S = np.random.randint(sh['n_serving'][0], sh['n_serving'][1] + 1)
+        roles = sorted(np.random.choice(ids, S, replace=False).tolist())
+        phases = (np.random.permutation(S) + np.random.uniform(size=S)) / S
+        airframes = []
+        for uid in ids:
+            uav = self.uavs[uid]
+            if uid not in roles:
+                uav.active = False
+                uav.current_power = 0.0
+                continue
+            uav.active = True
+            top = uav.battery_capacity - self._home_leg(uav.position, outbound=True)[0]
+            low = min(self._relay_threshold(uav.position), top)
+            uav.current_battery = low + (top - low) * phases[roles.index(uid)]
+            airframes.append({'id': len(airframes), 'state': 'serving', 'role': uid, 'battery': 0.0,
+                              'timer': 0, 'swaps': 0})
+        for _ in range(int(np.ceil(sh['spares_per_uav'] * S - 1e-9))):
+            airframes.append({'id': len(airframes), 'state': 'ready', 'role': None,
+                              'battery': float(self.uav_params.battery_capacity), 'timer': 0, 'swaps': 0})
+        n_stations = int(sh['station_count']) if sh['station_count'] is not None else \
+            int(np.ceil(sh['stations_per_uav'] * S - 1e-9))
+        self.shift_state = {
+            'step': 0, 'S': S, 'roles': roles, 'airframes': airframes, 'n_stations': n_stations,
+            'pool': [1.0] * (n_stations * sh['pairs_per_station']),
+            'inbound': {},      # role -> airframe id flying out to it
+            'vacancy': {},      # role -> position it was left at, while nobody serves it
+            'relays': 0, 'gaps': 0, 'battery_short': 0,
+        }
+
+    def _charge_soc(self, soc: float, minutes: float) -> float:
+        """State of charge after charging for some minutes on the CC-CV curve of shift.charge"""
+        c = self.shift['charge']
+        while minutes > 1e-12 and soc < 1.0:
+            rate = c['cc_rate'] if soc < c['soc_cc_end'] else c['cv_rate']
+            end = c['soc_cc_end'] if soc < c['soc_cc_end'] else 1.0
+            dt = min(minutes, (end - soc) / rate)
+            soc, minutes = soc + dt * rate, minutes - dt
+        return min(soc, 1.0)
+
+    def _send_home(self, airframe: Dict, position: np.ndarray, battery: float) -> float:
+        """An airframe leaves its position for the Home Point; returns the energy of the leg"""
+        energy, duration = self._home_leg(position, outbound=False)
+        if battery < energy:
+            self.shift_state['battery_short'] += 1
+        airframe.update(state='returning', role=None, battery=max(0.0, battery - energy),
+                        timer=max(1, int(np.ceil(duration / self.T_L - 1e-9))))
+        return energy
+
+    def _dispatch(self, role: int, target: np.ndarray) -> float:
+        """Send the fullest ready airframe out to a position; returns the energy of the leg (0 if none is ready).
+        The leg is flown to where the position is now; the airframe arrives at a step boundary and hovers the
+        rest of its last step"""
+        st = self.shift_state
+        ready = [a for a in st['airframes'] if a['state'] == 'ready']
+        if not ready:
+            return 0.0
+        a = max(ready, key=lambda f: f['battery'])
+        energy, duration = self._home_leg(target, outbound=True)
+        steps = max(1, int(np.ceil(duration / self.T_L - 1e-9)))
+        energy += self._hover_power(target[2]) * (steps * self.T_L - duration)
+        a.update(state='outbound', role=role, battery=a['battery'] - energy, timer=steps)
+        st['inbound'][role] = a['id']
+        return energy
+
+    def _shift_update(self) -> Dict:
+        """
+        After a step: move the airframes that are not serving on by one step, charge the depot, hand serving
+        positions over to arriving relays, send home the serving airframes at their return energy (Low Battery
+        RTH), and dispatch ready spares to positions that need a relay or are empty. Rules of the operator, not
+        decisions of the policy
+        """
+        sh, st = self.shift, self.shift_state
+        cap = float(self.uav_params.battery_capacity)
+        n_serving_step = sum(self.uavs[r].active for r in st['roles'])
+        st['step'] += 1
+        transit_energy, relays = 0.0, 0
+        frames = st['airframes']
+
+        # Airframes on their way, swapping or waiting for a pair
+        for a in frames:
+            if a['state'] in ('outbound', 'returning', 'swap'):
+                a['timer'] -= 1
+            if a['state'] == 'returning' and a['timer'] <= 0:
+                a.update(state='swap', timer=sh['swap_steps'])
+            if a['state'] == 'swap' and a['timer'] <= 0:
+                st['pool'].append(a['battery'] / cap)   # The used pair goes on charge
+                a.update(state='waiting', battery=0.0, swaps=a['swaps'] + 1)
+        # The depot: each station charges one pair at a time, the fullest one first (BS60)
+        charging = sorted((i for i, s in enumerate(st['pool']) if s < 1.0), key=lambda i: -st['pool'][i])
+        for i in charging[:st['n_stations']]:
+            st['pool'][i] = self._charge_soc(st['pool'][i], self.T_L / 60.0)
+        for a in frames:
+            if a['state'] == 'waiting' and st['pool']:
+                best = int(np.argmax(st['pool']))
+                if st['pool'][best] >= sh['launch_soc'] - 1e-12:
+                    a.update(state='ready', battery=st['pool'].pop(best) * cap)
+
+        # Arrivals: a relay takes over a serving position, or fills an empty one
+        for role, fid in list(st['inbound'].items()):
+            a = frames[fid]
+            if a['timer'] > 0:
+                continue
+            uav = self.uavs[role]
+            if uav.active:
+                old = next(f for f in frames if f['state'] == 'serving' and f['role'] == role)
+                transit_energy += self._send_home(old, uav.position, uav.current_battery)
+                relays += 1
+            else:
+                uav.active = True
+                uav.position = st['vacancy'].pop(role)
+                uav.current_power = self.uav_params.initial_power
+            uav.current_battery = a['battery']
+            a.update(state='serving', battery=0.0, timer=0)
+            del st['inbound'][role]
+
+        # Low Battery RTH: a serving airframe at its return energy leaves, relayed or not
+        for role in st['roles']:
+            uav = self.uavs[role]
+            if uav.active and uav.current_battery <= self._leave_threshold(uav.position):
+                old = next(f for f in frames if f['state'] == 'serving' and f['role'] == role)
+                transit_energy += self._send_home(old, uav.position, uav.current_battery)
+                st['vacancy'][role] = uav.position.copy()
+                st['gaps'] += 1
+                uav.active = False
+                uav.current_power = 0.0
+                uav.energy_used = {"movement": 0.0, "transmission": 0.0}
+
+        # Dispatch: empty positions first, then relays by the lowest battery margin
+        for role in sorted(st['vacancy']):
+            if role not in st['inbound']:
+                transit_energy += self._dispatch(role, st['vacancy'][role])
+        due = [(self.uavs[r].current_battery - self._relay_threshold(self.uavs[r].position), r)
+               for r in st['roles'] if self.uavs[r].active and r not in st['inbound']]
+        for margin, role in sorted(due):
+            if margin <= 0:
+                transit_energy += self._dispatch(role, self.uavs[role].position)
+        st['relays'] += relays
+
+        states = [a['state'] for a in frames]
+        return {
+            'n_serving_target': st['S'],
+            'n_serving_step': n_serving_step,                # Serving positions during this step's reward
+            'relays': relays,                                # Hand-overs to a relay at the end of this step
+            'gaps': len(st['vacancy']),                      # Positions left empty now
+            'waiting_battery': states.count('waiting'),      # Airframes on the ground with no charged pair
+            'transit_energy_j': transit_energy,              # Legs to and from the Home Point started now
+            'depot_mean_soc': float(np.mean(st['pool'])) if st['pool'] else float('nan'),
+        }
 
     def _apply_height_bounds(self, position: np.ndarray) -> np.ndarray:
         """

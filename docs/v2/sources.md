@@ -28,3 +28,19 @@ Cách tính SLA mỗi UE (v2): biên nhỏ nhất theo log tự nhiên, `m = min
 | Thang thời gian | Tỉ lệ slice mỗi bước 60 s, lập lịch bên trong | O-RAN Alliance WG1, "O-RAN Architecture Description" (non-RT RIC: vòng điều khiển ≥ 1 s; near-RT RIC: 10 ms – 1 s) | Đặt hành động ở thang non-RT RIC | **Chưa đọc bản chính thức** (Notion mục 6) |
 | `slicing.per_slice_queues` | true | Thiết kế (khoá có từ v1.1), mỗi slice một phần ba buffer | Sửa hạn chế 4: năng lực của mMTC không còn phục vụ gói eMBB | — |
 | Tải mục tiêu của bộ lập lịch | Drop = 1/10 ngân sách lỗi | Thiết kế; công thức M/M/1/K của env | eMBB 0.75, URLLC 0.93, mMTC 0.95 | — |
+
+## TIP 4. Ca trực, thay ca, trạm sạc
+
+| Tham số | Giá trị | Nguồn | Phần dùng | Trạng thái |
+|---|---|---|---|---|
+| `shift.swap_steps` | 1 bước (60 s) | D. Lee, J. Zhou, W. T. Lin, "Autonomous Battery Swapping System for Quadcopter", Proc. ICUAS 2015, pp. 118–124 | Đổi pin tự động trong 60 s | Đọc qua trích dẫn trong Galkin & DaSilva (dưới), chưa đọc bản gốc |
+| Đổi pin nóng | Không tắt máy | DJI Store, trang TB60 Intelligent Flight Battery | TB60 hot-swap; M300 bay bằng một cặp TB60 | Trang sản phẩm |
+| Thay ca bằng UAV dự phòng | Cơ chế | V. Galkin, L. DaSilva, "UAVs as Mobile Infrastructure: Addressing Battery Lifetime", arXiv:1807.00996, 2018 (preprint) | Sec. IV: UAV dự phòng thay UAV về sạc để phủ liên tục; Sec. V: tổng thời gian gián đoạn dưới 3 phút mỗi 20–25 phút khi đổi pin | Preprint, chưa thấy bản đăng |
+| `shift.pairs_per_station` | 4 cặp | DJI Store, trang BS60 Intelligent Battery Station; Advexure (đại lý) | BS60 chứa 8 TB60 | Trang sản phẩm; hướng dẫn sử dụng BS60 (PDF) bị mã hoá, chưa đối chiếu |
+| `shift.charge` | 20→90% trong 30 phút, đầy trong 60 phút (220 V) | DJI Store; Advexure | "approximately 60 minutes to fully charge two TB60"; 20–90% trong 30 phút; 110 V: 70 và 40 phút. Giả định "đầy" tính từ 0% | Như trên. B&H ghi "70 min (1 x TB60)" ở 110 V, mâu thuẫn với các nguồn khác |
+| Một cặp tại một thời điểm, cặp đầy nhất trước | Cơ chế của kho | Advexure; Heliguy, "How many batteries can the M300 Battery Station (BS60) charge at the same time?" | Sạc 2 TB60 cùng lúc; "selects the battery with the highest battery level to be recharged first" | Trang đại lý |
+| `shift.launch_soc` | 0.9 | Thiết kế | Hết đoạn sạc dòng không đổi (CC); đoạn 90–100% chậm gấp 5 lần | — |
+| `shift.stations_per_uav` | 2 BS60 mỗi vị trí | Thiết kế, đo bằng `docs/v2/check_tip4.py` | 1 trạm mỗi vị trí: vị trí trống khoảng 25% thời gian (S = 3 và 10); 1.5: 2–3%; 2: dưới 1% | — |
+| `shift.spares_per_uav` | 0.5 | Thiết kế, cùng script | Với 2 trạm mỗi vị trí: 0.25 dự phòng → trống 1%, 0.5 → 0.1% (S = 3), 0 (S = 10) | — |
+| `shift.n_serving` | 2–10 | Quyết định 2026-11-13 (`plan.md`) | Test thêm 11–12, rồi 13–15 nếu đạt | — |
+| `shift.duration_steps` | 240 (4 giờ) | Thiết kế | Đủ để mỗi vị trí được thay ca khoảng 14 lần và kho pin kịp hụt nếu thiếu trạm | — |

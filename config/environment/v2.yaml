@@ -1,7 +1,8 @@
 # ENVIRONMENT CONFIGURATION FOR UAV NETWORK SIMULATION: v2 (thesis), story (b)
 # ----------------------------------------------------
 # ma3.yaml (v1.1) plus the v2 keys of docs/v2/plan.md, each marked "v2 (TIP n)". Story (b): the terrestrial network
-# is down after a disaster and 3 UAVs serve the area for a while. The three slices keep their internal names:
+# is down after a disaster and a team of UAVs serves the area through a shift, relayed by spares (TIP 4). The
+# three slices keep their internal names:
 #   embb  = mission-critical video of the responders (5QI 67)
 #   urllc = road-side units of the traffic system (5QI 84), kept from v1.1
 #   mmtc  = sensors (TR 38.913)
@@ -9,7 +10,7 @@
 
 # Physical entities parameters
 system:
-    num_uavs: 3   # MOMA-AC CTDE (config/train/moma_ac_ma3.yaml)
+    num_uavs: 10  # v2 (TIP 4): serving positions (slots of the observation and action); shift.n_serving of them are used per shift
     num_ues: 91  # Arriving/departing UEs: 31 eMBB + 60 mMTC (slicing.slice_probabilities); RSUs come on top
     service_area: [2000, 2000] # [width, height] in meters
     uav_fly_range_x: [0, 2000] # [min, max] radius from center in meters
@@ -353,3 +354,26 @@ objectives:
 # runs every TTI)
 action:
     mode: slice_share
+
+# v2 (TIP 4): a shift of a running operation, with relays by spare airframes and a charging depot at the Home
+# Point (environment.py, _start_shift and _shift_update; docs/v2/sources.md). The policy steers the serving
+# positions; the operator's rules fly the spares out, send airframes home at their return energy (Low Battery RTH)
+# and swap batteries
+shift:
+    duration_steps: 240        # 4 h at T_L = 60 s; terminal at the end
+    n_serving: [2, 10]         # serving positions per shift, uniform (docs/v2/plan.md, decided 2026-11-13)
+    spares_per_uav: 0.5        # spare airframes = ceil(0.5 S): design, sized with docs/v2/check_tip4.py (with 2
+                               # BS60 per position, 0.5 leaves a position empty 0.1% of the time at S = 3, 0 at
+                               # S = 10; 0.25 leaves 1.0% and 0.9%)
+    swap_steps: 1              # hot swap of the TB60 pair in 60 s: Lee, Zhou & Lin, ICUAS 2015, pp. 118-124
+                               # (cited by Galkin & DaSilva, arXiv:1807.00996, Sec. V)
+    launch_soc: 0.9            # an airframe takes off with a pair at least this full (end of the fast CC phase): design
+    stations_per_uav: 2.0      # BS60 stations = ceil(2.0 S); station_count: K fixes the number instead. Design, a
+                               # well-equipped team: with 1 per position the depot can't keep up and a position is
+                               # empty about 25% of the time (S = 3 and 10), with 2 almost never (check_tip4.py)
+    pairs_per_station: 4       # BS60 holds 8 TB60 (DJI Store, Advexure); full at the start of the shift
+    charge:                    # BS60 on 220 V (DJI Store, Advexure): two TB60 (one pair) at a time, fullest first
+        soc_low: 0.2           #   (Heliguy); 20% -> 90% in 30 min, full in 60 min, "full" assumed from empty
+        soc_cc_end: 0.9
+        minutes_low_to_cc_end: 30.0
+        minutes_full: 60.0

@@ -1,7 +1,8 @@
 # ============================================================
 # MOMA-AC Training Config — 3 UAVs, CTDE, residual policy on a formation prior (prior.py)
 # omega ~ uniform on the simplex (Dirichlet(1,1,1)), per episode
-# v2 (docs/v2/plan.md): moma_ac_ma3_prior.yaml on config/environment/v2.yaml (4 objectives, Dirichlet(1,1,1,1))
+# v2 (docs/v2/plan.md): moma_ac_ma3_prior.yaml on config/environment/v2.yaml (4 objectives, Dirichlet(1,1,1,1);
+# up to 10 serving positions per shift, relays and battery swaps, TIP 4)
 # ============================================================
 
 # Environment
@@ -13,14 +14,15 @@ min_buffer_size: 5000
 train_frequency: 1
 train_iterations: 1
 batch_size: 256
-max_steps_per_episode: 18     # min on station at T_L = 60 s: the longest mission that, in the worst case (hovering at full power, farthest point), still leaves the energy to fly home (return_home)
+max_steps_per_episode: 240    # one shift (v2.yaml shift.duration_steps); the env ends it with a terminal done
 
 # Omega sampling
 omega_sampling: "random"
 corner_warmup_episodes: 0
 
-# Formation prior: each UAV flies to its vertex of the r-triangle at the top altitude, and the actor learns a
-# residual on that movement. r = 600 m is within 0.4% of the 3-means coverage placement of the area
+# Formation prior: each serving position flies to its vertex of the regular n-gon of the positions serving now
+# (reassigned when one is left empty or filled again), at the top altitude, and the actor learns a residual on that
+# movement. r = 600 m suits n = 3 only; TIP 7 replaces it with k-means for the current n
 formation_prior: true
 prior_radius: 600.0
 
@@ -45,7 +47,7 @@ save_interval: 100000
 eval_interval: 50000
 eval_n_omega: 30
 eval_n_episodes: 3
-eval_steps: 18
+eval_steps: 240                # a whole shift; eval cost is large, revisit in TIP 8/11
 
 # Output
 save_dir: "saved_models_moma_ac_v2_prior"
