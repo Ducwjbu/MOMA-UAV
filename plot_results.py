@@ -11,8 +11,10 @@ Figures of the 3-UAV course-report results (env v1.1) from the tracked files in 
                         one of the 30 eval weights, averaged over episodes and seeds
   fig_trajectories      top view of the 3 UAVs at the QoS and energy corners, ma3 against ma3_prior, one episode
                         (needs eval_trajectories.py output)
-  behaviour.csv         per method and corner: speed, distance to the prior's triangle, coverage, power
-                        (from the trajectories)
+  behaviour.csv         per method and corner: speed, distance to the prior's triangle (dist_vertex_m in UAV id
+                        order, the prior's assignment; dist_formation_m with the best vertex per UAV for each
+                        episode, the fair number for methods without the prior), coverage, power (from the
+                        trajectories)
 
 Each method keeps one colour and one marker in every figure, and the lines are labelled directly, so the
 figures stay readable in greyscale.
@@ -22,6 +24,7 @@ Run:
 """
 
 import argparse
+import itertools
 import os
 
 import matplotlib
@@ -190,7 +193,27 @@ def trajectories(traj, out, env_config, seed=0, ep=0, r=600.0):
     save(fig, out, "fig_trajectories")
 
 
-def behaviour(traj, out):
+def formation_distance(late, vertices):
+    """Mean distance to the triangle with the vertices given to the UAVs by the permutation that is best over
+    the whole episode (each UAV keeps one vertex), per (method, seed, corner, ep). dist_vertex uses UAV id order,
+    which is the prior's assignment but overstates the distance of methods without the prior, whose UAVs may
+    hold the triangle with the vertices swapped"""
+    perms = list(itertools.permutations(range(len(vertices))))
+    res = {}
+    for key, g in late.groupby(["method", "seed", "corner", "ep"]):
+        g = g.sort_values(["uav", "t"])
+        pos = g[["x", "y", "h"]].to_numpy().reshape(len(vertices), -1, 3)     # uav, t, xyz
+        d = np.linalg.norm(pos[:, None] - vertices[None, :, None], axis=3).mean(axis=2)   # uav, vertex
+        res[key] = min(np.mean([d[u, p[u]] for u in range(len(p))]) for p in perms)
+    return pd.Series(res).rename_axis(["method", "seed", "corner", "ep"])
+
+
+def behaviour(traj, out, env_config, r=600.0):
+    with open(env_config, encoding="utf-8") as f:
+        system = yaml.safe_load(f)["system"]
+    fx, fy, fh = system["uav_fly_range_x"], system["uav_fly_range_y"], system["uav_fly_range_h"]
+    a = np.pi / 2 + 2 * np.pi * np.arange(3) / 3   # prior.formation_vertices
+    vertices = np.stack([sum(fx) / 2 + r * np.cos(a), sum(fy) / 2 + r * np.sin(a), np.full(3, float(fh[1]))], 1)
     t = traj.sort_values(["method", "seed", "corner", "ep", "uav", "t"]).copy()
     key = ["method", "seed", "corner", "ep", "uav"]
     t["move_m"] = np.hypot(t.groupby(key).x.diff(), t.groupby(key).y.diff())
@@ -201,6 +224,7 @@ def behaviour(traj, out):
         speed_mps=("move_m", lambda v: v.mean() / 60.0), dist_vertex_m=("dist_vertex", "mean"),
         power=("power", "mean"), bw_embb=("bw_embb", "mean"), bw_urllc=("bw_urllc", "mean"),
         bw_mmtc=("bw_mmtc", "mean"))
+    rows.insert(2, "dist_formation_m", formation_distance(late, vertices).groupby(["method", "corner"]).mean())
     rows["coverage"] = s.groupby(["method", "corner"]).coverage.mean()
     rows["qos"] = s.groupby(["method", "corner"]).qos.mean()
     rows = rows.reindex([(m, c) for m in TRAINED for c in ("qos", "energy", "fair")])
@@ -225,7 +249,7 @@ def main():
     if os.path.exists(path):
         traj = pd.read_csv(path)
         trajectories(traj, args.out, args.env_config)
-        behaviour(traj, args.out)
+        behaviour(traj, args.out, args.env_config)
     else:
         print(f"{path} not found: skipping the trajectory figure and behaviour.csv")
 

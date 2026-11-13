@@ -82,21 +82,24 @@ Mỗi điểm là policy tại một trong 30 trọng số ω, trung bình 20 ep
 
 Trung bình 5 seed × 20 episode, từ bước 3 trở đi:
 
-| Phương pháp | Góc | Tốc độ (m/s) | Cách đỉnh tam giác (m) | Công suất | Độ phủ |
-|---|---|---|---|---|---|
-| `ma3` | QoS | 11.3 | 852 | 0.94 | 0.41 |
-| `ma3_g90` | QoS | 12.9 | 711 | 1.00 | 0.51 |
-| `ma3_prior_g99` | QoS | 11.2 | 375 | 1.00 | 0.52 |
-| `ma3_prior` | QoS | 11.6 | 363 | 1.00 | 0.53 |
-| `ma3` | năng lượng | 11.6 | 1046 | 0.42 | 0.26 |
-| `ma3_g90` | năng lượng | 14.9 | 855 | 0.54 | 0.34 |
-| `ma3_prior_g99` | năng lượng | 14.3 | 679 | 0.36 | 0.27 |
-| `ma3_prior` | năng lượng | 14.7 | 604 | 0.42 | 0.30 |
+| Phương pháp | Góc | Tốc độ (m/s) | Cách đỉnh, gán theo id (m) | Cách đỉnh, gán tối ưu (m) | Công suất | Độ phủ |
+|---|---|---|---|---|---|---|
+| `ma3` | QoS | 11.3 | 852 | 677 | 0.94 | 0.41 |
+| `ma3_g90` | QoS | 12.9 | 711 | 501 | 1.00 | 0.51 |
+| `ma3_prior_g99` | QoS | 11.2 | 375 | 374 | 1.00 | 0.52 |
+| `ma3_prior` | QoS | 11.6 | 363 | 363 | 1.00 | 0.53 |
+| `ma3` | năng lượng | 11.6 | 1046 | 745 | 0.42 | 0.26 |
+| `ma3_g90` | năng lượng | 14.9 | 855 | 633 | 0.54 | 0.34 |
+| `ma3_prior_g99` | năng lượng | 14.3 | 679 | 651 | 0.36 | 0.27 |
+| `ma3_prior` | năng lượng | 14.7 | 604 | 600 | 0.42 | 0.30 |
+
+- **Hai cột khoảng cách.** "Gán theo id" (`dist_vertex_m`) lấy đỉnh i cho UAV i, đúng cách prior gán. Với phương pháp không có prior, cách này phóng đại khoảng cách khi đội giữ tam giác nhưng đổi chỗ các đỉnh. "Gán tối ưu" (`dist_formation_m`) chọn cho mỗi episode hoán vị đỉnh có khoảng cách trung bình nhỏ nhất, mỗi UAV giữ một đỉnh suốt episode. Cột này mới là số công bằng để so giữa các phương pháp.
+- **Đọc đúng:** `ma3_g90` có dàn đội hình (cách tam giác khoảng 500 m ở góc QoS), nhưng vẫn xa hơn phương pháp có prior (khoảng 365 m). Vì vậy không nói "MOMA-TD3 không bao giờ dàn đội hình"; nói "không có prior thì đội hình kém đều và xa tam giác hơn".
 
 - **Không policy nào hover.** Ở góc QoS, mỗi UAV của phương pháp đề xuất bay qua lại trên một đoạn thẳng gần đỉnh tam giác của nó. Hành vi này giống nhau ở cả 5 seed: tốc độ 10.9–12.2 m/s, khoảng cách tới đỉnh 353–375 m.
 - **Lý do:** theo mô hình Zeng, bay chậm tốn ít năng lượng hơn lơ lửng, nên vừa giữ được vùng phủ vừa tiết kiệm pin.
 - **Góc năng lượng:** mọi phương pháp đều bay đường dài gần tốc độ tối đa (17 m/s), với công suất khoảng 0.4.
-- **Seed 3 của `ma3`** (HV 0.026) là policy duy nhất gần như đứng yên (71–85% số bước), và đứng ở mép khu vực, cách các đỉnh 1.3–1.6 km.
+- **Seed 3 của `ma3`** (HV 0.026) là policy duy nhất gần như đứng yên (71–85% số bước), và đứng ở mép khu vực: cách tam giác 1.1–1.15 km khi gán đỉnh tối ưu (1.3–1.6 km khi gán theo id), so với 0.53–0.67 km của 4 seed còn lại.
 - **Băng thông:** mọi policy học được đều dành phần lớn nhất cho URLLC. Ở góc QoS, phương pháp đề xuất giảm phần cho mMTC.
 
 ## 8. Tỉ lệ UE đạt đủ SLA
@@ -107,6 +110,8 @@ Trung bình 5 seed × 20 episode, từ bước 3 trở đi:
 | URLLC, ω = QoS | 0.147 | 0.189 | 0.371 | **0.400** | 0.246 |
 | mMTC, trung bình 30 ω | 0.248 | 0.338 | 0.338 | **0.360** | 0.282 |
 | eMBB, trung bình 30 ω | 0.014 | 0.018 | 0.017 | 0.019 | 0.017 |
+
+- **Đọc SLA URLLC cẩn thận:** URLLC không có biên tin cậy, nên phần lớn UE trượt vì một handover trong bước đó, không phải vì kênh xấu. Đếm cả các bước đó là đạt thì SLA URLLC của `ma3_prior` ở góc QoS là khoảng 0.66 thay vì 0.44 (10 episode validation, seed 0). So sánh giữa các phương pháp vẫn đúng chiều, nhưng con số tuyệt đối phản ánh tần suất handover. Xem hạn chế 11 trong `05_han_che.md`.
 
 **Chẩn đoán eMBB** (`report/scripts/embb_diag.py` và `embb_bound.py`, chạy từ gốc repo, 5 episode test, góc QoS):
 

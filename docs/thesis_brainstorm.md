@@ -300,7 +300,7 @@ Hạn chế của bài toán, câu hỏi cho thầy (Q1–Q12) và ngưỡng SLA
 
 **Kết quả A1 trên seed validation** (`ma3_prior`, ràng buộc QoS ≥ 0.30, tối ưu năng lượng):
 - Hệ số mặc định (λ bắt đầu từ 0) quá chậm trong 18 bước: QoS 0.26, mọi episode vi phạm.
-- Chỉ có phần I, K_I 0.5, λ khởi đầu 0.5: QoS 0.322, năng lượng −0.044, 6.7% episode vi phạm. Ngang ω cố định tốt nhất chọn sau khi biết kết quả (a = 0.30: 0.336, −0.044, 8%).
+- Chỉ có phần I, K_I 0.5, λ khởi đầu 0.5: QoS 0.322, năng lượng −0.044, 6.7% episode vi phạm. Ngang ω cố định tốt nhất chọn sau khi biết kết quả trên lưới 0.1 (a = 0.30: 0.336, −0.044, 8%); với lưới mịn xem đính chính bên dưới.
 - Giữ λ qua cả ca (`--carry`): QoS trung bình bám đúng ngưỡng (0.296–0.302), năng lượng −0.040, nhưng từng episode dao động quanh ngưỡng.
 - Phần P làm dao động nhiều hơn (một câu trả lời cho D6).
 - DPI rút gọn: QoS 0.39, năng lượng −0.107. Nó bỏ qua ngưỡng và dồn ω về mục tiêu đang cao.
@@ -314,7 +314,19 @@ Hạn chế của bài toán, câu hỏi cho thầy (Q1–Q12) và ngưỡng SLA
 | PID giữ λ qua cả ca | −0.038 [−0.040, −0.037] | 0.301 (trung bình) | 49% |
 | DPI rút gọn | −0.098 | 0.390 | 0% |
 
-Bộ điều khiển ngang (năng lượng chồng CI) hoặc hơn ω tốt nhất chọn sau khi biết kết quả, mà không cần biết trước. Ở v1.1 kịch bản tĩnh, nên chưa thấy lợi thế khi điều kiện đổi; cần các kịch bản sự kiện của môi trường v2 (`fleet`, Q6).
+~~Bộ điều khiển ngang hoặc hơn ω tốt nhất chọn sau khi biết kết quả.~~ Câu này chỉ đúng với lưới ω thô của `eval_controller.py` (bước 0.1). Đính chính 2026-11-13 với lưới 0.025 (`report/scripts/controller_fine_grid.py`, cùng seed test, cùng hệ số):
+
+| Cách chọn ω | Năng lượng [CI 95%] | QoS | Episode vi phạm |
+|---|---|---|---|
+| PID (chỉ I, reset mỗi episode) | −0.0397 [−0.0411, −0.0383] | 0.320 | 5% |
+| ω cố định a = 0.25 (rẻ nhất mà QoS trung bình vẫn ≥ 0.30) | −0.0379 [−0.0391, −0.0366] | 0.315 | 31% |
+| ω cố định a = 0.275 | −0.0400 [−0.0414, −0.0386] | 0.328 | 16% |
+| ω cố định a = 0.325 (mức vi phạm ngang PID) | −0.0422 [−0.0438, −0.0405] | 0.339 | 6% |
+
+- Nếu ràng buộc là QoS trung bình ≥ 0.30, ω cố định tốt nhất trên lưới mịn tốn ít năng lượng hơn PID (−0.0379 so với −0.0397), nhưng 31% episode vi phạm.
+- Ở cùng mức vi phạm từng episode (5–6%), PID tốn ít năng lượng hơn ω cố định (−0.0397 so với −0.0422), và hai CI không chồng nhau.
+- Vì vậy cách nói đúng: bộ điều khiển cho ít vi phạm từng episode với chi phí thấp hơn một ω cố định có cùng mức vi phạm, và nó không cần biết trước a. Nó không thắng ω cố định tốt nhất theo trung bình.
+- Ở v1.1 kịch bản tĩnh, nên chưa thấy lợi thế khi điều kiện đổi; cần các kịch bản sự kiện của môi trường v2 (`fleet`, Q6).
 
 Lưu ý khi trình bày: ở chế độ reset mỗi episode, kết quả tốt phần lớn nhờ khởi đầu λ = 0.5 (trọng số QoS khoảng 0.33, gần ω tốt nhất 0.30), giá trị lấy từ seed validation. Bằng chứng chính nên là hai thí nghiệm dưới, đều bắt đầu từ λ = 0.
 
@@ -343,7 +355,7 @@ Lưu ý khi trình bày: ở chế độ reset mỗi episode, kết quả tốt 
 
 Trình xem (`visualize/`, commit 7a3af15) cho thấy các UAV đi đường thẳng: mỗi UAV bay qua lại theo một trục, trục kia gần như đứng yên (residual theo trục đó gần hằng số, prior triệt tiêu nó), và `ma3` không prior cũng vậy. Bước xuôi gió dài 1020 m, ngược gió khoảng 500 m: giới hạn airspeed.
 
-Phép thử đứng yên (chỉ eval, không đổi env): giữ power và bandwidth của policy, thay di chuyển từ bước 3 bằng đứng yên tại chỗ (`hold_now`) hoặc tại trung điểm quỹ đạo của chính policy (`hold_mid`). Episode validation 100000+, 3 seed train x 10 episode, checkpoint 1M, số liệu trên các bước 3+. Script `hold_test.py` ở scratchpad của phiên 2026-11-13 (chưa đưa vào repo).
+Phép thử đứng yên (chỉ eval, không đổi env): giữ power và bandwidth của policy, thay di chuyển từ bước 3 bằng đứng yên tại chỗ (`hold_now`) hoặc tại trung điểm quỹ đạo của chính policy (`hold_mid`). Episode validation 100000+, 3 seed train x 10 episode, checkpoint 1M, số liệu trên các bước 3+. Script: `report/scripts/hold_test.py`.
 
 | | QoS (hold_now - policy) | năng lượng | SLA URLLC, policy -> hold_now |
 |---|---|---|---|
@@ -353,6 +365,7 @@ Phép thử đứng yên (chỉ eval, không đổi env): giữ power và bandwi
 
 - Bay qua lại không giúp QoS (CI chứa 0 ở mọi góc, cả hai method) mà tiết kiệm nhiều năng lượng: trong mô hình Zeng, treo tốn hơn bay. Ở góc QoS trọng số năng lượng bằng 0, nên đây là thói quen lan từ các ω khác, không bị phạt.
 - Nhưng nó làm hỏng SLA URLLC qua handover: ở episode 0 (test 200000), UE URLLC trượt reliability ở 82/120 lần đổi UAV phục vụ với `ma3` và 2/322 lần không đổi (`ma3_prior`: 48/70 và 28/372). Mất gói do handover (1% x 50 ms / 60 s, khoảng 8e-6) cộng PER dư đã vượt mục tiêu 1e-5. Reward QoS hầu như không thấy, vì độ thoả mãn reliability tính theo bậc "số 9" (thất bại 2e-5 so với 1e-5 vẫn được khoảng 0.94), còn chỉ số SLA là nhị phân.
+- Đính chính 2026-11-13 (kiểm độc lập): cơ chế này là hệ quả của cách mô hình hoá, không phải vật lý. PER dư của liên kết URLLC (1e-5, một lần truyền) đúng bằng mục tiêu, nên mất gói dù rất nhỏ (handover, drop) cũng làm trượt SLA. Với 10 episode validation (`report/scripts/urllc_failures.py`), 877/987 lần trượt chỉ vì reliability rơi vào bước có handover. Có biên tin cậy thì kết luận "bay qua lại hại URLLC" sẽ yếu đi nhiều. Xem hạn chế 11 trong `report/05_han_che.md`; v2 sửa ở TIP 1.
 - Hệ quả cho v2: mục tiêu SLA theo slice (Q1 trong Notion) sẽ cho policy thấy cái giá này; tính mạng theo bước con (time dynamics) cần cho việc chấm QoS trong lúc bay. Với báo cáo môn học không đổi kết luận nào, có thể thêm như một quan sát.
 
 ## Link

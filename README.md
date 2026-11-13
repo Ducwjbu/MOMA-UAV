@@ -95,7 +95,7 @@ Mỗi config train 1M bước. Mỗi bước là 60 giây mô phỏng. Một epi
 **Đội hình nền (`formation_prior`, file `prior.py`), dùng trong `moma_ac_ma3_prior.yaml`.**
 - Mỗi UAV có một đỉnh cố định của tam giác đều bán kính `prior_radius` (600 m) quanh tâm vùng, ở độ cao tối đa. Đội hình này cách vị trí phủ đều tối ưu kiểu k-means chưa tới 0,4%.
 - Lệnh di chuyển gửi cho môi trường là lệnh bay về đỉnh cộng với output của actor. Actor chỉ học phần lệch đó, khởi tạo bằng 0, nên lúc đầu agent chính là đội hình (residual policy learning). Công suất và băng thông vẫn do actor quyết định.
-- Config này dùng γ = 0,9. Với γ = 0,99, giá trị của critic trôi xa giá trị thật và kéo actor rời đội hình.
+- Config này dùng γ = 0,9, chọn trước theo tầm nhìn của bài toán. Với γ = 0,99 phần lớn giá trị mà critic phải ước lượng nằm sau mốc 18 bước, mà quan sát không cho biết còn bao nhiêu bước (xem CLAUDE.md, mục formation prior).
 - Môi trường không đổi. Eval (`eval_checkpoint.py`) tự áp đội hình theo config train.
 
 Tùy chọn thử nghiệm khác cho `ma3`: `guide_prob` và `guide_until` bật bộ dẫn đội hình (`guide.py`). Nó lái phần di chuyển trong một tỉ lệ episode để agent được thấy các đội hình dàn đều. Mặc định tắt, chỉ giúp HV khoảng +0,01, và không dùng chung được với `formation_prior`.
@@ -198,6 +198,9 @@ Hành vi và hình cho báo cáo (3 UAV): `eval_trajectories.py` ghi vị trí, 
 python eval_trajectories.py --out results-v1.1/eval_test/trajectories
 python plot_results.py --results results-v1.1 --out figures
 ```
+
+Mỗi nhận định trong `CLAUDE.md` và báo cáo không đến từ `eval_checkpoint.py` có một script kiểm trong `report/scripts/` (danh sách trong `report/README.md`), chạy từ gốc repo.
+
 
 ### Khoá luận: chọn omega lúc chạy (đang phát triển)
 

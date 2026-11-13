@@ -47,3 +47,20 @@ py eval_trajectories.py --out results-v1.1/eval_test/trajectories
 ```
 
 Commit chứa toàn bộ kết quả: `9e9e289` (số liệu), `4681c7b` (hình, quỹ đạo, chẩn đoán eMBB).
+
+## Script chẩn đoán (`scripts/`)
+
+Mỗi câu nhận định trong báo cáo, `CLAUDE.md` và `docs/thesis_brainstorm.md` mà không đến từ `eval_checkpoint.py` đều có một script ở đây. Chạy từ gốc repo; docstring đầu mỗi file ghi câu nó kiểm và lệnh chạy. Kết quả ghi vào `evals/diag/` (không commit). Các script chẩn đoán dùng seed validation 100000+; riêng `controller_fine_grid.py` và các script eMBB kiểm lại số đã báo trên seed test.
+
+| Script | Kiểm câu nào |
+|---|---|
+| `embb_diag.py`, `embb_bound.py` | SLA eMBB 1–2% là do kịch bản (mục 8 của `03_ket_qua.md`) |
+| `position_signal.py` | Vị trí UAV giải thích bao nhiêu phương sai QoS của một bước (lý do cần prior) |
+| `critic_bias.py` | Critic với γ 0.99 lệch khỏi giá trị thật bao nhiêu (lý do chọn γ 0.9) |
+| `triangle_kmeans.py` | Tam giác r = 600 m so với vị trí phủ tối ưu theo 3-means |
+| `hold_test.py` | Bay qua lại có giúp QoS không, và cái giá với SLA URLLC |
+| `urllc_failures.py` | UE URLLC trượt SLA vì KPI nào |
+| `queue_pooling.py` | Phần năng lực phục vụ của hàng đợi chung đến từ UE mMTC |
+| `ue_population.py` | Số UE đến thực tế so với mức hiệu chỉnh 91 |
+| `controller_fine_grid.py` | Bộ điều khiển ω so với ω cố định tốt nhất trên lưới 0.025 |
+| `energy_terms.py` | Công suất phát chiếm bao nhiêu trong mục tiêu năng lượng |

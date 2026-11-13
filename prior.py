@@ -12,8 +12,9 @@ Sec. IV, pi_theta(s) = pi(s) + f_theta(s)); Residual RL for robot control (Johan
 Sec. III-A, Eq. 5). The movement rows of the actor's last layer start at zero, so the initial policy is the
 formation with the actor's own power and bandwidth (Silver et al., Sec. IV-A). Power and bandwidth have no prior.
 
-Why a prior: on ma3 the UAV positions explain only about 17% of the variance of a step's QoS (energy about 90%),
-so MOMA-TD3 trained from scratch never finds spread formations and cruises at every weight. Why this formation:
+Why a prior: on ma3 the UAV positions explain only about 15-20% of the variance of a step's QoS (energy over 90%;
+report/scripts/position_signal.py), so MOMA-TD3 trained from scratch finds only loose formations and cruises at
+every weight. Why this formation:
 for 3 UAVs on the 2 x 2 km area, the 3-means (Lloyd) placement for uniform coverage is a near-equilateral
 triangle, and the r = 600 m triangle is within 0.4% of its RMS distance to the nearest UAV (519 m against 517 m).
 

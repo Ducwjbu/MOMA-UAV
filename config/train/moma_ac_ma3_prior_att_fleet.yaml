@@ -26,7 +26,7 @@ prior_radius: 600.0
 # TD3 hyperparameters
 actor_lr: 3.0e-4
 critic_lr: 3.0e-4
-gamma: 0.9                    # The effect of an action fades within about 2 steps (a UAV reaches any point of the area in 2 steps, queues are per step); with 0.99 the critic drifts far from the true values (TD3 paper, Sec. 5.1)
+gamma: 0.9                    # The effect of an action fades within about 2 steps (a UAV reaches any point of the area in 2 steps, queues are per step); chosen a priori, see CLAUDE.md (formation prior, why gamma 0.9)
 tau: 0.005
 policy_delay: 2
 policy_noise: 0.2

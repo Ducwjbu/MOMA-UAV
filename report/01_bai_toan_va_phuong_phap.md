@@ -63,12 +63,13 @@ di chuyển_i = clip(move_to(đỉnh_i) + a_i[0:3], -1, 1)
 
 - **Khởi tạo bằng heuristic:** các hàng di chuyển ở lớp cuối của actor được khởi tạo bằng 0, nên lúc chưa học policy chính là heuristic tam giác.
 - **Phần còn lại do mạng tự học:** công suất và băng thông không có prior.
-- **Tam giác r = 600 m:** lệch chưa tới 0.4% so với vị trí phủ tối ưu theo 3-means của khu 2 km.
+- **Tam giác r = 600 m:** khoảng cách RMS từ một điểm trong khu 2 km tới UAV gần nhất chỉ lớn hơn 0.46% so với vị trí phủ tối ưu theo 3-means (`scripts/triangle_kmeans.py`).
 
-**Vì sao cần prior?** Kiểm tra bằng học có giám sát cho thấy vị trí UAV chỉ giải thích khoảng 17% phương sai QoS của một bước. Tín hiệu quá yếu, nên MOMA-TD3 học từ đầu không tìm được đội hình dàn trải.
+**Vì sao cần prior?** Kiểm tra bằng học có giám sát trên v1.1 (`scripts/position_signal.py`) cho thấy vị trí UAV chỉ giải thích khoảng 15–20% phương sai QoS của một bước (R² trên tập kiểm tra: 0.15 từ đúng đầu vào của critic, 0.20 từ vị trí; năng lượng trên 0.9). Tín hiệu quá yếu, nên MOMA-TD3 học từ đầu chỉ tìm được đội hình lỏng: ở góc QoS cách tam giác khoảng 500 m (`ma3_g90`) và 680 m (`ma3`) khi gán đỉnh tối ưu, so với khoảng 365 m khi có prior.
 
 **Vì sao γ 0.9?**
-- **Về lý thuyết:** với γ 0.99, critic dạng vector trôi xuống thấp hơn giá trị thật rất nhiều. Ở góc năng lượng nó thậm chí âm cho QoS và công bằng, đúng hiện tượng mà TD3 paper mô tả ở Sec. 5.1. Sự trôi này kéo phần hiệu chỉnh ra xa đội hình.
+- **Về critic (đính chính 2026-11-13):** chẩn đoán lúc pilot (critic với γ 0.99 trôi xuống dưới giá trị thật, thậm chí âm) lấy từ checkpoint pilot trên env trước v1.1. Đo lại trên v1.1 (`scripts/critic_bias.py`, 100k và 1M bước), critic của cả hai γ đều đánh giá thấp QoS với tỉ lệ gần như nhau (Q khoảng 0.6–0.9 giá trị ước lượng). γ 0.99 chỉ khác ở chỗ sai số tuyệt đối lớn hơn khoảng 10 lần, và một seed của `ma3` cho Q của QoS âm ở góc công bằng. Vì vậy không dùng lập luận "critic trôi" làm lý do chính.
+- **Về cắt ngang ở bước 18:** mốc 18 bước được lưu là cắt ngang, không phải kết thúc, và quan sát không có thời gian còn lại. Critic vì vậy ước lượng một chân trời vô hạn mà nó không thấy điểm cuối; Q gần như không đổi theo bước. Với γ 0.99, phần lớn giá trị nằm sau bước 18: với một mục tiêu trong [0, 1], phần sau bước 18 có thể tới 83–99 (trung bình 91 theo các bước), trong khi bên trong episode tối đa 16.5. Với γ 0.9 phần này chỉ 1.5–9 (trung bình 4.3). Ablation γ đo chung cả hai hiệu ứng (hạn chế 14 trong `05_han_che.md`).
 - **Về tầm nhìn:** tác động của một hành động tắt dần sau khoảng 2 bước, trong khi episode dài 18 bước.
 - **Cách chọn:** γ 0.9 được chọn trước từ lập luận này và một pilot thô, không phải từ một đợt tuning có ngân sách như nhau cho mọi phương pháp. Phải nói rõ điều này trong báo cáo.
 

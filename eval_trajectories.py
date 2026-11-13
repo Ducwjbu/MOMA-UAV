@@ -11,7 +11,8 @@ Writes <out>.csv, one row per (method, seed, corner, episode, t, uav); t = -1 is
 Columns: x, y, h, power (action), bw_embb, bw_urllc, bw_mmtc (sum of the actor's bandwidth outputs over the
 slice's 3 demand areas, before the env scales them; nan at t = -1), coverage, qos, energy, fair (the team's,
 repeated for each UAV), dist_vertex (distance to the UAV's vertex of the r=600 triangle of the prior, in UAV id
-order, also for the methods without the prior).
+order, also for the methods without the prior; that overstates their distance when they hold the triangle with
+the vertices swapped, so plot_results.py also reports dist_formation_m, with the best vertex per UAV per episode).
 
 Run (checkpoints are not in git; the default glob is the runs/ layout of the course-report runs):
   py eval_trajectories.py --out results-v1.1/eval_test/trajectories
