@@ -60,7 +60,9 @@ def scene_info(env) -> dict:
     if env.city is not None:
         c = env.city
         scene["city"] = {"pitch": round(float(c.pitch), 3), "width": round(float(c.width), 3),
-                         "offset": round(float(c.offset), 3), "heights": _round(c.heights)}
+                         "offset": round(float(c.offset), 3), "heights": _round(c.heights),
+                         # v2 city.random_offset: the grid moved by -shift (city.py); [0, 0] in v1.1
+                         "shift": _round(c.shift if getattr(c, "shift", None) is not None else np.zeros(2), 3)}
     if env.traffic_map is not None:
         # log10 of the density, 8 bits between its min and max (the viewer only shades it)
         d = np.log10(np.maximum(env.traffic_map.density, 1e-12))

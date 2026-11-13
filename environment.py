@@ -534,6 +534,10 @@ class NetworkSlicingEnv:
         # v2 (TIP 6): each eMBB UE carries streams_per_ue co-located video streams (demand and required rate scale;
         # it counts once in the slice's SLA share, like every eMBB UE). Absent: 1
         self.embb_streams = float(env_config.traffic_patterns.embb.get('streams_per_ue', 1))
+        # fixed: every eMBB UE carries streams_per_ue; poisson: each draws Poisson(streams_per_ue) once (mean the same)
+        self.embb_streams_dist = str(env_config.traffic_patterns.embb.get('streams_dist', 'fixed'))
+        if self.embb_streams_dist not in ('fixed', 'poisson'):
+            raise ValueError(f"traffic_patterns.embb.streams_dist must be fixed or poisson, got {self.embb_streams_dist}")
         self.ue_max_initial_velocity = self.ue_dynamics.max_initial_velocity  # m/s
         self.max_ues = int(self.num_ues * self.ue_dynamics.max_ues_multiplier)  # Maximum UEs allowed
         self.change_direction_prob = self.ue_dynamics.change_direction_prob  # Probability of changing direction
@@ -1252,11 +1256,37 @@ class NetworkSlicingEnv:
         climb = min(self.velocity_max_vertical * self.T_L, self.uav_fly_range_h[1] - self.uav_fly_range_h[0])
         return level_and_radio * self.T_L + self.energy_models['uav_weight'] * climb
 
+    def _return_growth_bound(self) -> float:
+        """
+        Most the return leg can grow in one step (J), for this episode's wind. In a step the UAV can get farther
+        from the Home Point by at most (velocity_max + w) T_L (airspeed capped at velocity_max, a tailwind w on
+        the way out) plus a separation push (taken as 2 x min_uav_separation; a search found pushes up to about
+        56 m with 50 m), and it flies that back against a headwind w at ground speed velocity_max - w; it can
+        also climb by min(climb rate x T_L, height range), flown down again at the descent rate. w is the wind at
+        the highest altitude it may fly (the strongest). Without wind, w = 0
+        """
+        v_max = self.uav_params.velocity_max
+        top = self.uav_fly_range_h[1] if self.wind_ceiling is None else min(self.uav_fly_range_h[1], self.wind_ceiling)
+        w = float(np.linalg.norm(self._wind_at(top))) if self.wind_params is not None else 0.0
+        push = 2.0 * self.min_uav_separation if self._separation_active() else 0.0
+        away = (v_max + w) * self.T_L + push
+        v_head = max(v_max - w, 1e-3)
+        if self.wind_params is None:
+            per_metre = self._propulsion_power(v_max, 0.0) / v_max
+            descent = self._propulsion_power(0.0, -self.velocity_max_descent)
+        else:
+            per_metre = self._propulsion_power(v_head, 0.0, v_max) / v_head
+            descent = self._propulsion_power(0.0, -self.velocity_max_descent, w)
+        climb = min(self.velocity_max_vertical * self.T_L, self.uav_fly_range_h[1] - self.uav_fly_range_h[0])
+        return away * per_metre + descent * climb / self.velocity_max_descent
+
     def _leave_threshold(self, position: np.ndarray) -> float:
-        """Battery (J) at which a serving airframe leaves for the Home Point: the return leg plus the most one
-        step can draw, so that the battery still covers the return after the next step whatever the policy does
-        (the check runs once per step, the M300's Low Battery RTH continuously)"""
-        return self._home_leg(position, outbound=False)[0] + self._step_energy_bound()
+        """Battery (J) at which a serving airframe leaves for the Home Point: the return leg, plus the most one
+        step can draw, plus the most that step can lengthen the return leg (_return_growth_bound, fixed per
+        episode), so that the battery still covers the return after the next step whatever the policy does (the
+        check runs once per step, the M300's Low Battery RTH continuously)"""
+        return (self._home_leg(position, outbound=False)[0] + self._step_energy_bound()
+                + self.shift_state['growth'])
 
     def _relay_threshold(self, position: np.ndarray, role: int) -> float:
         """Battery (J) at which a serving position calls its relay: the leave threshold plus the energy of the
@@ -1284,7 +1314,8 @@ class NetworkSlicingEnv:
         airframes = []
         # Recent power draw per position (exponential average, see _shift_update); hover at full radio to start
         self.shift_state = {'power': {r: self._hover_power(self.uavs[r].position[2])
-                                      + self._radio_power(self.uavs[r].max_power) for r in roles}}
+                                      + self._radio_power(self.uavs[r].max_power) for r in roles},
+                            'growth': self._return_growth_bound()}
         for uid in ids:
             uav = self.uavs[uid]
             if uid not in roles:
@@ -1780,7 +1811,12 @@ class NetworkSlicingEnv:
             ue.packet_bytes = self.packet_bytes[ue.slice_type]
             if ue.slice_type == 'embb':
                 ue.demand_bps = tp.embb.peak_rate if np.random.random() < tp.embb.activity_factor else 0.0
-                if self.embb_streams != 1:   # v2 (TIP 6): one simulated UE carries several co-located streams
+                if self.embb_streams_dist == 'poisson':
+                    # v2 (TIP 6): each UE draws its number of streams once, at its first step: teams differ
+                    if not hasattr(ue, 'streams'):
+                        ue.streams = int(np.random.poisson(self.embb_streams))
+                    ue.demand_bps *= ue.streams   # 0 streams: no demand, like an idle UE
+                elif self.embb_streams != 1:   # v2 (TIP 6): one simulated UE carries several co-located streams
                     ue.streams = self.embb_streams
                     ue.demand_bps *= self.embb_streams
             elif ue.slice_type == 'urllc':
@@ -3103,9 +3139,9 @@ class NetworkSlicingEnv:
         of the rate estimate. Clipped to [0.05, 0.95]. Depends only on the config"""
         if self._target_load is not None:
             return self._target_load
-        tp = self.traffic_patterns
-        packet_bytes = {'embb': float(tp.embb.packet_size), 'urllc': float(tp.urllc.packet_size),
-                        'mmtc': float(tp.mmtc.payload_cap) + float(tp.mmtc.overhead)}
+        # The mean packet of each slice, as the queues use it (self.packet_bytes; mMTC: the capped Pareto mean, not
+        # the cap, which an independent audit noted on 2026-11-14)
+        packet_bytes = {s: float(self.packet_bytes[s]) for s in ('embb', 'urllc', 'mmtc')}
         buffer_bits = self.uav_buffer_size / (3.0 if self.per_slice_queues else 1.0)
         out = {}
         for s in ('embb', 'urllc', 'mmtc'):
@@ -3421,7 +3457,7 @@ class NetworkSlicingEnv:
 
     def _required_rate(self, ue) -> float:
         """The rate a UE's SLA asks for: the slice's min_rate per stream, times the streams it carries (v2 TIP 6,
-        traffic_patterns.embb.streams_per_ue; 1 otherwise)"""
+        traffic_patterns.embb.streams_per_ue and streams_dist; 1 otherwise)"""
         rate = self.qos_profiles[ue.slice_type].min_rate
         streams = getattr(ue, 'streams', 1)
         return rate if streams == 1 else rate * streams

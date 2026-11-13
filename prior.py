@@ -126,6 +126,17 @@ def weighted_kmeans(points: np.ndarray, weights: np.ndarray, k: int, n_init: int
     return best
 
 
+def uniform_vertices(env, n: int, cell: float = 40.0) -> np.ndarray:
+    """k-means (k = n) of the service area itself, every cell weighted the same, at the top altitude: a placement
+    that knows the area but not the demand (a baseline for demand_vertices)"""
+    width, height = env.service_area
+    gx, gy = np.meshgrid((np.arange(int(np.ceil(width / cell))) + 0.5) * cell,
+                         (np.arange(int(np.ceil(height / cell))) + 0.5) * cell, indexing="ij")
+    grid = np.stack([np.minimum(gx.ravel(), width), np.minimum(gy.ravel(), height)], axis=1)
+    c = weighted_kmeans(grid, np.ones(len(grid)), n)
+    return np.concatenate([c, np.full((n, 1), float(env.uav_fly_range_h[1]))], axis=1)
+
+
 def demand_vertices(env, n: int) -> np.ndarray:
     """k-means (k = n) of the episode's expected demand (demand_points), at the top altitude"""
     points, weights = demand_points(env)
@@ -141,10 +152,11 @@ def assign_vertices(env, uav_ids, radius: float, mode: str = "ngon", cache: dict
     active = [uid for uid in uav_ids if env.uavs[uid].active]
     if not active:
         return {}
-    if mode == "demand":
+    if mode in ("demand", "uniform"):
         cache = {} if cache is None else cache
         if len(active) not in cache:
-            cache[len(active)] = demand_vertices(env, len(active))
+            place = demand_vertices if mode == "demand" else uniform_vertices
+            cache[len(active)] = place(env, len(active))
         vertices = cache[len(active)]
     else:
         vertices = formation_vertices(env, radius, len(active))
@@ -161,9 +173,10 @@ def attach(env, uav_ids, radius: float, mode: str = "ngon"):
     the n-gon of the active UAVs is reassigned whenever the active set changes (a reset, a withdrawal, a position
     left empty or filled again in a shift). mode demand (v2, TIP 7): the vertices are the weighted k-means of the
     episode's expected demand for the number of active UAVs (demand_vertices), recomputed at each reset and
-    reassigned whenever the active set changes."""
-    if mode not in ("ngon", "demand"):
-        raise ValueError(f"prior mode must be ngon or demand, got {mode}")
+    reassigned whenever the active set changes. mode uniform: the same with the k-means of the area itself
+    (uniform_vertices), a baseline that ignores the demand."""
+    if mode not in ("ngon", "demand", "uniform"):
+        raise ValueError(f"prior mode must be ngon, demand or uniform, got {mode}")
     vertices = formation_vertices(env, radius, len(uav_ids)) if mode == "ngon" else None
     fixed = {uid: vertices[i] for i, uid in enumerate(uav_ids)} if mode == "ngon" else None
     cache = {"active": None, "targets": fixed, "kmeans": {}}

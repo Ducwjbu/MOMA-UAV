@@ -5,8 +5,13 @@ check_tip1.py (TIP 1 of docs/v2/plan.md)
    slice's UEs meeting their SLA (info['sla_<slice>']; a slice without demand counts 1 in the objective, nan in info)
    at every step. Run on 5 validation episodes (100000+) of config/environment/v2.yaml (3 UAVs, without the shift
    section of TIP 4) with random actions.
-2. At the default sharpness, prints the mean objective next to the mean binary share, and the share of UE-steps in
-   each slice that fail on each KPI (rate, delay, reliability), to see where the v2 thresholds bind.
+   In v2 the binary share itself uses the margin (margin >= -sla_tolerance), so this only checks the sigmoid limit.
+2. Independently of the margin: for every served UE with demand, the v1.1 rule (the smallest of the rate, delay and
+   reliability satisfactions is 1 within 1e-9, qos_aggregation min) must agree with margin >= -sla_tolerance.
+   Added after an independent audit (2026-11-14) noted that check 1 alone is tautological.
+3. At the default sharpness, prints the mean objective next to the mean binary share, and the share of UE-steps in
+   each slice that fail on each KPI (rate, delay, reliability), to see where the v2 thresholds bind. The objective
+   is not a smoothed share: at sharpness 4 a UE exactly at its SLA scores 0.5 and margin beyond it still counts.
 
 Run from the repo root: py docs/v2/check_tip1.py
 """
@@ -39,7 +44,7 @@ def v2_config():
     return path
 
 
-def run(sharpness, n_ep=5, seed_base=100000, kpi_log=None):
+def run(sharpness, n_ep=5, seed_base=100000, kpi_log=None, agree=None):
     with contextlib.redirect_stdout(io.StringIO()):
         env = NetworkSlicingEnv(config_path=v2_config())
     if sharpness is not None:
@@ -74,6 +79,14 @@ def run(sharpness, n_ep=5, seed_base=100000, kpi_log=None):
                     if ue.failure_rate > (1 - p.min_reliability) * (1 + 1e-9):
                         kpi_log.append((ue.slice_type, "reliability"))
                     kpi_log.append((ue.slice_type, "ue-steps"))
+                    if agree is not None:
+                        thr_sat, thr = env._calculate_throughput_satisfaction(ue)
+                        delay_sat, delay = env._calculate_delay_satisfaction(ue)
+                        rel_sat = env._calculate_reliability_satisfaction(ue)
+                        rel_sat = rel_sat[0] if isinstance(rel_sat, tuple) else rel_sat
+                        old = min(thr_sat, delay_sat, rel_sat) >= 1.0 - 1e-9
+                        new = env._sla_margin(ue, thr, delay) >= -env.sla_tolerance
+                        agree.append(old == new)
             if done:
                 break
     return np.array(rows, dtype=float), names
@@ -88,8 +101,10 @@ def main():
     print("sharpness 1e12: max |objective - binary share| per slice:", np.round(diff.max(0), 12))
     ok = bool(np.all(diff < 1e-6))
 
-    log = []
-    r, _ = run(None, kpi_log=log)
+    log, agree = [], []
+    r, _ = run(None, kpi_log=log, agree=agree)
+    print(f"\nv1.1 rule against the margin, served UE-steps: {len(agree)}, disagreements {len(agree) - sum(agree)}")
+    ok = ok and len(agree) > 0 and all(agree)
     print("\ndefault sharpness: mean objective / mean binary share (nan skipped)")
     for j, s in enumerate(SLICES):
         print(f"  {s:6s} {np.mean(r[:, j]):.3f} / {np.nanmean(r[:, 3 + j]):.3f}")

@@ -90,10 +90,10 @@ channel:
 # queue delay only, so the delay budget is the Packet Delay Budget minus the core-network share given in the notes
 # of that table. Reliability is 1 - Packet Error Rate
 qos_profiles:
-    embb: # Mission-critical video (5QI 67: GBR, PDB 100 ms, PER 1e-3; core share 10 ms, note 13 of the table)
-        min_rate: 2e6 # bps: TS 22.125 Table 7.2-2 (480p video); within mission-critical video's 150 kbps - 5 Mbps
-                      # (Ericsson, arXiv:2103.02434) and near NIST PSCR's 1.5 Mb/s standard video (docs/v2/sources.md)
-        max_latency: 90.0 # ms
+    embb: # Mission-critical video (5QI 67: GBR, PDB 100 ms, PER 1e-3; NOTE 13: static CN PDB 20 ms to subtract)
+        min_rate: 2e6 # bps: TS 22.125 Table 7.2-2 (480p video); ECC Report 199 sizes PPDR video streams at 768 kbps,
+                      # NIST PSCR uses 1.5 Mb/s standard video (docs/v2/sources.md)
+        max_latency: 80.0 # ms: 100 ms PDB less the 20 ms CN PDB of NOTE 13 (90 ms before the audit of 2026-11-14)
         min_reliability: 0.999
     urllc: # Road-side units of an ITS, TS 22.261 Table 7.2.3.2-1 (10 Mbps); 5QI 84 (PDB 30 ms, PER 1e-5, core 5 ms)
         min_rate: 10e6
@@ -108,9 +108,9 @@ qos_profiles:
 # The QoS objective averages within each slice and then weights the slices, so counts set load, not priority
 slicing:
     slice_probabilities:
-        embb: 0.341 # 31 eMBB UEs: with the 260 Mbps of the RSUs, mean offered load = fleet capacity
-        urllc: 0.0 # (566 Mbps, 3 UAVs hovering at full power, all RBs to a mean covered UE). Sensitivity: eMBB x0.5, x1.5; rsu.spacing 2000
-        mmtc: 0.659 # 60 mMTC: 20 per UAV, enough points to measure coverage (design)
+        embb: 0.341 # 31 eMBB UEs (v1.1 count, sized there to 3 UAVs); in v2 the eMBB load is set by
+        urllc: 0.0 #   traffic_patterns.embb.streams_per_ue (TIP 6), the URLLC load by the RSUs
+        mmtc: 0.659 # 60 mMTC: enough points to measure coverage (design)
     # v2 (TIP 2): one queue per slice, served by the slice's own rates, with a third of the buffer each (assumed).
     # v1.1 had one queue per UAV, so the rate of mMTC UEs (almost no load) served eMBB and URLLC packets
     # (report/05_han_che.md, item 4)
@@ -187,10 +187,12 @@ traffic_patterns:
     embb:
         packet_size: 1500 # bytes
         peak_rate: 2e6 # v2 (TIP 1): the video rate of qos_profiles.embb, streamed all the time. Mission-critical video
-        activity_factor: 1.0 # needs 150 kbps - 5 Mbps (Ericsson, arXiv:2103.02434); NIST PSCR uses 1.5 Mb/s standard video
-        streams_per_ue: 2.6 # v2 (TIP 6): mean co-located video streams per simulated eMBB UE (a team's cameras): the
-                            # largest value on a 0.1 grid for which 6 serving UAVs (k-means prior, even shares) still
-                            # meet the SLA of 80% of covered eMBB UEs (docs/v2/check_tip6.py calibrate). Design
+        activity_factor: 1.0 # streamed all the time
+        streams_per_ue: 2.4 # v2 (TIP 6): mean co-located video streams per simulated eMBB UE (a team's cameras),
+                            # calibrated in docs/v2/check_tip6.py on 10 episodes (largest mean on a 0.1 grid for which 6 UAVs,
+                            # k-means prior, even shares, still meet the SLA of 80% of covered eMBB UEs). Design: the
+                            # PPDR load of ECC Report 199 (two major incidents, ~10-15 Mbps) is about 10x lower
+        streams_dist: poisson # each UE draws Poisson(streams_per_ue) streams once; teams differ (0: no demand)
     urllc:
         packet_size: 256 # TS 22.261 allows small (<= 256 B) to big; small chosen
         rate: 10e6 # Note 4 of the table: every application needs the experienced rate
@@ -379,7 +381,7 @@ shift:
     spares_per_uav: 0.5        # spare airframes = ceil(0.5 S): design, sized with docs/v2/check_tip4.py (with 1.5
                                # BS60 per position: 0.25 leaves a position empty 1.9% of the time at S = 3, 0.5 never)
     swap_steps: 1              # hot swap of the TB60 pair in 60 s: Lee, Zhou & Lin, ICUAS 2015, pp. 118-124
-                               # (cited by Galkin & DaSilva, arXiv:1807.00996, Sec. V)
+                               # (cited by Galkin, Kibilda & DaSilva, IEEE Commun. Mag. 2019, arXiv:1807.00996, Sec. V)
     launch_soc: 0.9            # an airframe takes off with a pair at least this full (end of the fast CC phase): design
     relay_power_margin: 0.1    # relay call: the position's recent power draw + 10% over the steps a spare needs to
                                # fly out (design); the leave threshold uses the most one step can draw instead

@@ -393,5 +393,50 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
   - S = 8 có tỉ lệ đạt (0.776) thấp hơn S = 6 (0.801): k-means đặt UAV theo cả ba slice, và 3 episode là mẫu nhỏ.
   - Tỉ số tải / năng lực ở S = 6 chỉ 0.31: năng lực trung bình không phải thước đo đúng, ràng buộc nằm ở UE sóng yếu.
 - **DEVIATIONS:**
-  - Plan ghi "UE có trọng số (tải và đếm SLA nhân w)". Bản cài nhân tải và tốc độ yêu cầu; mỗi UE vẫn đếm một lần trong tỉ lệ SLA của slice, vì mọi UE eMBB cùng w nên trung bình không đổi.
+  - Plan ghi "UE có trọng số (tải và đếm SLA nhân w)". Bản cài nhân tải và tốc độ yêu cầu; mỗi UE vẫn đếm một lần trong tỉ lệ SLA của slice. Không tương đương đếm từng luồng: các luồng của một UE được cả hoặc trượt cả (kiểm độc lập 2026-11-14).
   - Ngưỡng hiệu chỉnh lúc đầu là 0.75 (lệch plan), sửa về 0.80 của plan.
+
+### Kiểm độc lập và các sửa sau đó (2026-11-14)
+
+Một agent không có ngữ cảnh của cuộc trò chuyện đã kiểm `ee68411..5ed15d9` (chỉ đọc, chạy lại các script). Kết luận chính:
+- v1.1 giống từng bit: agent ghi lại tham chiếu từ `git archive ee68411`, khớp `runs/check_v11_ref`.
+- Hầu hết số liệu tái tạo đúng.
+- Có hai lỗi nặng, xem bảng.
+
+| Phát hiện | Mức | Sửa |
+|---|---|---|
+| Ngưỡng phải về chỉ tính chặng về từ vị trí hiện tại; bước sau UAV có thể xa thêm khoảng 1 km. Với policy zig-zag: 50/266 lần về thiếu năng lượng. Kiểm "pin không âm" không bao giờ bắt được vì `step` kẹp pin ở 0 | Nặng | `_return_growth_bound` (mỗi episode): quãng xa thêm tối đa `(v_max + w) T_L` + 2 × khoảng cách tối thiểu, bay về ngược gió `w` (gió ở độ cao cao nhất), cộng leo tối đa rồi hạ. `check_tip4.py` thêm bộ Z (S = 10, zig-zag, không dự phòng). Code cũ trượt bộ Z (52 lần thiếu trong 3 ca), code mới 0 |
+| TIP 6 hiệu chỉnh và kiểm trên cùng 3 episode, nên (b) đạt là đương nhiên. Đổi bộ 3 episode lệch khoảng 0.13. Tiêu chí chỉ tính UE đã được phủ mà không ghi là lệch plan | Nặng | Hiệu chỉnh trên 10 episode (100000+), kiểm trên 10 episode khác (100100+) với CI bootstrap 90%. Tiêu chí đặt lại trước khi chạy: (b) CI nằm trong [0.70, 0.90] và chứa 0.80; (c) ≥ 5% trượt vì tốc độ. Ghi rõ là lệch plan |
+| 5QI 67: NOTE 13 là CN PDB 20 ms, không phải 10 ms | Nhỏ | `max_latency` eMBB 90 → 80 ms |
+| Số cũ trong CLAUDE.md và các Completion Report | Nhỏ | CLAUDE.md cập nhật theo lần chạy này; các báo cáo cũ giữ số lúc đó |
+| Kiểm TIP 1 gần như tự đúng (chia sẻ nhị phân v2 cũng dùng biên) | Nhỏ | Thêm phép so độc lập với luật v1.1 (min các độ thoả mãn = 1): 0 bất đồng trên 2345 UE-bước |
+| Baseline yếu: đa giác đều (TIP 7), chia đều có RB bỏ trống (TIP 2) | Nhỏ | Báo cáo thêm k-means đều trên vùng (`prior_mode: uniform`) và chia đều với `rb_sharing: all` |
+| Trích dẫn: B. Galkin (không phải V.), đã đăng IEEE Commun. Mag. 2019; tên bài Ericsson sai và khoảng 150 kbps – 5 Mbps không có trong abstract | Nhỏ | Sửa trong `sources.md` và `v2.yaml`; tốc độ video dựa vào ECC Report 199 (768 kbps) và NIST (1.5 Mb/s) |
+| Bộ lập lịch dùng gói mMTC lớn nhất thay vì trung bình | Ghi chú | Dùng `self.packet_bytes` như hàng đợi (không đổi kết quả: mMTC vẫn kẹp ở 0.95) |
+| Trình xem vẽ nhà sai chỗ khi lưới dời | Ghi chú | `record.py` xuất `shift`, `viewer.html` dời theo |
+
+**Kết quả sau sửa** (worktree `tip6b`, tất cả trên v2 hiện tại):
+- **v1.1:** không đổi.
+- **TIP 1:** PASS, 0 bất đồng.
+- **TIP 2:** PASS. SLA eMBB / URLLC / mMTC:
+
+  | Chế độ | SLA |
+  |---|---|
+  | Chia đều 9 DA | 0.094 / 0.127 / 0.446 |
+  | Chia đều + `rb_sharing: all` | 0.102 / 0.243 / 0.446 |
+  | `slice_share` | 0.141 / 0.254 / 0.446 |
+
+  Phần lớn lợi ích cho URLLC là từ việc không để RB trống; bộ lập lịch thêm chủ yếu cho eMBB.
+- **TIP 4:** PASS, gồm bộ Z.
+- **TIP 7:** PASS. SLA trung bình theo S: demand 0.476, n-gon 0.399, k-means đều 0.357 (thấp nhất). Cái giúp là trọng số theo nhu cầu.
+- **TIP 6:** số luồng rút Poisson mỗi UE (`streams_dist: poisson`), hiệu chỉnh lại ra trung bình 2.4 (ngưỡng trễ 80 ms).
+  - Trên 10 episode kiểm: dân số 90.6; tỉ lệ đạt SLA của eMBB đã được phủ ở S = 6 là 0.756 [0.656, 0.844].
+  - (a), (c), (d) ok. **(b) FAIL:** CI chứa 0.80 nhưng cận dưới < 0.70. Giữa các episode chênh nhau nhiều, 10 episode không đủ.
+  - Chưa đổi ngưỡng; chờ bạn quyết (thêm episode cho cả hiệu chỉnh và kiểm, hoặc chấp nhận).
+- **Smoke train v2** chạy hết.
+
+**Giả định phải ghi rõ** (agent nêu):
+- Trạm sạc dùng điện không giới hạn (máy phát) dù lưới điện có thể hỏng.
+- Mỗi UE gánh mọi luồng của nó theo kiểu được cả hoặc không, nên đếm UE một lần không tương đương đếm từng luồng (sửa câu DEVIATIONS của TIP 6).
+- Mục tiêu năng lượng bằng 0 khi không vị trí nào phục vụ.
+- 31 phút của M300 được coi là thời gian treo, nên thời gian bay đều của mô hình khoảng 38 phút.

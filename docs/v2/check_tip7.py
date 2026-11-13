@@ -6,6 +6,8 @@ config/environment/v2.yaml, with the shift's serving positions fixed at S = 2, 3
 (100000+) of 60 steps each. Two prior modes:
   ngon     the regular S-gon of radius 600 m around the middle (the v1.1 prior, made for S = 3)
   demand   the weighted k-means of the episode's expected demand for the positions serving (prior.demand_vertices)
+  uniform  the k-means of the area itself, every cell the same (prior.uniform_vertices): reported only, added after
+           an independent audit (2026-11-14) noted that the n-gon is a weak baseline at S != 3
 
 Reported per S and mode, from step 6 on (the UAVs reach their vertices within 3 steps): coverage, the three SLA
 objectives (sla_embb, sla_urllc, sla_mmtc, mean over steps) and their mean, and the time to compute the k-means.
@@ -77,11 +79,14 @@ def main():
     rows = {}
     print("  S  mode     coverage   sla_embb  sla_urllc  sla_mmtc   SLA mean   k-means s")
     for S in (2, 3, 6, 10):
-        for mode in ("ngon", "demand"):
+        for mode in ("ngon", "uniform", "demand"):
             cov, sla, tk = run(S, mode)
             rows[(S, mode)] = (cov, sla.mean())
             print(f"{S:3d}  {mode:7s}  {cov:8.3f}   {sla[0]:8.3f}  {sla[1]:9.3f}  {sla[2]:8.3f}   {sla.mean():8.3f}"
                   f"   {tk:9.3f}", flush=True)
+    cov_u = np.mean([rows[(S, 'uniform')][0] for S in (2, 3, 6, 10)])
+    sla_u = np.mean([rows[(S, 'uniform')][1] for S in (2, 3, 6, 10)])
+    print(f"uniform k-means (reported only): coverage {cov_u:.3f}, SLA mean {sla_u:.3f}")
     cov_d = np.mean([rows[(S, 'demand')][0] for S in (2, 3, 6, 10)])
     cov_n = np.mean([rows[(S, 'ngon')][0] for S in (2, 3, 6, 10)])
     sla_d = np.mean([rows[(S, 'demand')][1] for S in (2, 3, 6, 10)])

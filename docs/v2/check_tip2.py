@@ -34,14 +34,17 @@ CONFIG = "config/environment/v2.yaml"
 SLICES = ("embb", "urllc", "mmtc")
 
 
-def v2_config(action=True):
-    """v2.yaml as it was at TIP 2: 3 UAVs, one sortie (no shift section); without the action section if asked"""
+def v2_config(action=True, rb_sharing=None):
+    """v2.yaml as it was at TIP 2: 3 UAVs, one sortie (no shift section); without the action section if asked,
+    with slicing.rb_sharing set if given"""
     with open(CONFIG, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     cfg.pop("shift", None)
     cfg["system"]["num_uavs"] = 3
     if not action:
         cfg.pop("action", None)
+    if rb_sharing is not None:
+        cfg["slicing"]["rb_sharing"] = rb_sharing
     path = os.path.join(tempfile.mkdtemp(prefix="check_tip2_"), "v2_tip2.yaml")
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
@@ -85,9 +88,12 @@ def run(config, n_ep=10, seed_base=100000):
 
 def main():
     res = {"demand_areas": run(v2_config(action=False)), "slice_share": run(v2_config())}
-    print("mode           SLA share eMBB / URLLC / mMTC     UAV-steps with idle RBs   idle share then")
+    # Reported only (added after the independent audit of 2026-11-14): the 9 even fractions with the unreserved
+    # and idle RBs shared out (rb_sharing all), to separate what the scheduler adds from what sharing RBs adds
+    res["demand_areas+all"] = run(v2_config(action=False, rb_sharing="all"))
+    print("mode              SLA share eMBB / URLLC / mMTC     UAV-steps with idle RBs   idle share then")
     for mode, (sla, idle, share) in res.items():
-        print(f"{mode:14s} {sla[0]:.3f} / {sla[1]:.3f} / {sla[2]:.3f}            {idle:.2f}                      "
+        print(f"{mode:17s} {sla[0]:.3f} / {sla[1]:.3f} / {sla[2]:.3f}            {idle:.2f}                      "
               f"{share:.2f}")
     sla_new, idle_new, _ = res["slice_share"]
     sla_old = res["demand_areas"][0]

@@ -8,8 +8,12 @@ power and even slice shares, on validation seeds (100000+). Two set-ups, each wi
 and, for the record, the v2 defaults (1.5 BS60 and 0.5 spare per serving position) and an under-equipped team
 (1 BS60 per position), each at S = 3 and S = 10.
 
-Checked at every step: the episode ends with done exactly at step 240; no serving battery below 0 and no airframe
-short of energy for its return leg; the number of battery pairs is conserved (depot + airframes holding a pair).
+Also Z: S = 10 with no spares, each position zig-zagging at full speed away from and back toward the Home Point
+(the case an independent audit found to leave airframes short of their return energy, 50 of 266 departures).
+
+Checked at every step: the episode ends with done exactly at step 240; no airframe short of energy for its
+return leg (battery_short: step clamps the battery at 0, so a short leg shows only there); the number of battery
+pairs is conserved (depot + airframes holding a pair).
 Over the shift: every serving position is handed over at least once (A, B). Reported: relays, the share of
 position-steps left empty, airframe-steps waiting for a pair, battery swaps per airframe, ms per step.
 PASS: all checks hold in every set-up, A has no empty position, and B has at least one airframe waiting.
@@ -48,7 +52,18 @@ def pairs_held(env):
     return len(st["pool"]) + sum(a["state"] != "waiting" for a in st["airframes"])
 
 
-def run(config, n_ep=2, seed_base=100000):
+def zigzag(env, t, n_share):
+    """Full speed straight away from the Home Point on odd steps, straight back on even ones, power 1"""
+    acts = {}
+    for uid, uav in env.uavs.items():
+        d = uav.position[:2] - env.home_position[:2]
+        d = d / max(np.linalg.norm(d), 1e-9)
+        sign = 1.0 if t % 2 else -1.0
+        acts[uid] = np.concatenate([sign * d, [0.0, 1.0], np.full(n_share, 1.0 / n_share)])
+    return acts
+
+
+def run(config, n_ep=2, seed_base=100000, policy="hover"):
     with contextlib.redirect_stdout(io.StringIO()):
         env = NetworkSlicingEnv(config_path=config)
     n_share = env.act_dim - 4
@@ -66,7 +81,8 @@ def run(config, n_ep=2, seed_base=100000):
         for t in range(1, 1000):
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(io.StringIO()):
-                _, _, done, info = env.step({u: action for u in env.uavs})
+                acts = {u: action for u in env.uavs} if policy == "hover" else zigzag(env, t, n_share)
+                _, _, done, info = env.step(acts)
             res["ms"].append(1000 * (time.perf_counter() - t0))
             for r in st["roles"]:
                 uav = env.uavs[r]
@@ -92,7 +108,7 @@ def run(config, n_ep=2, seed_base=100000):
         if st["battery_short"]:
             res["ok"] = False
             res["msgs"].append(f"ep {ep}: {st['battery_short']} return legs short of energy")
-        if not all(handed.values()):
+        if policy == "hover" and not all(handed.values()):   # Z has no spares: the same airframe comes back
             res["ok"] = False
             res["msgs"].append(f"ep {ep}: positions never handed over: {[r for r, h in handed.items() if not h]}")
         res["swaps"] += [a["swaps"] for a in st["airframes"]]
@@ -107,6 +123,8 @@ def main():
               "S=3,  1 BS60 per position": config_with(n_serving=[3, 3], stations_per_uav=1.0),
               "S=10, 1 BS60 per position": config_with(n_serving=[10, 10], stations_per_uav=1.0)}
     out = {name: run(path) for name, path in setups.items()}
+    out["Z  S=10, zig-zag, no spares"] = run(config_with(n_serving=[10, 10], spares_per_uav=0.0), n_ep=4,
+                                              policy="zigzag")
     print("set-up                         relays  empty share  airframe-steps waiting  swaps/airframe  ms/step")
     for name, r in out.items():
         print(f"{name:30s} {r['relays']:6d}  {r['empty'] / max(r['pos_steps'], 1):11.3f}  {r['waiting']:22d}  "
