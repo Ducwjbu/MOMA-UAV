@@ -17,8 +17,12 @@ Also reported against each --baseline: the difference of the means with its CI, 
 improvement P(X > Y) over pairs of seeds (Agarwal et al. 2021, Sec. 5), which is 1 when every seed of the
 method beats every seed of the baseline.
 
-A --family is a fixed set of non-learning policies, one file (n_episodes, n_policies, 3) with no seeds. Its
+A --family is a fixed set of non-learning policies, one file (n_episodes, n_policies, n_obj) with no seeds. Its
 hv is that of the set of points and its eu_front picks the best policy at each eval omega; eum is undefined.
+
+Objectives: 3 in the files means the v1.1 vector (qos, energy, fair); otherwise --objectives names them, in the
+env's order (default for 4: the v2 vector sla_embb sla_urllc sla_mmtc energy). HV is the trainer's
+(train_moma_ac.front_hv). Every file must come from the same N (eval_checkpoint.py --n_serving): HV is per N.
 
 Run:
   py aggregate_seeds.py --method ma3 "evals/ma3_s*_actor.npy" --method ma3_prior "evals/ma3_prior_s*_actor.npy" \
@@ -32,28 +36,29 @@ import numpy as np
 import pandas as pd
 
 from eval_checkpoint import eval_omegas
-from train_moma_ac import HV_REF_POINT, _hv_3d
+from train_moma_ac import V11_OBJECTIVES, V2_OBJECTIVES, front_hv
 
 METRICS = ("hv", "eum", "eu_front")
 CORNERS = ("qos", "energy", "fair")
 
 
-def seed_metrics(front: np.ndarray, omegas: np.ndarray, family: bool) -> dict:
-    """front: mean reward vectors (n_points, 3). For an agent point i is its policy at omegas[i]."""
+def seed_metrics(front: np.ndarray, omegas: np.ndarray, family: bool, names=V11_OBJECTIVES) -> dict:
+    """front: mean reward vectors (n_points, n_obj). For an agent point i is its policy at omegas[i]."""
     return {
-        "hv": float(_hv_3d(front, HV_REF_POINT)),
+        "hv": float(front_hv(front, names)),
         "eum": np.nan if family else float((front * omegas).sum(axis=1).mean()),
         "eu_front": float((omegas @ front.T).max(axis=1).mean()),
     }
 
 
-def method_score(runs: list, omegas: np.ndarray, family: bool, seed_idx=None, ep_idx=None) -> dict:
+def method_score(runs: list, omegas: np.ndarray, family: bool, seed_idx=None, ep_idx=None,
+                 names=V11_OBJECTIVES) -> dict:
     """Mean over the (resampled) seeds of each seed's metrics on the (resampled) episodes."""
     seed_idx = range(len(runs)) if seed_idx is None else seed_idx
     rows = []
     for s in seed_idx:
         r = runs[s] if ep_idx is None else runs[s][ep_idx]
-        rows.append(seed_metrics(r.mean(axis=0), omegas, family))
+        rows.append(seed_metrics(r.mean(axis=0), omegas, family, names))
     return {m: float(np.mean([row[m] for row in rows])) for m in METRICS}
 
 
@@ -64,6 +69,8 @@ def main():
     parser.add_argument("--family", nargs=2, action="append", default=[], metavar=("NAME", "NPY"),
                         help="A set of non-learning policies in one .npy, shape (n_episodes, n_policies, 3)")
     parser.add_argument("--baseline", action="append", default=[], help="Name to report differences against")
+    parser.add_argument("--objectives", nargs="+", default=None,
+                        help="Objective names in file order; default qos energy fair for 3, the v2 vector for 4")
     parser.add_argument("--n_boot", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", required=True, help="Output prefix: <out>.csv and <out>_seeds.csv")
@@ -86,17 +93,25 @@ def main():
     if len(n_ep) != 1 or len(n_omega) > 1 or any(r.shape[0] != next(iter(n_ep)) for runs, _, _ in methods.values() for r in runs):
         parser.error(f"All files need the same eval episodes and omegas (episodes {n_ep}, omegas {n_omega})")
     n_ep = n_ep.pop()
-    omegas = eval_omegas(n_omega.pop() if n_omega else 30)
+    n_obj = {r.shape[2] for runs, _, _ in methods.values() for r in runs}
+    if len(n_obj) != 1:
+        parser.error(f"All files need the same objectives (got {sorted(n_obj)} per point)")
+    n_obj = n_obj.pop()
+    names = args.objectives or {3: V11_OBJECTIVES, 4: V2_OBJECTIVES}.get(n_obj)
+    if names is None or len(names) != n_obj:
+        parser.error(f"--objectives must name the {n_obj} objectives of the files")
+    corners = CORNERS if list(names) == V11_OBJECTIVES else list(names)
+    omegas = eval_omegas(n_omega.pop() if n_omega else 30, n_obj)
 
     # Point estimates and per-seed values
     seed_rows, point = [], {}
     for name, (runs, fam, files) in methods.items():
-        point[name] = method_score(runs, omegas, fam)
+        point[name] = method_score(runs, omegas, fam, names=names)
         for f, r in zip(files, runs):
-            row = {"method": name, "file": f, **seed_metrics(r.mean(axis=0), omegas, fam)}
+            row = {"method": name, "file": f, **seed_metrics(r.mean(axis=0), omegas, fam, names)}
             if not fam:
-                for c, cname in enumerate(CORNERS):
-                    for o, oname in enumerate(CORNERS):
+                for c, cname in enumerate(corners):
+                    for o, oname in enumerate(corners):
                         row[f"w_{cname}_{oname}"] = float(r[:, c, o].mean())   # Corner weight c, objective o
             seed_rows.append(row)
 
@@ -109,7 +124,7 @@ def main():
         scores = {}
         for name, (runs, fam, _) in methods.items():
             seed_idx = rng.integers(0, len(runs), len(runs))
-            scores[name] = method_score(runs, omegas, fam, seed_idx, ep_idx)
+            scores[name] = method_score(runs, omegas, fam, seed_idx, ep_idx, names)
             for m in METRICS:
                 boot[name][m].append(scores[name][m])
         for (name, b), d in diff.items():

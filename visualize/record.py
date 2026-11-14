@@ -10,8 +10,16 @@ the env receives (residual + prior) is read by wrapping the inner step that prio
 the env, the agent or the RNG changes, so the recorded episode is the one eval_checkpoint.py scores (checked
 bit-for-bit, see plan.md P0.4).
 
+v2 (docs/v2/plan.md TIP 8): the corners and the reward are the env's objectives (meta.objectives), bw is the
+action's slice share (7-dim action), the vertex is the UAV's current prior target (env.prior_targets, read with no
+side effect on the run: the prior's cache gets what its next step computes anyway), and the team block has the
+serving positions and empty ones of a shift. --n_serving fixes the serving positions. --controller records a run of
+eval_controller.py (omega chosen at every step from KPI targets, --constraint): each frame then has ctrl (omega,
+the mean over UAVs for local, and lambda per constraint, the mean over UAVs for local), drawn by the viewer.
+
 Run from the repo root (environment.py loads its config by relative path):
   py -m visualize.record --methods ma3_prior ma3 --episodes 0 1 --out visualize/out/run1 --html
+  py -m visualize.record --methods v2_prior --n_serving 6 --controller pid --constraint sla_urllc:0.8 --out o --html
 """
 
 import argparse
@@ -29,8 +37,10 @@ import numpy as np
 
 import agents_moma_ac
 import prior
-from eval_checkpoint import load_trainer
-from eval_trajectories import CORNERS, METHODS
+import eval_controller
+from eval_checkpoint import env_config_for, load_trainer
+from eval_trajectories import CORNERS, METHODS, corners_of
+from train_moma_ac import V11_OBJECTIVES
 
 SLICES = ("embb", "urllc", "mmtc")
 # UE status codes in the trace (the viewer has the same table)
@@ -127,7 +137,9 @@ def snapshot(env, uids, tracks, residual=None, combined=None, pre_pos=None, info
 
     vertices = None
     if radius is not None:
-        if getattr(env, "fleet", None) is not None:
+        if getattr(env, "shift", None) is not None or getattr(env, "prior_mode", "ngon") != "ngon":
+            vertices = env.prior_targets() if hasattr(env, "prior_targets") else None
+        elif getattr(env, "fleet", None) is not None:
             # The n-gon of the active UAVs (the prior switches to it from the step after a change)
             vertices = prior.assign_vertices(env, uids, radius)
         else:
@@ -147,7 +159,8 @@ def snapshot(env, uids, tracks, residual=None, combined=None, pre_pos=None, info
                 "residual": _round(residual[u][0:3], 4),
                 "move": _round(a[0:3], 4),            # residual + prior, clipped: what the env received
                 "power_cmd": round(float(a[3]), 3),
-                "bw": [round(float(np.sum(a[4 + 3 * s:7 + 3 * s])), 3) for s in range(3)],
+                "bw": ([round(float(a[4 + s]), 3) for s in range(3)] if len(a) == 7    # slice_share
+                       else [round(float(np.sum(a[4 + 3 * s:7 + 3 * s])), 3) for s in range(3)]),
                 "cmd_target": _round(commanded_target(env, uav, pre_pos[u], a)),
                 "pre": _round(pre_pos[u]),
             })
@@ -162,6 +175,9 @@ def snapshot(env, uids, tracks, residual=None, combined=None, pre_pos=None, info
             "n_active": int(info.get("n_active", len(uids))),
             "sla": [None if np.isnan(info[f"sla_{s}"]) else round(float(info[f"sla_{s}"]), 4) for s in SLICES],
         }
+        if "n_serving_step" in info:   # v2 shift
+            frame["team"].update({"n_serving": int(info["n_serving_step"]), "gaps": int(info["gaps"]),
+                                  "relays": int(info["relays"])})
     return frame
 
 
@@ -206,7 +222,37 @@ def _inner_step_cell(step_fn):
 
 
 def record_episode(trainer, omega, env_seed: int, steps: int):
-    """Run eval_omega on one episode with reset and step wrapped; returns (scene, frames)"""
+    """Run eval_omega on one episode with reset and step wrapped; returns (scene, frames, mean reward)"""
+    def run():
+        default_seed = agents_moma_ac.EVAL_SEED
+        try:
+            agents_moma_ac.EVAL_SEED = env_seed
+            return trainer.agent.eval_omega(trainer.eval_env, np.array(omega, np.float32), 1, steps)
+        finally:
+            agents_moma_ac.EVAL_SEED = default_seed
+    return record_run(trainer, run)
+
+
+def record_controlled(trainer, controller, constraints, env_seed: int, steps: int):
+    """One episode of eval_controller.run_episodes (omega from the controller at every step), recorded; each frame
+    after a step gets ctrl: the omega used for that step and lambda after it"""
+    names = list(trainer.obj_names)
+    scene, frames, rows = record_run(
+        trainer, lambda: eval_controller.run_episodes(trainer, controller, [env_seed], steps, False, constraints))
+    for r in rows:
+        lam = [v for k, v in r.items() if k.startswith("lambda_")]
+        if any(k.startswith("lambda_u") for k in r):   # local: mean over the UAVs per constraint
+            n_c = len(constraints)
+            lam = [float(np.nanmean([r[k] for k in r if k.startswith("lambda_u") and k.endswith(f"_{c}")]))
+                   for c in range(n_c)]
+        frames[r["t"] + 1]["ctrl"] = {"omega": [round(float(r[f"w_{n}"]), 4) for n in names],
+                                      "lambda": [round(float(v), 4) for v in lam]}
+    mean = np.mean([[r[n] for n in names] for r in rows], axis=0)
+    return scene, frames, mean
+
+
+def record_run(trainer, run):
+    """Wrap the env's reset and step, call run(), restore; returns (scene, frames, run's result)"""
     env = trainer.eval_env
     uids = sorted(env.uavs)
     radius = trainer.cfg["prior_radius"] if trainer.cfg.get("formation_prior") else None
@@ -239,16 +285,13 @@ def record_episode(trainer, omega, env_seed: int, steps: int):
     env.reset, env.step = reset, step
     if cell is not None:
         cell.cell_contents = inner
-    default_seed = agents_moma_ac.EVAL_SEED
     try:
-        agents_moma_ac.EVAL_SEED = env_seed
-        rv = trainer.agent.eval_omega(env, np.array(omega, np.float32), 1, steps)
+        result = run()
     finally:
-        agents_moma_ac.EVAL_SEED = default_seed
         env.reset, env.step = outer_reset, outer_step
         if cell is not None:
             cell.cell_contents = env_step
-    return state["scene"], frames, rv
+    return state["scene"], frames, result
 
 
 def _git_commit() -> str:
@@ -270,6 +313,24 @@ def write_html(trace_json: str, path: str):
         f.write(html.replace(marker, f'<script type="application/json" id="trace">{payload}</script>'))
 
 
+def make_controller(args, trainer, constraints, names):
+    """A fresh controller of eval_controller.py for one recorded episode"""
+    n_obj, primary = len(names), names.index(args.primary)
+    kind = args.controller
+    if kind in ("pid", "i_only", "p_only"):
+        k_p = 0.0 if kind == "i_only" else args.k_p
+        k_i = 0.0 if kind == "p_only" else args.k_i
+        return eval_controller.OmegaController(n_obj, primary, constraints, k_p, k_i, 0.0, 2.0, args.lambda_init)
+    if kind == "local":
+        return eval_controller.LocalQueue(len(trainer.uav_ids), n_obj, primary, constraints, args.k_i, 2.0,
+                                          args.lambda_init)
+    if kind == "bang_bang":
+        return eval_controller.BangBang(n_obj, primary, constraints)
+    if kind == "rcpo":
+        return eval_controller.RCPOLambda(n_obj, primary, constraints, args.rcpo_lr, args.lambda_init)
+    raise SystemExit(f"unknown --controller {kind}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Record 3-UAV eval episodes for visualize/viewer.html")
     parser.add_argument("--methods", nargs="+", default=["ma3_prior"])
@@ -286,11 +347,35 @@ def main():
     parser.add_argument("--sweep", type=int, default=0, metavar="N",
                         help="Also the interior weights of the training eval's sweep of N weights (eval_pareto_front: "
                              "corners plus N - 3 seeded Dirichlet draws)")
+    parser.add_argument("--config", default=None, help="Train config for every method (default: by method name)")
+    parser.add_argument("--n_serving", type=int, default=None, help="v2: serving positions of the shift fixed at N")
+    parser.add_argument("--controller", default=None,
+                        help="Record a runtime controller of eval_controller.py instead of fixed weights: pid, i_only, "
+                             "p_only, local, bang_bang or rcpo (with --constraint, --primary and its gains)")
+    parser.add_argument("--constraint", action="append", default=[], help="kpi:threshold[:objective], repeatable")
+    parser.add_argument("--primary", default="energy")
+    parser.add_argument("--k_p", type=float, default=2.0)
+    parser.add_argument("--k_i", type=float, default=0.5)
+    parser.add_argument("--lambda_init", type=float, default=0.0)
+    parser.add_argument("--rcpo_lr", type=float, default=1.0)
     parser.add_argument("--out", required=True, help="Writes <out>.json (and <out>.html with --html)")
     parser.add_argument("--html", action="store_true", help="Also a self-contained viewer page")
     args = parser.parse_args()
 
-    corners = {k: np.array(v, np.float32) for k, v in CORNERS.items()}
+    if args.controller is None and args.config is None and args.n_serving is None and \
+            all(METHODS.get(m, "").find("v2") < 0 for m in args.methods):
+        names = V11_OBJECTIVES
+    else:   # The objectives come from the first trainer: load it once to know them
+        m0 = args.methods[0]
+        f0 = sorted(glob.glob(args.checkpoint_glob.format(m=m0, s=args.seeds[0], step=args.step)))
+        if not f0:
+            parser.error(f"no checkpoint for {m0} seed {args.seeds[0]}")
+        cfg0 = args.config or METHODS.get(m0, f"config/train/moma_ac_{m0}.yaml")
+        names = list(load_trainer(cfg0, f0[0], env_config_for(cfg0, None, args.n_serving)).obj_names)
+    n_obj = len(names)
+    corners = {k: np.array(v, np.float32) for k, v in corners_of(names).items()}
+    if args.corners == list(CORNERS) and names != V11_OBJECTIVES:
+        args.corners = list(corners)
     if args.roles:
         for i in range(3):
             w = np.tile(corners["qos"], (3, 1))
@@ -304,42 +389,57 @@ def main():
     extra = []
     for text in args.omega:
         w = np.array([float(v) for v in text.split(",")], np.float32)
-        if w.shape != (3,) or np.any(w < 0) or w.sum() <= 0:
-            parser.error(f"--omega needs three non-negative numbers: {text}")
+        if w.shape != (n_obj,) or np.any(w < 0) or w.sum() <= 0:
+            parser.error(f"--omega needs {n_obj} non-negative numbers: {text}")
         extra.append(w / w.sum())
-    if args.sweep > 3:
+    if args.sweep > n_obj:
         # Same weights as MOMA_AC_Agent.eval_pareto_front
-        extra += list(np.random.RandomState(agents_moma_ac.EVAL_SEED).dirichlet(np.ones(3), args.sweep - 3)
+        extra += list(np.random.RandomState(agents_moma_ac.EVAL_SEED).dirichlet(np.ones(n_obj), args.sweep - n_obj)
                       .astype(np.float32))
     for w in extra:
         name = "w(" + ",".join(f"{v:.2f}" for v in w) + ")"
         corners[name] = w
         args.corners.append(name)
 
+    if args.controller is not None:
+        if not args.constraint:
+            parser.error("--controller needs --constraint")
+        obj = {n: j for j, n in enumerate(names)}
+        constraints = [eval_controller.parse_constraint(c, obj) for c in args.constraint]
+        args.corners = [f"ctrl:{args.controller}"]
     scenes, episodes = {}, []
     for m in args.methods:
-        config = METHODS.get(m, f"config/train/moma_ac_{m}.yaml")
+        config = args.config or METHODS.get(m, f"config/train/moma_ac_{m}.yaml")
         for s in args.seeds:
             pattern = args.checkpoint_glob.format(m=m, s=s, step=args.step)
             files = sorted(glob.glob(pattern))
             if not files:
                 parser.error(f"no checkpoint for {m} seed {s}: {pattern}")
-            trainer = load_trainer(config, files[0])
+            trainer = load_trainer(config, files[0], env_config_for(config, None, args.n_serving))
             steps = trainer.cfg["eval_steps"]
             for c in args.corners:
                 for k in args.episodes:
-                    scene, frames, rv = record_episode(trainer, corners[c], args.seed_base + k, steps)
+                    extra = {}
+                    if args.controller is not None:
+                        ctrl = make_controller(args, trainer, constraints, names)
+                        scene, frames, rv = record_controlled(trainer, ctrl, constraints, args.seed_base + k, steps)
+                        omega = np.atleast_2d(frames[1]["ctrl"]["omega"]) if len(frames) > 1 else np.zeros((1, n_obj))
+                        extra["controller"] = {"method": args.controller, "primary": args.primary, "constraints": [
+                            {"kpi": con["kpi"], "c": con["c"], "objective": names[con["obj"]]} for con in constraints]}
+                    else:
+                        scene, frames, rv = record_episode(trainer, corners[c], args.seed_base + k, steps)
+                        omega = np.atleast_2d(corners[c])
                     key = hashlib.sha1(json.dumps(scene, sort_keys=True).encode()).hexdigest()[:12]
                     scenes[key] = scene
                     episodes.append({"method": m, "train_seed": s, "corner": c,
-                                     "omega": _round(np.atleast_2d(corners[c]), 3), "episode": k,
+                                     "omega": _round(omega, 3), "episode": k,
                                      "env_seed": args.seed_base + k, "scene": key, "mean_reward": _round(rv, 4),
-                                     "frames": frames})
+                                     "frames": frames, **extra})
             print(f"{m} seed {s} done ({files[0]})", flush=True)
 
     trace = {"meta": {"git_commit": _git_commit(), "device": os.environ.get("MOMA_DEVICE", ""),
                       "seed_base": args.seed_base, "step": args.step, "T_L": float(trainer.eval_env.T_L),
-                      "slices": list(SLICES),
+                      "slices": list(SLICES), **({} if names == V11_OBJECTIVES else {"objectives": names}),
                       "status": ["no_demand", "sla_met", "uncovered", "no_rb", "fail_rate", "fail_delay",
                                  "fail_reliability"]},
              "scenes": scenes, "episodes": episodes}

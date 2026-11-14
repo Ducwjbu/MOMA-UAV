@@ -207,6 +207,7 @@ def attach(env, uav_ids, radius: float, mode: str = "ngon"):
     env.step = step
     env.prior_vertices = vertices
     env.prior_targets = targets
+    env.prior_mode = mode
     return vertices
 
 

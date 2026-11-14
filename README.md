@@ -165,13 +165,23 @@ python eval_checkpoint.py --config config/train/moma_ac_ma3.yaml \
     --out eval_ma3_s1
 python eval_checkpoint.py --formation --out eval_triangle
 python eval_heuristics.py --out eval_heuristics      # Họ 10 heuristic, cùng episode
+
+# v2 (4 mục tiêu, ca 240 bước): eval theo từng N vị trí phục vụ (HV báo cáo theo N, không gộp)
+python eval_checkpoint.py --config config/train/moma_ac_v2_prior.yaml \
+    --checkpoint saved_models_moma_ac_v2_prior/seed_1/checkpoints/checkpoint_step_1000000.pth \
+    --n_serving 6 --out eval_v2_n6_s1
+# Baseline không train cùng N, cùng episode: UAV treo ở điểm k-means theo nhu cầu (12 cấu hình)
+python eval_heuristics.py --env_config config/environment/v2.yaml --n_serving 6 --out eval_kmeans_n6
+# Mức tải khác (phân tích độ nhạy, TIP 11): --embb_streams 0.2 hoặc 3.45
 ```
+
+v2 tốn nhiều thời gian: một ca 240 bước ở N = 10 mất khoảng 20 s trên CPU (gần như như nhau với N từ 2 đến 10), nên 30 omega × 20 episode cho một N và một checkpoint mất khoảng 3,3 giờ. Chia các N cho nhiều tiến trình.
 
 Kết quả nằm trong `<out>.csv`, mỗi policy một dòng:
 
 - `hv`, `eum`, `eu_front` và khoảng tin cậy `*_lo`, `*_hi`.
 - Với `--baseline`, chênh lệch so với baseline `d_hv`, `d_eum` và khoảng tin cậy của chênh lệch.
-- Reward ở 3 góc: `w_qos_*`, `w_energy_*`, `w_fair_*`.
+- Reward ở các góc: `w_qos_*`, `w_energy_*`, `w_fair_*` (v2: `w_<mục tiêu>_*`, tỉ lệ đạt SLA nhị phân có đuôi `_share`).
 - Tỷ lệ đạt SLA theo slice.
 
 Các file `.npy` lưu số liệu từng episode. Với `gpi_ls` và `gpi_pd` có hai dòng: `gpi` (suy luận GPI) và `actor` (actor thường). So `actor` với baseline để tách tác dụng của cách chọn omega khỏi tác dụng của GPI.
@@ -192,7 +202,7 @@ Số liệu cuối gộp từ các file `.npy` của `eval_checkpoint.py` (bư�
 python aggregate_seeds.py --method ma3 "evals/ma3_s*_actor.npy" --method ma3_prior "evals/ma3_prior_s*_actor.npy"     --baseline ma3 --out agg
 ```
 
-`hv`, `eum`, `eu_front` là trung bình qua các seed. Khoảng tin cậy 95% bootstrap hai tầng (lấy lại seed, rồi lấy lại episode eval), nên phản ánh cả khác biệt giữa các seed train. `d_*_vs_<baseline>` là chênh lệch, so từng cặp trên cùng episode. `p_improve_hv_vs_<baseline>` là xác suất một seed của phương pháp có HV cao hơn một seed của baseline (Agarwal et al., NeurIPS 2021). `--family <tên> <file.npy>` thêm một họ policy không học, ví dụ các heuristic. `<out>_seeds.csv` có số liệu từng seed.
+Với v2, mọi file phải cùng N; `--objectives` đặt tên mục tiêu (mặc định: 3 cột là v1.1, 4 cột là v2). `hv`, `eum`, `eu_front` là trung bình qua các seed. Khoảng tin cậy 95% bootstrap hai tầng (lấy lại seed, rồi lấy lại episode eval), nên phản ánh cả khác biệt giữa các seed train. `d_*_vs_<baseline>` là chênh lệch, so từng cặp trên cùng episode. `p_improve_hv_vs_<baseline>` là xác suất một seed của phương pháp có HV cao hơn một seed của baseline (Agarwal et al., NeurIPS 2021). `--family <tên> <file.npy>` thêm một họ policy không học, ví dụ các heuristic. `<out>_seeds.csv` có số liệu từng seed.
 
 Hành vi và hình cho báo cáo (3 UAV): `eval_trajectories.py` ghi vị trí, công suất, độ phủ từng bước ở 3 góc trọng số trên cùng episode test (cần checkpoint trong `runs/`); `plot_results.py` vẽ đường học, HV có CI, ablation 2×2, front Pareto, quỹ đạo, và ghi `behaviour.csv`, vào `figures/` (không commit).
 
@@ -208,12 +218,23 @@ Mỗi nhận định trong `CLAUDE.md` và báo cáo không đến từ `eval_ch
 
 `eval_controller.py` chạy policy `ma3_prior` đã train, nhưng omega đổi mỗi bước theo KPI mà nhà mạng đặt ngưỡng (PID-Lagrange, hàng đợi ảo, DPI rút gọn). Script so với các omega cố định và omega cố định tốt nhất chọn sau khi biết kết quả. Không train lại. Chỉnh hệ số trên seed 100000+, báo cáo trên 200000+.
 
+v2 (TIP 8):
+- Nhận nhiều `--constraint`, ví dụ `sla_urllc:0.8` và `sla_embb_share:0.5`.
+- Thêm các phương pháp `local` (mỗi UAV một hàng đợi ảo trên KPI của UE nó phục vụ, mỗi UAV một omega), `bang_bang` (luật ngưỡng) và `rcpo` (λ cập nhật sau mỗi episode).
+- `fixed` tạo lưới omega cố định trên mặt của đơn hình; `--fixed_grid 41` cho bước 0.025.
+- Oracle chọn theo hai tiêu chí: `oracle` (đạt ngưỡng trung bình) và `oracle_viol` (thêm điều kiện tỉ lệ episode vi phạm ≤ `--oracle_viol`).
+- Báo cáo thêm KPI theo thời gian: `tviol_*` là tỉ lệ bước vi phạm, `rec_*` là thời gian hồi phục sau khi ngưỡng đổi hoặc một vị trí bị bỏ trống.
+
 ```bash
 python eval_controller.py --out evals/ctrl --seed_base 200000 --constraint qos:0.30 --primary energy
 # Cả ca 20 episode, nhà mạng nâng ngưỡng lên 0,35 từ episode 10
 python eval_controller.py --out evals/ctrl_change --seed_base 200000 --carry --change 10:0.35 --k_i 0.5 --k_p 0
 # Phép thử vai trò: một UAV ở góc năng lượng, hai UAV kia ở góc QoS
 python eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
+# v2: hai ràng buộc SLA ở N = 6, lưới omega cố định bước 0.025
+python eval_controller.py --config config/train/moma_ac_v2_prior.yaml \
+    --checkpoint_glob "saved_models_moma_ac_v2_prior/seed_*/checkpoints/checkpoint_step_1000000.pth" --n_serving 6 \
+    --constraint sla_urllc:0.8 --constraint sla_embb:0.6 --methods pid local bang_bang rcpo fixed --fixed_grid 41 --out evals/ctrl_v2
 ```
 
 Xem lại một episode trên bản đồ (UAV bay, UE đi, association, UE trượt SLA vì đâu): `visualize/record.py` ghi episode của checkpoint (chỉ đọc env, kết quả không đổi), `--html` ra một trang tự chứa mở thẳng bằng trình duyệt. Thiết kế ở `visualize/architecture.md`.
@@ -222,6 +243,8 @@ Xem lại một episode trên bản đồ (UAV bay, UE đi, association, UE trư
 python -m visualize.record --methods ma3_prior ma3 --episodes 0 1 --out visualize/out/run1 --html
 # Mặc định 3 góc; thêm trọng số bất kỳ (--omega, lặp được) hoặc các trọng số của eval lúc train (--sweep 30)
 python -m visualize.record --methods ma3_prior --corners qos --omega 0.6,0.2,0.2 --omega 1,1,1 --out visualize/out/w --html
+# v2: ghi một ca có bộ điều khiển; trang vẽ omega và λ theo thời gian
+python -m visualize.record --methods v2_prior --n_serving 6 --controller pid --constraint sla_urllc:0.8 --out visualize/out/ctrl --html
 ```
 
 Pilot 300k bước cho kiến trúc mới (chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa` (mỗi UAV một omega), `ma3_prior_att` (mạng attention), `ma3_prior_att_fleet` (attention, môi trường `ma3_fleet.yaml` có UAV rút giữa chừng).
@@ -243,6 +266,7 @@ Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt
 | `omega_per_agent` | config train (3 UAV) | Tỉ lệ episode mà mỗi UAV có omega riêng; critic nhận omega của mọi UAV |
 | `network` | config train (3 UAV) | `mlp` (mặc định, như paper) hoặc `attention`: một actor chung và critic attention, không phụ thuộc số UAV; checkpoint 3 UAV chạy được với 4 UAV. Chậm hơn khoảng 40% mỗi bước train |
 | `omega_switch_prob` | config train (3 UAV) | Xác suất đổi omega ở mỗi bước trong episode |
+| `omega_edge_prob`, `omega_face_prob` | config train (nhiều UAV) | Tỉ lệ lần rút omega nằm trên một cạnh (2 mục tiêu), hoặc một mặt (3 mục tiêu), của đơn hình. Bộ điều khiển chạy trên các vùng này, mà Dirichlet(1) hiếm khi rút tới (TIP 8) |
 
 ### 3. Lưu kết quả vào repo
 
@@ -259,7 +283,7 @@ Chép các CSV, và nếu muốn thì các `.npy` của eval, vào `results-v<ph
 | `eval_checkpoint.py` | Eval cuối với khoảng tin cậy. |
 | `aggregate_seeds.py` | Gộp eval cuối của nhiều seed, khoảng tin cậy bootstrap hai tầng. |
 | `eval_formation.py` | Heuristic 3 UAV đứng yên thành tam giác. |
-| `eval_heuristics.py` | Họ 10 heuristic 3 UAV (bay theo tam giác r = 600 m), cùng episode với `eval_checkpoint.py`. |
+| `eval_heuristics.py` | Họ 10 heuristic 3 UAV (bay theo tam giác r = 600 m), cùng episode với `eval_checkpoint.py`. Với v2 là họ 12 cấu hình treo ở điểm k-means theo nhu cầu. |
 | `eval_trajectories.py` | Ghi quỹ đạo và hành vi của các policy 3 UAV ở 3 góc trọng số. |
 | `eval_controller.py` | Khoá luận: chọn omega lúc chạy theo ngưỡng KPI, trên policy đã train. |
 | `visualize/` | Trình xem episode: bộ ghi `record.py` và trang `viewer.html`. |

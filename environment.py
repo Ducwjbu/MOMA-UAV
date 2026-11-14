@@ -3415,7 +3415,9 @@ class NetworkSlicingEnv:
                 else:
                     margin = self._sla_margin(ue, ue_throughput, total_delay_ms)
                     sla_met[ue.slice_type].append(margin >= -self.sla_tolerance)
-                    sla_soft[ue.slice_type].append(self._sla_score(margin))
+                    # Read by the per-UAV KPIs of eval_controller.py (with the UE's assigned_uav and demand)
+                    ue.sla_score, ue.sla_ok = self._sla_score(margin), bool(margin >= -self.sla_tolerance)
+                    sla_soft[ue.slice_type].append(ue.sla_score)
             else:
                 # Combine using slice-specific weights
                 ue_qos_weights = self.qos_weights[ue.slice_type]

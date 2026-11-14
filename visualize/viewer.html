@@ -9,6 +9,7 @@
   --bg: #f6f6f3; --panel: #ffffff; --fg: #1f2328; --muted: #646b75; --border: #d9dbde;
   --map-bg: #f3f4f0; --bldg-lo: #e7e4de; --bldg-hi: #bdb7ad; --range: #9aa3ad;
   --uav0: #0f766e; --uav1: #7c3aed; --uav2: #b45309; --uav3: #be185d;
+  --uav4: #0369a1; --uav5: #4d7c0f; --uav6: #a21caf; --uav7: #9a3412; --uav8: #475569; --uav9: #0e7490;
   --embb: #2563eb; --urllc: #dc2626; --mmtc: #16a34a;
   --st-idle: #c3cad3; --st-met: #16a34a; --st-unc: #8b939d; --st-norb: #334155;
   --st-rate: #dc2626; --st-delay: #ea580c; --st-rel: #c026d3;
@@ -21,6 +22,7 @@
     --bg: #15171a; --panel: #1d2024; --fg: #e6e8eb; --muted: #9aa1ab; --border: #33373d;
     --map-bg: #1a1d21; --bldg-lo: #26292e; --bldg-hi: #454a52; --range: #59616b;
     --uav0: #2dd4bf; --uav1: #a78bfa; --uav2: #fbbf24; --uav3: #f472b6;
+    --uav4: #38bdf8; --uav5: #a3e635; --uav6: #e879f9; --uav7: #fb923c; --uav8: #cbd5e1; --uav9: #22d3ee;
     --embb: #60a5fa; --urllc: #f87171; --mmtc: #4ade80;
     --st-idle: #4b5260; --st-met: #4ade80; --st-unc: #7b838e; --st-norb: #cbd5e1;
     --st-rate: #f87171; --st-delay: #fb923c; --st-rel: #e879f9;
@@ -33,6 +35,7 @@
   --bg: #15171a; --panel: #1d2024; --fg: #e6e8eb; --muted: #9aa1ab; --border: #33373d;
   --map-bg: #1a1d21; --bldg-lo: #26292e; --bldg-hi: #454a52; --range: #59616b;
   --uav0: #2dd4bf; --uav1: #a78bfa; --uav2: #fbbf24; --uav3: #f472b6;
+  --uav4: #38bdf8; --uav5: #a3e635; --uav6: #e879f9; --uav7: #fb923c; --uav8: #cbd5e1; --uav9: #22d3ee;
   --embb: #60a5fa; --urllc: #f87171; --mmtc: #4ade80;
   --st-idle: #4b5260; --st-met: #4ade80; --st-unc: #7b838e; --st-norb: #cbd5e1;
   --st-rate: #f87171; --st-delay: #fb923c; --st-rel: #e879f9;
@@ -134,10 +137,11 @@ th { color: var(--muted); font-weight: 500; }
   <aside class="side">
     <div class="card"><h2>Episode</h2><div id="epinfo" class="note"></div></div>
     <div class="card"><h2>Reward vector (mỗi bước)</h2><canvas class="chart" id="chReward"></canvas>
-      <div class="keys"><span><span class="sw line" style="border-color:var(--s-qos)"></span>QoS</span>
-        <span><span class="sw line" style="border-color:var(--s-energy)"></span>−năng lượng</span>
-        <span><span class="sw line" style="border-color:var(--s-fair)"></span>fairness</span>
+      <div class="keys"><span id="rewardKeys"></span>
         <span id="abKey1"></span></div></div>
+    <div class="card" id="ctrlCard" hidden><h2>Bộ điều khiển: ω (nét liền) và λ (nét đứt) mỗi bước</h2>
+      <canvas class="chart" id="chOmega"></canvas><canvas class="chart" id="chLambda"></canvas>
+      <div class="keys" id="ctrlKeys"></div></div>
     <div class="card"><h2>Tỉ lệ UE đạt SLA theo slice, và coverage</h2><canvas class="chart" id="chSla"></canvas>
       <div class="keys"><span><span class="sw line" style="border-color:var(--embb)"></span>eMBB</span>
         <span><span class="sw line" style="border-color:var(--urllc)"></span>URLLC</span>
@@ -161,7 +165,14 @@ const STATUS_LABEL = ["Không có traffic", "Đạt SLA", "Không được phủ
 const STATUS_VAR = ["--st-idle", "--st-met", "--st-unc", "--st-norb", "--st-rate", "--st-delay", "--st-rel"];
 const SLICE_LABEL = ["eMBB", "URLLC", "mMTC"];
 const SLICE_VAR = ["--embb", "--urllc", "--mmtc"];
-const UAV_VAR = ["--uav0", "--uav1", "--uav2", "--uav3"];
+const UAV_VAR = ["--uav0", "--uav1", "--uav2", "--uav3", "--uav4", "--uav5", "--uav6", "--uav7", "--uav8", "--uav9"];
+// Objectives of the trace (meta.objectives; the v1.1 vector when absent): label, short label, colour
+const OBJ_INFO = {
+  qos: ["QoS", "QoS", "--s-qos"], energy: ["−năng lượng", "E", "--s-energy"], fair: ["fairness", "F", "--s-fair"],
+  sla_embb: ["SLA eMBB", "eMBB", "--embb"], sla_urllc: ["SLA URLLC", "URLLC", "--urllc"],
+  sla_mmtc: ["SLA mMTC", "mMTC", "--mmtc"]};
+const objNames = () => (TRACE && TRACE.meta.objectives) || ["qos", "energy", "fair"];
+const objInfo = n => OBJ_INFO[n] || [n, n, "--muted"];
 const LAYERS = [
   ["buildings", "Nhà", true], ["density", "Mật độ traffic", false], ["assoc", "Association", true],
   ["uavTrail", "Vệt bay UAV", true], ["action", "Lệnh bước tới", true], ["vertex", "Đỉnh prior", true],
@@ -211,6 +222,10 @@ function prepare(ep) {
     ep.paths.get(t).push([i, f.ues.x[k], f.ues.y[k]]);
   }));
   ep.nUav = ep.frames[0].uavs.length;
+  // Controller runs (record.py --controller): omega and lambda per step, and the constraints' objectives
+  ep.nLambda = ep.controller ? ep.controller.constraints.length : -1;
+  ep.ctrlObj = ep.controller ? ep.controller.constraints.map(c => c.objective) : [];
+  ep.ctrlNames = ep.controller ? ep.controller.constraints.map(c => `${c.kpi} ≥ ${c.c}`) : [];
   ep.speed = ep.frames.map(f => f.uavs.map(u => u.pre ? Math.hypot(u.pos[0] - u.pre[0], u.pos[1] - u.pre[1]) / TRACE.meta.T_L : null));
 }
 
@@ -237,8 +252,9 @@ class MapView {
     this.ep = ep;
     this.title.textContent = (this.side === "B" ? "B: " : (views.length > 1 ? "A: " : "")) + ep.label;
     const om = ep.omega.map(r => "(" + r.map(v => fmt(v, 2)).join(", ") + ")").join(" ");
+    const means = objNames().map((n, j) => `${n === "energy" ? "năng lượng" : objInfo(n)[0]} ${fmt(ep.mean_reward[j], 3)}`);
     this.sub.textContent = `ω ${ep.omega.length > 1 ? "theo UAV " : ""}${om} · env seed ${ep.env_seed} · ` +
-      `trung bình episode: QoS ${fmt(ep.mean_reward[0], 3)}, năng lượng ${fmt(ep.mean_reward[1], 3)}, fairness ${fmt(ep.mean_reward[2], 3)}`;
+      `trung bình episode: ${means.join(", ")}`;
   }
   resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -525,9 +541,13 @@ class MapView {
     ctx.fillText(text, this.pad + 11, this.pad + 15);
     if (key && i > 0) {
       const t = ep.frames[i].team;
+      const N = objNames();
+      const shortParts = N.map((n, j) => `${objInfo(n)[1]} ${fmt(t.reward[j], 2)}`);
+      const longParts = N.map((n, j) => `${n === "energy" ? "năng lượng" : objInfo(n)[0]} ${fmt(t.reward[j], 3)}`);
+      const shift = t.n_serving !== undefined ? ` · phục vụ ${t.n_serving}` + (t.gaps ? `, trống ${t.gaps}` : "") : "";
       const line = this.size < 560
-        ? `QoS ${fmt(t.reward[0], 2)} · E ${fmt(t.reward[1], 2)} · F ${fmt(t.reward[2], 2)} · cov ${fmt(t.coverage, 2)}`
-        : `QoS ${fmt(t.reward[0], 3)} · năng lượng ${fmt(t.reward[1], 3)} · fairness ${fmt(t.reward[2], 3)} · coverage ${fmt(t.coverage, 2)} · handover ${t.handovers}`;
+        ? `${shortParts.join(" · ")} · cov ${fmt(t.coverage, 2)}${shift}`
+        : `${longParts.join(" · ")} · coverage ${fmt(t.coverage, 2)} · handover ${t.handovers}${shift}`;
       const w2 = ctx.measureText(line).width + 14;
       ctx.fillStyle = C["--banner-bg"]; ctx.strokeStyle = C["--border"];
       ctx.beginPath(); ctx.roundRect(this.pad + 4, this.pad + 30, w2, 22, 5); ctx.fill(); ctx.stroke();
@@ -645,7 +665,10 @@ function seriesFor(ep, dash) {
   const T = ep.frames.map(f => f.team || null);
   const pick = fn => T.map(t => t ? fn(t) : null);
   return {
-    reward: [0, 1, 2].map(j => ({ values: pick(t => t.reward[j]), color: C[["--s-qos", "--s-energy", "--s-fair"][j]], dash })),
+    reward: objNames().map((n, j) => ({ values: pick(t => t.reward[j]), color: C[objInfo(n)[2]], dash })),
+    omega: objNames().map((n, j) => ({ values: ep.frames.map(f => f.ctrl ? f.ctrl.omega[j] : null), color: C[objInfo(n)[2]], dash })),
+    lambda: [...Array(Math.max(0, ep.nLambda)).keys()].map(k => ({ values: ep.frames.map(f => f.ctrl ? f.ctrl.lambda[k] : null),
+      color: C[objInfo(ep.ctrlObj[k])[2]], dash: true })),
     sla: [0, 1, 2].map(j => ({ values: pick(t => t.sla[j]), color: C[SLICE_VAR[j]], dash }))
       .concat([{ values: pick(t => t.coverage), color: C["--s-cov"], dash }]),
     speed: [...Array(ep.nUav).keys()].map(k => ({ values: ep.speed.map(r => r[k]), color: uavColor(k), dash })),
@@ -659,6 +682,9 @@ function renderCharts() {
   chart("chSla", both("sla"), S.p, [0, 1]);
   chart("chSpeed", both("speed"), S.p, [0, Math.max(18, EPS[S.a].sceneObj.v_max + 1)]);
   chart("chPower", both("power"), S.p, [0, 1]);
+  const ctl = EPS[S.a].nLambda >= 0 || (B && EPS[S.b].nLambda >= 0);
+  document.getElementById("ctrlCard").hidden = !ctl;
+  if (ctl) { chart("chOmega", both("omega"), S.p, [0, 1]); chart("chLambda", both("lambda"), S.p); }
 }
 
 // ---------------------------------------------------------------- side panel
@@ -693,6 +719,11 @@ function renderInfo() {
   const m = TRACE.meta;
   parts.push(`<span class="note">commit ${m.git_commit || "?"} · ${m.device || "?"} · checkpoint bước ${m.step}</span>`);
   document.getElementById("epinfo").innerHTML = parts.join("<br>");
+  document.getElementById("rewardKeys").innerHTML = objNames().map(n =>
+    `<span><span class="sw line" style="border-color:var(${objInfo(n)[2]})"></span>${objInfo(n)[0]}</span>`).join(" ");
+  const ce = [A, B].find(e => e && e.nLambda >= 0);
+  document.getElementById("ctrlKeys").innerHTML = ce ? `ω theo mục tiêu (màu như reward); λ của ràng buộc: ` +
+    ce.ctrlNames.map(c => `<span>${c}</span>`).join(", ") : "";
   document.getElementById("abKey1").innerHTML = B ? `<span class="sw line" style="border-color:var(--muted)"></span>A <span class="sw dash" style="border-color:var(--muted)"></span>B` : "";
   for (const id of ["uavKeys1", "uavKeys2"])
     document.getElementById(id).innerHTML = [...Array(A.nUav).keys()]

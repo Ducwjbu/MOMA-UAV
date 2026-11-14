@@ -14,12 +14,19 @@ repeated for each UAV), dist_vertex (distance to the UAV's vertex of the r=600 t
 order, also for the methods without the prior; that overstates their distance when they hold the triangle with
 the vertices swapped, so plot_results.py also reports dist_formation_m, with the best vertex per UAV per episode).
 
+v2 (an env with an objectives section; docs/v2/plan.md TIP 8): the corners are those of the env's objectives
+(e.g. sla_embb, sla_urllc, sla_mmtc, energy), the reward columns are named after them, bw_<slice> is the action's
+slice share (action.mode slice_share, 7 dims), dist_vertex is the distance to the UAV's current prior target
+(env.prior_targets, nan when it has none), and active marks the serving positions. Every slot is logged, the empty
+ones too. --n_serving fixes the serving positions of the shift.
+
 Run (checkpoints are not in git; the default glob is the runs/ layout of the course-report runs):
   py eval_trajectories.py --out results-v1.1/eval_test/trajectories
 Role test of the thesis pilot B1 (any method name maps to config/train/moma_ac_<name>.yaml):
   py eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
   (checkpoint_step_300000.pth for the pilots: --checkpoint_glob "runs/saved_models_moma_ac_{m}/seed_*/checkpoints/
   checkpoint_step_300000.pth")
+  py eval_trajectories.py --methods v2_prior --n_serving 6 --seed_base 100000 --out evals/traj_v2_n6
 """
 
 import argparse
@@ -33,43 +40,60 @@ import numpy as np
 import pandas as pd
 
 import agents_moma_ac
-from eval_checkpoint import load_trainer
+from eval_checkpoint import env_config_for, load_trainer
 from prior import formation_vertices
+from train_moma_ac import V11_OBJECTIVES
 
 METHODS = {   # name -> train config
     "ma3": "config/train/moma_ac_ma3.yaml",
     "ma3_g90": "config/train/moma_ac_ma3_g90.yaml",
     "ma3_prior_g99": "config/train/moma_ac_ma3_prior_g99.yaml",
     "ma3_prior": "config/train/moma_ac_ma3_prior.yaml",
+    "v2_prior": "config/train/moma_ac_v2_prior.yaml",
 }
 CORNERS = {"qos": [1, 0, 0], "energy": [0, 1, 0], "fair": [0, 0, 1]}
 CHECKPOINT = "runs/saved_models_moma_ac_{m}/seed_*/checkpoints/checkpoint_step_1000000.pth"
+
+
+def corners_of(names) -> dict:
+    """The corner weights: qos, energy, fair for the v1.1 vector, else one per objective"""
+    if list(names) == V11_OBJECTIVES:
+        return dict(CORNERS)
+    return {n: np.eye(len(names))[j].tolist() for j, n in enumerate(names)}
 
 
 def record_episodes(trainer, omega, n_episodes, seed_base, steps, radius):
     """Run eval_omega on each episode with env.reset and env.step wrapped to log the team."""
     env = trainer.eval_env
     uids = sorted(env.uavs)
-    vertices = formation_vertices(env, radius, len(uids))
+    names = list(trainer.obj_names)
+    legacy = names == V11_OBJECTIVES
+    vertices = formation_vertices(env, radius, len(uids)) if legacy else None
     rows, state = [], {"ep": -1, "t": -1}
     inner_step, inner_reset = env.step, env.reset
 
+    def bw(a, s):
+        if a is None:
+            return np.nan
+        return a[4 + s] if len(a) == 7 else a[4 + 3 * s:7 + 3 * s].sum()   # slice_share: one share per slice
+
     def log(actions, info):
+        targets = None if legacy or not hasattr(env, "prior_targets") else env.prior_targets()
         for i, u in enumerate(uids):
             p = env.uavs[u].position
             a = None if actions is None else np.asarray(actions[u], dtype=float)
-            rows.append({
-                "ep": state["ep"], "t": state["t"], "uav": i, "x": p[0], "y": p[1], "h": p[2],
-                "power": np.nan if a is None else a[3],
-                "bw_embb": np.nan if a is None else a[4:7].sum(),
-                "bw_urllc": np.nan if a is None else a[7:10].sum(),
-                "bw_mmtc": np.nan if a is None else a[10:13].sum(),
-                "coverage": np.nan if info is None else info["coverage"],
-                "qos": np.nan if info is None else info["reward_vector"][0],
-                "energy": np.nan if info is None else info["reward_vector"][1],
-                "fair": np.nan if info is None else info["reward_vector"][2],
-                "dist_vertex": float(np.linalg.norm(p - vertices[i])),
-            })
+            row = {"ep": state["ep"], "t": state["t"], "uav": i, "x": p[0], "y": p[1], "h": p[2],
+                   "power": np.nan if a is None else a[3],
+                   "bw_embb": bw(a, 0), "bw_urllc": bw(a, 1), "bw_mmtc": bw(a, 2),
+                   "coverage": np.nan if info is None else info["coverage"]}
+            row.update({n: np.nan if info is None else info["reward_vector"][j] for j, n in enumerate(names)})
+            if legacy:
+                row["dist_vertex"] = float(np.linalg.norm(p - vertices[i]))
+            else:
+                tg = None if targets is None else targets.get(u)
+                row["dist_vertex"] = np.nan if tg is None else float(np.linalg.norm(p - tg))
+                row["active"] = bool(getattr(env.uavs[u], "active", True))
+            rows.append(row)
 
     def reset(*args, **kwargs):
         out = inner_reset(*args, **kwargs)
@@ -106,15 +130,10 @@ def main():
     parser.add_argument("--roles", action="store_true",
                         help="Also the role test: corner u<i>_energy gives UAV i the energy corner and the others "
                              "the QoS corner (one omega per UAV), to see whether UAV i alone saves energy")
+    parser.add_argument("--config", default=None, help="Train config for every method (default: by method name)")
+    parser.add_argument("--n_serving", type=int, default=None, help="v2: serving positions of the shift fixed at N")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-
-    corners = dict(CORNERS)
-    if args.roles:
-        for i in range(3):
-            w = np.tile(np.array(CORNERS["qos"], np.float32), (3, 1))
-            w[i] = CORNERS["energy"]
-            corners[f"u{i}_energy"] = w
 
     frames = []
     for m in args.methods:
@@ -122,8 +141,18 @@ def main():
         if not files:
             parser.error(f"no checkpoint for {m}: {args.checkpoint_glob.format(m=m)}")
         for f in files:
-            seed = int(re.search(r"seed_(\d+)", f.replace("\\", "/")).group(1))
-            trainer = load_trainer(METHODS.get(m, f"config/train/moma_ac_{m}.yaml"), f)
+            found = re.search(r"seed_(\d+)", f.replace("\\", "/"))
+            seed = int(found.group(1)) if found else 0
+            config = args.config or METHODS.get(m, f"config/train/moma_ac_{m}.yaml")
+            trainer = load_trainer(config, f, env_config_for(config, None, args.n_serving))
+            corners = corners_of(trainer.obj_names)
+            if args.roles:
+                if list(trainer.obj_names) != V11_OBJECTIVES or len(trainer.uav_ids) != 3:
+                    parser.error("--roles is the 3-UAV v1.1 role test")
+                for i in range(3):
+                    w = np.tile(np.array(CORNERS["qos"], np.float32), (3, 1))
+                    w[i] = CORNERS["energy"]
+                    corners[f"u{i}_energy"] = w
             for cname, omega in corners.items():
                 rows = record_episodes(trainer, omega, args.n_episodes, args.seed_base,
                                        trainer.cfg["eval_steps"], args.radius)

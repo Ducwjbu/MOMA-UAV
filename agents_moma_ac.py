@@ -1047,7 +1047,8 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
     def __init__(self, obs_dim: int, act_dim: int, n_agents: int, n_objectives: int = 3,
                  hidden_dim: int = 256, actor_lr: float = 3e-4,
                  omega_sampling: str = "random", omega_per_agent: float = 0.0,
-                 omega_switch_prob: float = 0.0, network: str = "mlp", **kwargs):
+                 omega_switch_prob: float = 0.0, network: str = "mlp",
+                 omega_edge_prob: float = 0.0, omega_face_prob: float = 0.0, **kwargs):
         if omega_sampling != "random":
             raise ValueError(f"MOMA_CTDE_Agent only supports omega_sampling='random', got {omega_sampling}")
 
@@ -1078,6 +1079,15 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
         self.per_agent_omega   = omega_per_agent > 0
         self.omega_per_agent   = omega_per_agent
         self.omega_switch_prob = omega_switch_prob
+        # v2 (TIP 8): a draw lies on a random edge of the simplex (2 objectives, Dirichlet(1, 1) on them) with
+        # probability omega_edge_prob, on a random 2-face (3 objectives) with omega_face_prob, else Dirichlet(1)
+        # on the whole simplex. A runtime controller moves omega along edges and faces (e_0 + lambda d), which
+        # Dirichlet(1) seldom draws (an independent audit, 2026-11-13). Both 0: the draws of the code before them
+        if omega_edge_prob < 0 or omega_face_prob < 0 or omega_edge_prob + omega_face_prob > 1:
+            raise ValueError("omega_edge_prob and omega_face_prob must be >= 0 and sum to at most 1")
+        self.omega_edge_prob   = omega_edge_prob
+        self.omega_face_prob   = omega_face_prob
+        self.omega_mixing      = omega_edge_prob > 0 or omega_face_prob > 0
         if self.per_agent_omega or network == "attention":
             w_dim = n_agents * n_objectives if self.per_agent_omega else n_objectives
             critic_lr = self.critic_opt.param_groups[0]["lr"]
@@ -1103,16 +1113,32 @@ class MOMA_CTDE_Agent(MOMA_AC_Agent):
 
     # ── Omega ────────────────────────────────────────────────────
 
+    def _draw_mixed(self) -> np.ndarray:
+        """One omega on a random edge, a random 2-face or the whole simplex (omega_edge_prob, omega_face_prob)"""
+        u = np.random.rand()
+        k = 2 if u < self.omega_edge_prob else 3 if u < self.omega_edge_prob + self.omega_face_prob else self.n_obj
+        k = min(k, self.n_obj)
+        idx = np.sort(np.random.choice(self.n_obj, k, replace=False)) if k < self.n_obj else np.arange(self.n_obj)
+        w = np.zeros(self.n_obj)
+        w[idx] = np.random.dirichlet(np.ones(k))
+        return w
+
+    def _draw_simplex(self, size=None) -> np.ndarray:
+        if not self.omega_mixing:
+            return np.random.dirichlet(np.ones(self.n_obj), size)
+        return self._draw_mixed() if size is None else np.stack([self._draw_mixed() for _ in range(size)])
+
     def _draw_team_omega(self) -> np.ndarray:
         if not self.per_agent_omega:
-            return np.random.dirichlet(np.ones(self.n_obj)).astype(np.float32)
+            return self._draw_simplex().astype(np.float32)
         if np.random.rand() < self.omega_per_agent:
-            return np.random.dirichlet(np.ones(self.n_obj), self.n_agents).astype(np.float32)
-        return np.tile(np.random.dirichlet(np.ones(self.n_obj)), (self.n_agents, 1)).astype(np.float32)
+            return self._draw_simplex(self.n_agents).astype(np.float32)
+        return np.tile(self._draw_simplex(), (self.n_agents, 1)).astype(np.float32)
 
     def sample_omega(self) -> np.ndarray:
-        """Call at the start of each episode. Without per-UAV omega this is the base class's draw."""
-        if not self.per_agent_omega:
+        """Call at the start of each episode. With a team omega drawn from Dirichlet(1) this is the base class's
+        draw (which also has the corner warm-up); otherwise _draw_team_omega"""
+        if not self.per_agent_omega and not self.omega_mixing:
             return super().sample_omega()
         omega = self._draw_team_omega()
         self.current_omega = omega

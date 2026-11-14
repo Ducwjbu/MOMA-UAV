@@ -119,6 +119,16 @@ def hv_ref_point(names) -> np.ndarray:
 
 
 V11_OBJECTIVES = ["qos", "energy", "fair"]
+V2_OBJECTIVES = ["sla_embb", "sla_urllc", "sla_mmtc", "energy"]
+
+
+def front_hv(points: np.ndarray, names) -> float:
+    """The trainer's HV of a front for the named objectives: _hv_3d at HV_REF_POINT for the v1.1 vector, else
+    _hv_nd at hv_ref_point(names)"""
+    names = list(names)
+    if names == V11_OBJECTIVES:
+        return _hv_3d(points, HV_REF_POINT)
+    return _hv_nd(points, hv_ref_point(names))
 
 
 def _get(cfg_obj, key: str, default):
@@ -173,6 +183,9 @@ class MOMA_AC_Trainer:
             # and the per-step probability of a new omega within an episode (MOMA_CTDE_Agent)
             "omega_per_agent":   float(_get(tcfg, "omega_per_agent",   0.0)),
             "omega_switch_prob": float(_get(tcfg, "omega_switch_prob", 0.0)),
+            # v2 (TIP 8): share of omega draws on a random edge / 2-face of the simplex (MOMA_CTDE_Agent)
+            "omega_edge_prob":   float(_get(tcfg, "omega_edge_prob",   0.0)),
+            "omega_face_prob":   float(_get(tcfg, "omega_face_prob",   0.0)),
             # Several UAVs: "mlp" (the paper's MultiHeadActor and flat critics) or "attention" (one actor for every
             # UAV and an attention critic, independent of the number of UAVs)
             "network":           str(  _get(tcfg, "network",           "mlp")),
@@ -242,7 +255,8 @@ class MOMA_AC_Trainer:
         # ── Agent ────────────────────────────────────────────────
         agent_cls  = MOMA_CTDE_Agent if self.multi_uav else MOMA_AC_Agent
         agent_args = ({"n_agents": len(self.uav_ids), "omega_per_agent": self.cfg["omega_per_agent"],
-                       "omega_switch_prob": self.cfg["omega_switch_prob"], "network": self.cfg["network"]}
+                       "omega_switch_prob": self.cfg["omega_switch_prob"], "network": self.cfg["network"],
+                       "omega_edge_prob": self.cfg["omega_edge_prob"], "omega_face_prob": self.cfg["omega_face_prob"]}
                       if self.multi_uav else {})
         self.agent = agent_cls(
             obs_dim   = self.obs_dim,
@@ -592,7 +606,7 @@ class MOMA_AC_Trainer:
 
     def _compute_hv(self, pts: np.ndarray) -> float:
         """Exact HV, fixed ref point (3D sweep for the v1.1 objectives, the n-dimensional sweep otherwise)"""
-        return _hv_3d(pts, HV_REF_POINT) if self.legacy_objectives else _hv_nd(pts, self.hv_ref)
+        return front_hv(pts, self.obj_names)
 
     def _count_pareto(self, pts: np.ndarray) -> int:
         """Count non-dominated points (3D strict Pareto)."""

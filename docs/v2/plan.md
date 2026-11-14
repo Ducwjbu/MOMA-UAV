@@ -471,3 +471,59 @@ Hai bộ episode tăng từ 10 lên 30 mỗi bộ (hiệu chỉnh 100000–10002
 
   - Chia slice (0.6, 0.2, 0.2) cho SLA eMBB / URLLC là 0.714 / 0.710; (0.2, 0.6, 0.2) cho 0.551 / 0.851.
 - **Kiểm ở 2.4** (chạy song song trước khi hiệu chỉnh xong) cũng PASS, ở S = 6 là 0.766 [0.718, 0.811]. Quy tắc là lấy đúng mức hiệu chỉnh chọn, nên `v2.yaml` dùng 2.3. Hai mức khác nhau không quá độ nhiễu.
+
+### TIP 8. Đánh giá nhiều mục tiêu và bộ điều khiển nhiều ràng buộc (2026-11-14)
+
+**STATUS:** xong phần công cụ; kiểm bằng `py docs/v2/check_tip8.py` (PASS). Chưa có checkpoint v2 thật, nên chưa có số liệu đánh giá (chờ pilot TIP 11).
+
+**FILES CHANGED:**
+- `train_moma_ac.py`: thêm `front_hv` và `V2_OBJECTIVES`; khoá `omega_edge_prob`, `omega_face_prob`.
+- `agents_moma_ac.py`: rút ω trên cạnh hoặc mặt của đơn hình (`_draw_mixed`, `_draw_simplex`).
+- `environment.py`: khi có `objectives`, mỗi UE có thêm `ue.sla_score` và `ue.sla_ok` để tính KPI theo từng UAV.
+- `prior.py`: thêm `env.prior_mode`.
+- `eval_checkpoint.py`: chạy với n mục tiêu; thêm `--n_serving`, `--embb_streams` và hàm `env_config_for`.
+- `aggregate_seeds.py`: thêm `--objectives`.
+- `eval_heuristics.py`: họ k-means treo cho v2.
+- `eval_controller.py`: viết lại, chi tiết ở TEST RESULTS.
+- `eval_trajectories.py`: hành động 7 chiều, góc theo mục tiêu, `--n_serving`, `--config`.
+- `visualize/record.py` và `visualize/viewer.html`: v2, `--controller`, biểu đồ ω/λ, 10 màu UAV.
+- Mới: `docs/v2/check_tip8.py`. Cập nhật CLAUDE.md và README.
+
+**TEST RESULTS:**
+- **HV, so với WFG độc lập.** WFG theo While, Bradstreet & Barone, IEEE Trans. Evol. Comput. 16(1):86–95, 2012, viết lại từ định nghĩa.
+  - 3D: trên 400 front của `results-v1.1`, `_hv_3d` lệch WFG tối đa 3.3e-16.
+  - 4D: trên 300 front ngẫu nhiên (1–30 điểm, có điểm trùng và điểm hoà), `_hv_nd` lệch WFG tối đa 4.4e-16.
+  - 96 front nhỏ (≤ 10 điểm): lệch so với công thức bao hàm–loại trừ tối đa 3.4e-15.
+  - 5 front: giá trị nằm trong khoảng 99.9% của Monte Carlo.
+  - Plan ghi "cài WFG". Thực tế giữ thuật toán quét đã có và dùng WFG làm phép kiểm độc lập (WFG chạy chậm hơn).
+- **Bộ điều khiển giữ ω cố định tái tạo `eval_checkpoint.py`.** Reward trung bình mỗi episode lệch 0, ở các góc, trên 2 episode kiểm:
+  - v1.1: checkpoint `ma3_prior` seed 0;
+  - v2: smoke checkpoint, N = 3.
+  - Hai lần chạy đầu lệch 3e-8 đến 6e-8, dù reward từng bước giống hệt. Lý do: `eval_omega` lấy trung bình float32 theo hàng, còn numpy cộng float32 trên mảng cột thì làm tròn khác. Mình sửa phép so trong script kiểm, không sửa công cụ.
+- **v1.1 không đổi.**
+  - `check_v11.py`: 0 mảng khác.
+  - So với output của code trước khi sửa: `eval_checkpoint` (cả `--formation`), `aggregate_seeds`, `eval_heuristics`, `eval_trajectories` và trace của `record.py` giống từng byte. `eval_controller` giống ở mọi cột cũ, chỉ thêm cột mới.
+- **`eval_controller.py` trên v2** (đã chạy thử trên smoke checkpoint MLP và attention):
+  - nhiều ràng buộc;
+  - `local`: λ riêng mỗi UAV; khe trống giữ λ, vì không có UE;
+  - `bang_bang`, `rcpo`;
+  - lưới ω cố định trên mặt đơn hình;
+  - `oracle_viol`;
+  - `tviol_*`, `rec_*`: sự kiện là đổi ngưỡng, hoặc một vị trí bị bỏ trống.
+- **Trình xem.** Chạy JS của trang trên DOM giả (node) với trace v1.1, v2 góc và v2 có bộ điều khiển: không lỗi. Lỗi `Array(-1)` với trace không có bộ điều khiển đã tìm thấy bằng cách này và đã sửa.
+- **Rút ω trộn.** Với 0.3 / 0.3: 29.5% lần rút có 2 mục tiêu khác 0, 30.0% có 3, 40.6% có 4. Trung bình mỗi mục tiêu 0.25.
+- **Chi phí eval.** Một ca 240 bước ở N = 10 tốn khoảng 20 s (đo 78–87 s cho 4 ca, tính cả thời gian nạp, ở N = 2, 6, 10, mạng attention và MLP gần như bằng nhau), nên 30 ω × 20 episode mất khoảng 3,3 giờ mỗi N và checkpoint trên CPU.
+
+**ISSUES:**
+- Chưa có số liệu v2: cần checkpoint pilot (TIP 11).
+- Eval v2 đắt: 30 ω × 20 episode × 5 giá trị N cho mỗi checkpoint mất nhiều giờ. Có thể giảm số ω (ví dụ 4 góc + 11) hoặc chia N cho nhiều tiến trình; chốt ở TIP 11.
+- `local` đưa vào policy những ω khác nhau giữa các UAV, mà policy chỉ được train với ω chung (trừ khi bật `omega_per_agent`). Đây là ngoài phân phối train.
+- RCPO ở đây chỉ là bước cập nhật nhân tử trên thang thời gian chậm (Tessler, Mankowitz & Mannor, ICLR 2019, arXiv:1805.11074), không train lại policy. Chưa đối chiếu số phương trình trong bài.
+- KPI hồi phục chưa có sự kiện của TIP 5 (điểm nóng, UAV hỏng); hiện chỉ có đổi ngưỡng và vị trí bị bỏ trống.
+
+**DEVIATIONS:**
+- WFG dùng để kiểm, không dùng để tính (đã nói ở trên).
+- Ngưỡng 1e-9 của plan là cho HV 3D; ở 4D mình dùng cùng ngưỡng.
+
+**SUGGESTIONS:**
+- TIP 11: train v2 với `omega_edge_prob` 0.2 và `omega_face_prob` 0.2 nếu bộ điều khiển là trọng tâm. Chỉnh hệ số trên seed 100000+.
