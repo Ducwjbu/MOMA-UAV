@@ -151,6 +151,13 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
   - **cao:** 1.5 × danh nghĩa.
   Kết luận chỉ đứng được nếu phương pháp hơn baseline ở cả ba mức.
 - **Chi phí đã đo** (v2, hành động ngẫu nhiên): một bước env 14.5 ms ở N = 2, 15.9 ms ở N = 3, 22.1 ms ở N = 6, 29.7 ms ở N = 10. Replay buffer của MLP 10 khe khoảng 5–6 GB mỗi run (3 UAV: khoảng 1 GB). Run dài cần `--resume` trên Kaggle.
+- **Quy trình đánh giá cuối (chốt 2026-11-14):** giữ nguyên như v1.1, không cắt bớt.
+  - Mỗi (seed, N): 30 ω × 20 episode test (200000+). N = 2, 4, 6, 8, 10, và với attention thêm 11, 12.
+  - Một ca 240 bước mất khoảng 20 s trên CPU. Tổng khoảng 200 giờ CPU, chạy song song mỗi (seed, N) một tiến trình (máy có 12 luồng).
+  - Phân tích độ nhạy theo tải: khoảng 400 giờ CPU nếu làm ở mọi N.
+  - Lý do giữ nguyên:
+    - Thử trên dữ liệu test v1.1: giảm xuống 15 ω chỉ hạ HV khoảng 1% và giữ nguyên chênh lệch giữa các phương pháp. Giảm episode thì ước lượng trôi: chênh lệch ma3_prior − heuristic là 0.058 với 20 episode, 0.066 với 10 episode đầu, 0.080 với 5.
+    - Thời gian chạy nhỏ so với hạn khoá luận (khoảng giữa tháng 4/2027), và quy trình giống báo cáo v1.1.
 
 ---
 
