@@ -221,9 +221,9 @@ Mỗi nhận định trong `CLAUDE.md` và báo cáo không đến từ `eval_ch
 v2 (TIP 8):
 - Nhận nhiều `--constraint`, ví dụ `sla_urllc:0.8` và `sla_embb_share:0.5`.
 - Thêm các phương pháp `local` (mỗi UAV một hàng đợi ảo trên KPI của UE nó phục vụ, mỗi UAV một omega), `bang_bang` (luật ngưỡng) và `rcpo` (λ cập nhật sau mỗi episode).
-- `fixed` tạo lưới omega cố định trên mặt của đơn hình; `--fixed_grid 41` cho bước 0.025.
-- Oracle chọn theo hai tiêu chí: `oracle` (đạt ngưỡng trung bình) và `oracle_viol` (thêm điều kiện tỉ lệ episode vi phạm ≤ `--oracle_viol`).
-- Báo cáo thêm KPI theo thời gian: `tviol_*` là tỉ lệ bước vi phạm, `rec_*` là thời gian hồi phục sau khi ngưỡng đổi hoặc một vị trí bị bỏ trống.
+- `fixed` tạo lưới omega cố định trên mặt của đơn hình. `--fixed_grid g` là số điểm mỗi trục. Với một ràng buộc, `--fixed_grid 41` cho bước 0.025. Với hai ràng buộc, số omega là g(g+1)/2: 66 khi g = 11, nhưng 861 khi g = 41, tức khoảng 96 giờ cho mỗi checkpoint.
+- Oracle chọn theo hai tiêu chí: `oracle` (đạt ngưỡng trung bình) và `oracle_viol` (thêm điều kiện tỉ lệ episode vi phạm ràng buộc bất kỳ ≤ `--oracle_viol`).
+- Báo cáo thêm KPI theo thời gian: `tviol_*` là tỉ lệ bước vi phạm, `rec_*` là thời gian hồi phục sau khi ngưỡng đổi (với `--carry`) hoặc một vị trí bị bỏ trống. Trung bình trượt chỉ tính các bước từ lúc xảy ra sự kiện.
 
 ```bash
 python eval_controller.py --out evals/ctrl --seed_base 200000 --constraint qos:0.30 --primary energy
@@ -231,10 +231,10 @@ python eval_controller.py --out evals/ctrl --seed_base 200000 --constraint qos:0
 python eval_controller.py --out evals/ctrl_change --seed_base 200000 --carry --change 10:0.35 --k_i 0.5 --k_p 0
 # Phép thử vai trò: một UAV ở góc năng lượng, hai UAV kia ở góc QoS
 python eval_trajectories.py --methods ma3_prior ma3_prior_pa --roles --seed_base 100000 --out evals/roles
-# v2: hai ràng buộc SLA ở N = 6, lưới omega cố định bước 0.025
+# v2: hai ràng buộc SLA ở N = 6
 python eval_controller.py --config config/train/moma_ac_v2_prior.yaml \
     --checkpoint_glob "saved_models_moma_ac_v2_prior/seed_*/checkpoints/checkpoint_step_1000000.pth" --n_serving 6 \
-    --constraint sla_urllc:0.8 --constraint sla_embb:0.6 --methods pid local bang_bang rcpo fixed --fixed_grid 41 --out evals/ctrl_v2
+    --constraint sla_urllc:0.8 --constraint sla_embb:0.6 --methods pid local bang_bang rcpo fixed --out evals/ctrl_v2
 ```
 
 Xem lại một episode trên bản đồ (UAV bay, UE đi, association, UE trượt SLA vì đâu): `visualize/record.py` ghi episode của checkpoint (chỉ đọc env, kết quả không đổi), `--html` ra một trang tự chứa mở thẳng bằng trình duyệt. Thiết kế ở `visualize/architecture.md`.

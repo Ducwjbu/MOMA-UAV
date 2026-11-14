@@ -313,6 +313,16 @@ def write_html(trace_json: str, path: str):
         f.write(html.replace(marker, f'<script type="application/json" id="trace">{payload}</script>'))
 
 
+def objective_names(train_config: str) -> list:
+    """The reward vector's names for a train config, read from its env config without building the env"""
+    import yaml
+    with open(train_config, encoding="utf-8") as f:
+        env_config = yaml.safe_load(f).get("env_config") or "config/environment/default.yaml"
+    with open(env_config, encoding="utf-8") as f:
+        obj = (yaml.safe_load(f) or {}).get("objectives")
+    return [str(n) for n in obj["names"]] if obj else list(V11_OBJECTIVES)
+
+
 def make_controller(args, trainer, constraints, names):
     """A fresh controller of eval_controller.py for one recorded episode"""
     n_obj, primary = len(names), names.index(args.primary)
@@ -362,21 +372,20 @@ def main():
     parser.add_argument("--html", action="store_true", help="Also a self-contained viewer page")
     args = parser.parse_args()
 
-    if args.controller is None and args.config is None and args.n_serving is None and \
-            all(METHODS.get(m, "").find("v2") < 0 for m in args.methods):
-        names = V11_OBJECTIVES
-    else:   # The objectives come from the first trainer: load it once to know them
-        m0 = args.methods[0]
-        f0 = sorted(glob.glob(args.checkpoint_glob.format(m=m0, s=args.seeds[0], step=args.step)))
-        if not f0:
-            parser.error(f"no checkpoint for {m0} seed {args.seeds[0]}")
-        cfg0 = args.config or METHODS.get(m0, f"config/train/moma_ac_{m0}.yaml")
-        names = list(load_trainer(cfg0, f0[0], env_config_for(cfg0, None, args.n_serving)).obj_names)
+    # The objectives, from the env config of each method's train config (the env's objectives.names, else v1.1);
+    # every method must have the same ones
+    found = {tuple(objective_names(args.config or METHODS.get(m, f"config/train/moma_ac_{m}.yaml")))
+             for m in args.methods}
+    if len(found) != 1:
+        parser.error(f"the methods have different objectives: {sorted(found)}")
+    names = list(found.pop())
     n_obj = len(names)
     corners = {k: np.array(v, np.float32) for k, v in corners_of(names).items()}
     if args.corners == list(CORNERS) and names != V11_OBJECTIVES:
         args.corners = list(corners)
     if args.roles:
+        if names != V11_OBJECTIVES:
+            parser.error("--roles is the 3-UAV v1.1 role test")
         for i in range(3):
             w = np.tile(corners["qos"], (3, 1))
             w[i] = corners["energy"]

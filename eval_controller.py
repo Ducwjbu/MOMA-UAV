@@ -29,15 +29,18 @@ Controllers (one call to observe per env step):
   local     v2, one omega per UAV: the virtual queue of i_only kept by each UAV on its own KPI, the mean of the
             sla_<slice> score (or the binary SLA, for X_share) over the UEs of that slice it serves this step;
             omega_i = (e_0 + sum_k lambda_ik d_k) / ||.||_1. A KPI with no per-UAV value (energy, coverage) uses
-            the team's. A UAV serving no UE of the slice keeps its lambda. The team policy was trained with one
-            omega for all UAVs (unless omega_per_agent), so this is out of its training distribution.
+            the team's. A UAV serving no UE of the slice keeps its lambda. Uncovered UEs count in the team KPI (near
+            0) but in no UAV's, so every local queue can be satisfied while the team constraint fails. The team
+            policy was trained with one omega for all UAVs (unless omega_per_agent), so this is out of its training
+            distribution. The steps file logs the mean omega over the positions serving when it was applied.
   bang_bang a threshold rule: omega is the corner of the constraints whose running mean (since the episode
             started, or the shift with --carry) is below its threshold (their mean if several), else e_0.
   rcpo      lambda held for a whole episode and updated after it on the episode's mean KPI,
             lambda_k <- [lambda_k + eta (c_k - mean KPI_k)]_+ (--rcpo_lr): the multiplier update of RCPO on the
             slow timescale (Tessler, Mankowitz & Mannor, "Reward Constrained Policy Optimization", ICLR 2019,
-            arXiv:1805.11074), here without retraining the policy. lambda carries across the episodes of a seed
-            whether or not --carry is set.
+            arXiv:1805.11074), here without retraining the policy: projected dual ascent on the episode mean,
+            none of RCPO's penalized reward or policy update. The update after an episode uses the thresholds in
+            force during it. lambda carries across the episodes of a seed whether or not --carry is set.
   dpi_lite  omega = E[w] under p(w) proportional to exp(beta <w, G>) on the simplex, G the critic's predicted return
             of the current action (times 1 - gamma, per step). This is DPI's evidence (Cao et al., ICLR 2026: the
             agent's own predicted return), without its learned inference network, so it keeps the property that
@@ -47,17 +50,20 @@ Controllers (one call to observe per env step):
             (fixed_a<a>); several: a grid of step 1 / (fixed_grid - 1) on the face spanned by e_0 and the
             constraints' objectives (fixed_<weights>). The best of them in hindsight is the "oracle" fixed omega,
             by two criteria: oracle, meets every constraint on average over the evaluated episodes (as before);
-            oracle_viol, also violates in at most --oracle_viol of the units (seed, episode), the criterion the
+            oracle_viol, also with at most --oracle_viol of the units (seed, episode) violating any constraint
+            (viol_any), the criterion the
             controllers are judged by (an independent audit, 2026-11-13, found a fine grid's best fixed omega met
             the mean while 31% of its episodes violated).
 Every change of omega is capped at delta in L1 (--delta): PCMA Thm 4.6 bounds the distance to equilibrium by a
 term proportional to the per-step change of preferences.
 
-KPIs over time (summary): tviol_<kpi>, the share of steps whose KPI is below the threshold in force; and the
-recovery after events, rec_<kpi>_steps (mean steps until the trailing mean over --window steps is back at the
-threshold, over events that recover) and rec_<kpi>_share (share of events that recover before the episode, or the
-shift with --carry, ends). Events: a threshold change (--change) and, in a v2 shift, a serving position left
-empty (info n_serving_step falls).
+KPIs over time (summary): tviol_<kpi>, the share of steps whose KPI is below the threshold in force; viol_any, the
+share of units (seed, episode) violating any constraint on the episode mean (viol_<kpi> is nan for an episode with
+no measurement of that KPI); and the recovery after events, rec_<kpi>_steps (mean steps until the trailing mean
+over --window steps, counting only steps from the event on, is at the threshold, over events that recover) and
+rec_<kpi>_share (share of events that recover before the episode, or the shift with --carry, ends). Events: a
+threshold change (--change; with --carry, as the episodes of a seed then form one sequence) and, in a v2 shift, a
+serving position left empty (info n_serving_step falls within an episode). Events count in the phase they start.
 
 Episodes are those of eval_checkpoint.py: episode k is seeded by seed_base + k (100000+ validation, used to tune the
 gains; 200000+ test). With --carry the controller state (lambda, integral, omega) carries over consecutive episodes
@@ -74,8 +80,12 @@ Run:
   py eval_controller.py --out evals/ctrl --seed_base 200000 --k_i 0.5 --k_p 0 --lambda_init 0.5
   py eval_controller.py --out evals/ctrl_shift --seed_base 200000 --k_i 0.5 --k_p 2 --lambda_init 0.5 --carry
   py eval_controller.py --out evals/ctrl_urllc --constraint sla_urllc:0.30:qos
-  py eval_controller.py --config config/train/moma_ac_v2_prior.yaml --checkpoint_glob "<run>/seed_*/checkpoints/*.pth"
-      --n_serving 6 --primary energy --constraint sla_urllc:0.8 --constraint sla_embb:0.6 --out evals/ctrl_v2
+  py eval_controller.py --config config/train/moma_ac_v2_prior.yaml
+      --checkpoint_glob "<run>/seed_*/checkpoints/checkpoint_step_1000000.pth" --n_serving 6 --primary energy
+      --constraint sla_urllc:0.8 --constraint sla_embb:0.6 --out evals/ctrl_v2
+  (fixed omegas: --fixed_grid points per axis, so (g + 1) g / 2 of them with two constraints on a 3-axis face:
+  66 at the default 11; 41 gives 861, about 96 h per checkpoint at 20 s a shift and 20 episodes. Use a fine grid
+  with one constraint)
 
 Gains (tuned on 3 seeds x 10 validation episodes, qos >= 0.30, primary energy): per episode K_I 0.5, K_P 0,
 lambda_init 0.5 is the only setting with at most 10% of episodes violating; with --carry the time-averaged qos
@@ -289,14 +299,15 @@ class RCPOLambda:
     def reset(self):
         n = len(self.constraints)
         self.lam = np.full(n, self.lambda_init)
-        self.sum, self.count = np.zeros(n), np.zeros(n)
+        self.sum, self.count = np.zeros(n), np.zeros(n)   # Sum of the deficits c_k - KPI_k over the episode
         self.w = lagrangian_omega(self.n_obj, self.primary, self.lam, self.constraints)
 
     def new_episode(self):
-        """Apply the multiplier update for the episode just ended; lambda carries over"""
-        for k, con in enumerate(self.constraints):
+        """Apply the multiplier update for the episode just ended (with the thresholds that were in force during
+        it, even when the next episode changes them); lambda carries over"""
+        for k in range(len(self.constraints)):
             if self.count[k]:
-                self.lam[k] = max(0.0, self.lam[k] + self.lr * (con["c"] - self.sum[k] / self.count[k]))
+                self.lam[k] = max(0.0, self.lam[k] + self.lr * self.sum[k] / self.count[k])
         self.sum[:], self.count[:] = 0.0, 0.0
         self.w = lagrangian_omega(self.n_obj, self.primary, self.lam, self.constraints)
 
@@ -307,7 +318,7 @@ class RCPOLambda:
         for k, con in enumerate(self.constraints):
             x = kpis.get(con["kpi"], np.nan)
             if not np.isnan(x):
-                self.sum[k] += x
+                self.sum[k] += con["c"] - x
                 self.count[k] += 1
 
 
@@ -392,6 +403,7 @@ def run_episodes(trainer, controller, seeds, steps: int, carry: bool, constraint
             obs_dict = env.reset()
             for t in range(steps):
                 w = controller.omega()
+                serving = [i for i, u in enumerate(uids) if getattr(env.uavs[u], "active", True)]
                 obs = np.stack([obs_dict[u] for u in uids])
                 action = agent.select_joint_action(obs, w, explore=False)
                 if isinstance(controller, DPILite):
@@ -403,8 +415,7 @@ def run_episodes(trainer, controller, seeds, steps: int, carry: bool, constraint
                     controller.update(g)
                 w_team = np.asarray(w, dtype=np.float64)
                 if w_team.ndim == 2:   # One omega per UAV: the mean over the serving ones
-                    act = [i for i, u in enumerate(uids) if getattr(env.uavs[u], "active", True)] or list(range(len(uids)))
-                    w_team = w_team[act].mean(0)
+                    w_team = w_team[serving or list(range(len(uids)))].mean(0)   # Serving when omega was applied
                 row = {"ep": ep, "t": t, "phase": phase, **{f"w_{n}": w_team[j] for j, n in enumerate(names)}, **k}
                 if "n_serving_step" in info:
                     row["n_serving"], row["gaps"] = info["n_serving_step"], info["gaps"]
@@ -435,7 +446,9 @@ def bootstrap_ci(x: np.ndarray, n_boot: int = 2000, seed: int = 0):
 
 def recovery(steps: pd.DataFrame, constraints: list, carry: bool, window: int) -> pd.DataFrame:
     """Per method and constraint: events (threshold changes; a serving position left empty) and the steps until
-    the trailing mean of the KPI over `window` steps is back at the threshold in force"""
+    the trailing mean of the KPI over `window` steps, counting only steps from the event on, is at the threshold in
+    force. Pass the whole run (every phase): a threshold change is the step where the phase changes, and each
+    event is reported with the phase it starts"""
     out = []
     keys = ["method", "seed"] if carry else ["method", "seed", "ep"]
     for key, g in steps.groupby(keys, sort=False):
@@ -447,22 +460,29 @@ def recovery(steps: pd.DataFrame, constraints: list, carry: bool, window: int) -
         for con in constraints:
             x = g[con["kpi"]].to_numpy(dtype=float)
             c = g[f"c_{con['kpi']}"].to_numpy(dtype=float) if f"c_{con['kpi']}" in g else np.full(len(x), con["c"])
-            trail = pd.Series(x).rolling(window, min_periods=1).mean().to_numpy()
+            phase = g["phase"].to_numpy()
             for e in sorted(set(events)):
-                after = np.flatnonzero(trail[e:] >= c[e:])
-                out.append({"method": key[0], "kpi": con["kpi"], "recovered": len(after) > 0,
+                # Pre-event steps never count: a KPI that was fine before the event is not "recovered" at once
+                trail = pd.Series(x[e:]).rolling(window, min_periods=1).mean().to_numpy()
+                after = np.flatnonzero(trail >= c[e:])
+                out.append({"method": key[0], "phase": int(phase[e]), "kpi": con["kpi"], "recovered": len(after) > 0,
                             "steps": float(after[0]) if len(after) else np.nan})
-    return pd.DataFrame(out, columns=["method", "kpi", "recovered", "steps"])
+    return pd.DataFrame(out, columns=["method", "phase", "kpi", "recovered", "steps"])
 
 
 def summarize(steps: pd.DataFrame, primary: str, constraints: list, names=V11_OBJECTIVES,
-              carry: bool = False, window: int = 5) -> pd.DataFrame:
-    """Per (method, seed, ep): episode means; then mean and CI over those units, per method"""
+              carry: bool = False, window: int = 5, rec: pd.DataFrame = None) -> pd.DataFrame:
+    """Per (method, seed, ep): episode means; then mean and CI over those units, per method. rec: the events of
+    recovery() on the whole run, restricted to this phase (computed from steps when None)"""
     ep = steps.groupby(["method", "seed", "ep"]).mean(numeric_only=True).reset_index()
     for con in constraints:
         c = ep[f"c_{con['kpi']}"] if f"c_{con['kpi']}" in ep else con["c"]   # The threshold in force
         ep[f"gap_{con['kpi']}"] = np.maximum(0.0, c - ep[con["kpi"]])
-        ep[f"viol_{con['kpi']}"] = (ep[con["kpi"]] < c).astype(float)
+        # nan when the KPI had no measurement in the whole episode (e.g. a slice with no demand)
+        ep[f"viol_{con['kpi']}"] = np.where(ep[con["kpi"]].isna(), np.nan, (ep[con["kpi"]] < c).astype(float))
+    vk = [f"viol_{con['kpi']}" for con in constraints]
+    # A unit violates if any constraint does (nan only if no constraint was measured)
+    ep["viol_any"] = ep[vk].max(axis=1, skipna=True)
     # KPIs over time: share of a unit's steps (with a measurement) below the threshold in force
     tv = steps.copy()
     for con in constraints:
@@ -472,7 +492,8 @@ def summarize(steps: pd.DataFrame, primary: str, constraints: list, names=V11_OB
     ep = ep.merge(tv.groupby(["method", "seed", "ep"])[tcols].mean().reset_index(), on=["method", "seed", "ep"])
     cols = [primary] + list(names) + ["coverage"] + share_keys(names)
     cols = list(dict.fromkeys(cols)) + [c for c in ep.columns if c.startswith(("gap_", "viol_"))]
-    rec = recovery(steps, constraints, carry, window)
+    if rec is None:
+        rec = recovery(steps, constraints, carry, window)
     out = []
     for m, g in ep.groupby("method", sort=False):
         row = {"method": m, "n_units": len(g)}
@@ -493,13 +514,13 @@ def summarize(steps: pd.DataFrame, primary: str, constraints: list, names=V11_OB
 
 def oracle_fixed(summary: pd.DataFrame, primary: str, constraints: list, max_viol: float = None):
     """The fixed omega with the best primary objective among those meeting every constraint on average, and with
-    max_viol also violating in at most that share of the units"""
+    max_viol also with at most that share of the units violating any constraint (viol_any)"""
     fixed = summary[summary.method.str.startswith("fixed_")]
     ok = np.ones(len(fixed), bool)
     for con in constraints:
         ok &= fixed[con["kpi"]].to_numpy() >= con["c"]
-        if max_viol is not None:
-            ok &= fixed[f"viol_{con['kpi']}"].to_numpy() <= max_viol
+    if max_viol is not None:
+        ok &= fixed["viol_any"].to_numpy() <= max_viol
     if not ok.any():
         return None
     return fixed[ok].sort_values(primary, ascending=False).iloc[0]["method"]
@@ -628,10 +649,11 @@ def main():
     show = ["method", args.primary] + [con["kpi"] for con in constraints] + \
            [f"viol_{con['kpi']}" for con in constraints] + [f"tviol_{con['kpi']}" for con in constraints]
     parts = []
+    rec_all = recovery(steps_df, constraints, args.carry, args.window)   # Whole run: sees the threshold changes
     for phase, g in steps_df.groupby("phase"):
         cons = [dict(con) for con in constraints]
         cons[0]["c"] = float(g[f"c_{cons[0]['kpi']}"].iloc[0])
-        summary = summarize(g, args.primary, cons, names, args.carry, args.window)
+        summary = summarize(g, args.primary, cons, names, args.carry, args.window, rec_all[rec_all.phase == phase])
         best = oracle_fixed(summary, args.primary, cons)
         best_viol = oracle_fixed(summary, args.primary, cons, args.oracle_viol)
         summary["oracle"] = summary.method == best

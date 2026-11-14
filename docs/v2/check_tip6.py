@@ -16,8 +16,10 @@ All runs: config/environment/v2.yaml with n_serving fixed, the k-means prior wit
 demand), power 1, 40 steps per episode, counted from step 6.
 
   py docs/v2/check_tip6.py calibrate
-      On CALIB_SEEDS (30 validation episodes, 100000+): the covered eMBB SLA share at S_REF for means 1, 2, ...,
-      then on a 0.1 grid above the last whole number still at 0.80 or more. Prints the largest mean at 0.80 or more.
+      On CALIB_SEEDS (30 validation episodes, 100000+): the covered eMBB SLA share at S_REF for means 1, 2, ...
+      until one falls below 0.80, then in steps of 0.1 above the last whole number at 0.80 or more until a step
+      falls below. Prints the last mean before that first failure (a step search: the share is not monotone in
+      the mean, on these episodes 2.2 gives 0.823 and 2.3 0.833, and values above the first failure are not tried).
 
   py docs/v2/check_tip6.py check
       On CHECK_SEEDS (30 other validation episodes, 100100+), with v2.yaml as it is. PASS if

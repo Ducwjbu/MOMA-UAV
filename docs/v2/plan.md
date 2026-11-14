@@ -527,3 +527,33 @@ Hai bộ episode tăng từ 10 lên 30 mỗi bộ (hiệu chỉnh 100000–10002
 
 **SUGGESTIONS:**
 - TIP 11: train v2 với `omega_edge_prob` 0.2 và `omega_face_prob` 0.2 nếu bộ điều khiển là trọng tâm. Chỉnh hệ số trên seed 100000+.
+
+### Kiểm độc lập TIP 6 và TIP 8 (2026-11-14)
+
+Một agent không có ngữ cảnh đã kiểm `0a01679..982170f`: chỉ đọc, chạy lại các script, và so code cũ với code mới trên một worktree tạm.
+
+**Agent xác nhận:**
+- `check_tip8.py` PASS. WFG đúng là thuật toán độc lập: tự tính lại bằng tay đúng, khớp Monte Carlo.
+- Phép kiểm (c) nhạy: lệch ω 1e-6 thì kết quả đổi 6.9e-5. Việc đổi sang so trung bình float32 là hợp lý, không nới tiêu chí.
+- `check_v11.py`: 0 mảng khác.
+- Output v1.1 của mọi công cụ giống code cũ (byte-identical, hoặc giống ở mọi cột cũ).
+- Chuỗi rút ω giống hệt code cũ khi các khoá mới bằng 0, với mọi tổ hợp `omega_per_agent` × `omega_switch_prob`.
+- Trace v2 của `record.py` khớp `eval_checkpoint`.
+- TIP 6: hai bộ seed tách rời; chạy lại S = 6 ở 2.3 ra đúng 0.781 [0.735, 0.824].
+
+| Phát hiện | Mức | Sửa |
+|---|---|---|
+| `rec_*` không bao giờ thấy sự kiện đổi ngưỡng: `summarize` chạy riêng từng phase, mà trong một phase thì phase không đổi | Nặng | Tính `recovery` một lần trên cả lần chạy; mỗi sự kiện ghi phase nó bắt đầu, và được đếm trong phase đó |
+| Trung bình trượt khi đo hồi phục gồm cả các bước trước sự kiện, nên KPI tốt trước sự kiện thì tính là "hồi phục" sau 0 bước | Nặng | Chỉ lấy các bước từ lúc sự kiện. Ví dụ của agent (sụt 8 bước) giờ cho 10 bước, không còn 0 |
+| Ví dụ trong CLAUDE.md lấy mọi checkpoint mà gán chung một seed | Nhỏ | Đổi sang `checkpoint_step_1000000.pth` |
+| `--fixed_grid 41` với hai ràng buộc cho 861 ω, khoảng 96 giờ | Nhỏ | Bỏ khỏi các ví dụ; ghi công thức g(g+1)/2 và chi phí |
+| `oracle_viol` xét từng ràng buộc riêng | Nhỏ | Thêm `viol_any` (tỉ lệ episode vi phạm ràng buộc bất kỳ); oracle dùng cột này |
+| RCPO cập nhật bằng ngưỡng của episode sau | Nhỏ | Cộng dồn độ thiếu `c − KPI` với ngưỡng đang áp dụng. Mô tả rõ: chỉ là bước nhân tử (projected dual ascent) |
+| Bộ rút ω trộn chọn cạnh và mặt bất kỳ, không riêng những cái chứa mục tiêu chính; với 3 mục tiêu thì `omega_face_prob` vô tác dụng; bật trộn thì bỏ qua corner warm-up | Nhỏ | Ghi rõ trong CLAUDE.md |
+| `record.py` đoán v1.1 hay v2 theo tên config; `--roles` với v2 lỗi KeyError | Nhỏ | Đọc tên mục tiêu từ env config của từng method; `--roles` với v2 báo lỗi rõ |
+| `local`: KPI từng UAV bỏ qua UE không được phủ; cột `w_*` lấy tập vị trí sau bước; episode không có đo thì tính là không vi phạm | Nhỏ | Ghi rõ phần UE không phủ; `w_*` dùng tập vị trí lúc áp ω; `viol_*` là nan khi không có đo |
+| Docstring của `check_tip6.py` ghi "lớn nhất ≥ 0.80" nhưng code dừng ở bước trượt đầu tiên | Nhỏ | Sửa docstring cho đúng code; không chạy lại |
+
+**Agent nêu thêm:**
+- `check_v11.py` tự nó không phủ các công cụ eval. Phần đó đã được kiểm bằng cách so trực tiếp với code cũ.
+- Phép kiểm (c) chỉ dùng ω cố định, nên kiểm vòng chạy và seed, không kiểm logic bộ điều khiển. Phần v2 của nó ngắn (10 bước, N = 3, không có thay ca).
