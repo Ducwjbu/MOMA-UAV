@@ -16,11 +16,11 @@ All runs: config/environment/v2.yaml with n_serving fixed, the k-means prior wit
 demand), power 1, 40 steps per episode, counted from step 6.
 
   py docs/v2/check_tip6.py calibrate
-      On CALIB_SEEDS (10 validation episodes, 100000+): the covered eMBB SLA share at S_REF for means 1, 2, ...,
+      On CALIB_SEEDS (30 validation episodes, 100000+): the covered eMBB SLA share at S_REF for means 1, 2, ...,
       then on a 0.1 grid above the last whole number still at 0.80 or more. Prints the largest mean at 0.80 or more.
 
   py docs/v2/check_tip6.py check
-      On CHECK_SEEDS (10 other validation episodes, 100100+), with v2.yaml as it is. PASS if
+      On CHECK_SEEDS (30 other validation episodes, 100100+), with v2.yaml as it is. PASS if
       (a) the arriving population averages 91 within 2%;
       (b) the covered eMBB SLA share at S_REF, with a 90% bootstrap CI over episodes, has its CI within
           [0.70, 0.90] and contains 0.80, i.e. the calibration carries over to unseen episodes;
@@ -33,7 +33,9 @@ History (independent audit of 2026-11-14): the first version calibrated and chec
 for 10% rate failures and was missed at 0.0997. Before that, a calibration to offered load = capacity of S_REF
 (17 streams per UE) passed the then criteria but left eMBB unreachable (SLA share 0.07 at S = 6). The criteria
 above were set after the audit and before running this version: separate seed sets, a CI, and a (c) threshold
-that only asks capacity to bind at all (5%).
+that only asks capacity to bind at all (5%). With 10 episodes per set the calibration gave 2.4 and the check
+0.756 [0.656, 0.844]: (b) failed on the CI width, since episodes differ a lot (random site and traffic map).
+Both sets were then raised to 30 episodes, criteria unchanged.
 """
 import contextlib
 import io
@@ -54,7 +56,7 @@ SLICES = ("embb", "urllc", "mmtc")
 S_REF = 6
 CALIB_SEEDS = 100000
 CHECK_SEEDS = 100100
-N_EP = 10
+N_EP = 30
 
 
 def config(S, streams=None):

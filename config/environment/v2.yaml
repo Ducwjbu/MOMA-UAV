@@ -188,8 +188,8 @@ traffic_patterns:
         packet_size: 1500 # bytes
         peak_rate: 2e6 # v2 (TIP 1): the video rate of qos_profiles.embb, streamed all the time. Mission-critical video
         activity_factor: 1.0 # streamed all the time
-        streams_per_ue: 2.4 # v2 (TIP 6): mean co-located video streams per simulated eMBB UE (a team's cameras),
-                            # calibrated in docs/v2/check_tip6.py on 10 episodes (largest mean on a 0.1 grid for which 6 UAVs,
+        streams_per_ue: 2.3 # v2 (TIP 6): mean co-located video streams per simulated eMBB UE (a team's cameras),
+                            # calibrated in docs/v2/check_tip6.py on 30 episodes (largest mean on a 0.1 grid for which 6 UAVs,
                             # k-means prior, even shares, still meet the SLA of 80% of covered eMBB UEs). Design: the
                             # PPDR load of ECC Report 199 (two major incidents, ~10-15 Mbps) is about 10x lower
         streams_dist: poisson # each UE draws Poisson(streams_per_ue) streams once; teams differ (0: no demand)

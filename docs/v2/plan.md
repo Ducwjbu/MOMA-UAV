@@ -147,7 +147,7 @@ Khoá `shift` (tắt khi vắng). Một episode là một cửa sổ 4 giờ (24
 - **Thí nghiệm tổng quát theo N (sau pilot, train 2–10):** đánh giá ở N = 2, 4, 6, 8, 10 (trong dải) và 11, 12 (ngoài dải). Tiêu chí "vẫn tốt" chốt trước khi chạy: ở mỗi N ngoài dải, HV của policy attention lớn hơn HV của baseline không train (UAV đứng yên ở vị trí k-means, cùng N, cùng episode), cận dưới CI của hiệu theo cặp > 0. Đạt cả 11 và 12 thì test thêm 13–15, không đạt thì dừng ở 12 và báo cáo đúng như vậy. Mạng MLP chỉ chạy được tới 10 (số khe cố định).
 - **Độ nhạy theo tải (đánh giá cuối):** đánh giá policy đã train ở ba mức tải eMBB, không train lại:
   - **thấp:** tải PPDR của ECC Report 199, khoảng 10–15 Mbps cho 2 sự cố, tức trung bình khoảng 0.2 luồng mỗi UE;
-  - **danh nghĩa:** 2.4 (TIP 6);
+  - **danh nghĩa:** 2.3 (TIP 6);
   - **cao:** 1.5 × danh nghĩa.
   Kết luận chỉ đứng được nếu phương pháp hơn baseline ở cả ba mức.
 - **Chi phí đã đo** (v2, hành động ngẫu nhiên): một bước env 14.5 ms ở N = 2, 15.9 ms ở N = 3, 22.1 ms ở N = 6, 29.7 ms ở N = 10. Replay buffer của MLP 10 khe khoảng 5–6 GB mỗi run (3 UAV: khoảng 1 GB). Run dài cần `--resume` trên Kaggle.
@@ -437,7 +437,7 @@ Một agent không có ngữ cảnh của cuộc trò chuyện đã kiểm `ee68
 - **TIP 6:** số luồng rút Poisson mỗi UE (`streams_dist: poisson`), hiệu chỉnh lại ra trung bình 2.4 (ngưỡng trễ 80 ms).
   - Trên 10 episode kiểm: dân số 90.6; tỉ lệ đạt SLA của eMBB đã được phủ ở S = 6 là 0.756 [0.656, 0.844].
   - (a), (c), (d) ok. **(b) FAIL:** CI chứa 0.80 nhưng cận dưới < 0.70. Giữa các episode chênh nhau nhiều, 10 episode không đủ.
-  - Chưa đổi ngưỡng; chờ bạn quyết (thêm episode cho cả hiệu chỉnh và kiểm, hoặc chấp nhận).
+  - Chưa đổi ngưỡng; chờ bạn quyết (thêm episode cho cả hiệu chỉnh và kiểm, hoặc chấp nhận). Bạn chọn chạy thêm: xem mục dưới.
 - **Smoke train v2** chạy hết.
 
 **Giả định phải ghi rõ** (agent nêu):
@@ -445,3 +445,29 @@ Một agent không có ngữ cảnh của cuộc trò chuyện đã kiểm `ee68
 - Mỗi UE gánh mọi luồng của nó theo kiểu được cả hoặc không, nên đếm UE một lần không tương đương đếm từng luồng (sửa câu DEVIATIONS của TIP 6).
 - Mục tiêu năng lượng bằng 0 khi không vị trí nào phục vụ.
 - 31 phút của M300 được coi là thời gian treo, nên thời gian bay đều của mô hình khoảng 38 phút.
+
+### TIP 6 với 30 + 30 episode (2026-11-14)
+
+Hai bộ episode tăng từ 10 lên 30 mỗi bộ (hiệu chỉnh 100000–100029, kiểm 100100–100129). Tiêu chí giữ nguyên, ghi vào docstring trước khi chạy.
+
+- **Hiệu chỉnh** ra **2.3**. Tỉ lệ eMBB đã được phủ đạt SLA ở S = 6:
+
+  | Trung bình luồng | 1.0 | 2.0 | 2.1 | 2.2 | 2.3 | 2.4 | 3.0 |
+  |---|---|---|---|---|---|---|---|
+  | Tỉ lệ đạt SLA | 0.970 | 0.874 | 0.859 | 0.823 | 0.833 | 0.791 | 0.751 |
+
+  2.2 thấp hơn 2.3 vì nhiễu: mỗi mức rút số luồng Poisson khác nhau. Bước 0.1 nhỏ hơn độ chênh giữa các episode.
+- **Kiểm ở 2.3:** PASS cả bốn tiêu chí.
+  - Dân số 90.1.
+  - Ở S = 6: **0.781 [0.735, 0.824]**, nên (b) đạt.
+  - Theo S:
+
+    | S | 2 | 4 | 6 | 8 | 10 |
+    |---|---|---|---|---|---|
+    | Tỉ lệ đạt SLA | 0.293 | 0.499 | 0.781 | 0.875 | 0.931 |
+    | Trượt vì tốc độ | 0.360 | 0.225 | 0.090 | 0.054 | 0.029 |
+    | Năng lực (Mbps) | 335 | 814 | 1266 | 1710 | 2200 |
+    | Tải (Mbps) | 393 | 393 | 394 | 393 | 393 |
+
+  - Chia slice (0.6, 0.2, 0.2) cho SLA eMBB / URLLC là 0.714 / 0.710; (0.2, 0.6, 0.2) cho 0.551 / 0.851.
+- **Kiểm ở 2.4** (chạy song song trước khi hiệu chỉnh xong) cũng PASS, ở S = 6 là 0.766 [0.718, 0.811]. Quy tắc là lấy đúng mức hiệu chỉnh chọn, nên `v2.yaml` dùng 2.3. Hai mức khác nhau không quá độ nhiễu.
