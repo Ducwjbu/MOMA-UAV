@@ -247,7 +247,7 @@ python -m visualize.record --methods ma3_prior --corners qos --omega 0.6,0.2,0.2
 python -m visualize.record --methods v2_prior --n_serving 6 --controller pid --constraint sla_urllc:0.8 --out visualize/out/ctrl --html
 ```
 
-Pilot 300k bước cho kiến trúc mới (chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa` (mỗi UAV một omega), `ma3_prior_att` (mạng attention), `ma3_prior_att_fleet` (attention, môi trường `ma3_fleet.yaml` có UAV rút giữa chừng).
+Pilot v2 (TIP 11, 300k bước, xem `kaggle/README.md`): `v2_pilot` (MLP) và `v2_pilot_att` (attention). Pilot 300k bước cho kiến trúc mới (chạy trên Kaggle, xem `kaggle/README.md`): `ma3_prior_pa` (mỗi UAV một omega), `ma3_prior_att` (mạng attention), `ma3_prior_att_fleet` (attention, môi trường `ma3_fleet.yaml` có UAV rút giữa chừng).
 
 Các khóa mới cho môi trường v2 và agent, mặc định tắt. Khi tắt, kết quả `v1.1` giữ nguyên từng bit (đã kiểm):
 

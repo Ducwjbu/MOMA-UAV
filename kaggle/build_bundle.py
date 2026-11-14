@@ -30,6 +30,8 @@ FILES = [
     "config/train/moma_ac_ma3_prior_att.yaml",
     "config/train/moma_ac_ma3_prior_att_fleet.yaml",
     "config/train/moma_ac_v2_prior.yaml",
+    "config/train/moma_ac_v2_pilot.yaml",
+    "config/train/moma_ac_v2_pilot_att.yaml",
     "kaggle/run_kaggle.py",
 ]
 

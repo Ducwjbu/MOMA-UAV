@@ -139,6 +139,27 @@ Ba variant thử kiến trúc mới. Mỗi variant chạy 300k bước, so với
    `py eval_trajectories.py --methods ma3_prior_pa --roles --seed_base 100000 --checkpoint_glob "runs/saved_models_moma_ac_{m}/seed_*/checkpoints/checkpoint_step_300000.pth" --out evals/roles_pa`
    Mốc so sánh là `ma3_prior` (đã train với một omega chung) với cùng lệnh, `--methods ma3_prior` và checkpoint 300000.
 
+## Pilot v2 (300k bước, môi trường `v2.yaml`)
+
+Môi trường v2 có 4 mục tiêu, ca trực 240 bước, mỗi ca 2–10 vị trí phục vụ, và prior k-means theo nhu cầu (`docs/v2/plan.md`, TIP 11). Pilot chỉ để biết MOMA-TD3 có học được trên v2 không: đường học có tăng không, và có đánh đổi thật giữa các slice và năng lượng không. Số liệu cuối chạy sau, 1M bước trở lên.
+
+| Variant | Config | Mạng |
+|---|---|---|
+| `v2_pilot` | `moma_ac_v2_pilot.yaml` | MLP, 10 khe cố định |
+| `v2_pilot_att` | `moma_ac_v2_pilot_att.yaml` | Attention, không phụ thuộc số UAV |
+
+1. Chạy `py kaggle/build_bundle.py`, rồi vào Dataset `moma-uav-code` → **New Version** → upload `moma_uav_code.zip` mới.
+2. Dùng một notebook mới, hoặc gỡ hết các Input là output của run cũ. Đặt:
+   - `VARIANTS = ["v2_pilot", "v2_pilot_att"]`, `SEEDS = [0, 1]`, `PARALLEL = 4`;
+   - các ô khác giữ nguyên.
+3. Chạy thử `SMOKE_TEST = True` trước (đã chạy được trên máy, từ chính file zip). Sau đó `SMOKE_TEST = False` → **Save & Run All (Commit)**.
+4. Một session không đủ, nên phải chạy tiếp như Bước 5.
+   - Trên laptop (GTX 1650), một bước train mất khoảng 110 ms với MLP và 130 ms với attention, chưa tính eval. Như vậy 300k bước khoảng 9–11 giờ cho một run chạy riêng.
+   - Bốn run cùng lúc trên 4 vCPU của Kaggle có thể chậm hơn. Dự kiến 2 session, khoảng 20 giờ quota GPU.
+   - Mỗi run chưa xong lưu replay buffer khoảng 1–2 GB vào output.
+5. Eval lúc train: 15 omega × 2 ca, mỗi 50k bước, khoảng 8 phút mỗi lần. Chỉ dùng để xem đường học.
+6. Tải `runs/saved_models_moma_ac_v2_pilot*/` về `runs/` ở máy để phân tích.
+
 ## Chia việc nếu chạy không kịp
 
 Mỗi session chạy cùng lúc tối đa `PARALLEL` run, các run còn lại chờ đến khi có chỗ trống hoặc tới session sau. Nếu muốn nhanh hơn:

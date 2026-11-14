@@ -60,6 +60,7 @@ py eval_heuristics.py --env_config config/environment/v2.yaml --n_serving 6 --ou
 py eval_controller.py --config config/train/moma_ac_v2_prior.yaml --checkpoint_glob "<run>/seed_*/checkpoints/checkpoint_step_1000000.pth" --n_serving 6 --constraint sla_urllc:0.8 --constraint sla_embb:0.6 --methods pid local bang_bang rcpo fixed --out evals/ctrl_v2
 py docs/v2/check_tip6.py calibrate|check                          # v2 load: streams per eMBB UE, capacity by fleet size
 py train_moma_ac.py --config config/train/moma_ac_v2_prior.yaml   # ma3_prior on v2 (4 objectives, 240-step shifts, 10 slots)
+py train_moma_ac.py --config config/train/moma_ac_v2_pilot.yaml   # TIP 11 pilot, 300k steps (v2_pilot_att: attention); about 110 / 130 ms a step on a GTX 1650
 
 # Optional flags
 py train_moma_ac.py --config <yaml> --env_config <yaml> --checkpoint <path.pth> --seed <n> --resume --max_hours <h>

@@ -1,0 +1,64 @@
+# ============================================================
+# Pilot v2 (docs/v2/plan.md TIP 11): moma_ac_v2_prior.yaml for 300k steps, to see whether MOMA-TD3 with the
+# demand prior learns on v2 at all (learning curve rising; a real trade-off between the slices and energy)
+# before the final runs. Training eval is cheaper than the final runs' (15 omegas x 2 shifts every 50k steps,
+# about 8 min each): curves only. buffer_size = total steps (same transitions as 500k, less memory)
+# ============================================================
+# ============================================================
+# MOMA-AC Training Config — 3 UAVs, CTDE, residual policy on a formation prior (prior.py)
+# omega ~ uniform on the simplex (Dirichlet(1,1,1)), per episode
+# v2 (docs/v2/plan.md): moma_ac_ma3_prior.yaml on config/environment/v2.yaml (4 objectives, Dirichlet(1,1,1,1);
+# up to 10 serving positions per shift, relays and battery swaps, TIP 4)
+# ============================================================
+
+# Environment
+env_config: "config/environment/v2.yaml"
+
+# Training
+total_training_steps: 300000
+min_buffer_size: 5000
+train_frequency: 1
+train_iterations: 1
+batch_size: 256
+max_steps_per_episode: 240    # one shift (v2.yaml shift.duration_steps); the env ends it with a terminal done
+
+# Omega sampling
+omega_sampling: "random"
+corner_warmup_episodes: 0
+
+# Formation prior (TIP 7): each serving position flies to its vertex, at the top altitude, and the actor learns a
+# residual on that movement. The vertices are the weighted k-means of the episode's expected demand (eMBB on the
+# traffic map, mMTC uniform, the RSUs; mass by slice weight) for the number of positions serving now, reassigned
+# when one is left empty or filled again (prior.py). prior_radius is used only by prior_mode ngon
+formation_prior: true
+prior_mode: demand
+prior_radius: 600.0
+
+# TD3 hyperparameters
+actor_lr: 3.0e-4
+critic_lr: 3.0e-4
+gamma: 0.9                    # The effect of an action fades within about 2 steps (a UAV reaches any point of the area in 2 steps, queues are per step); chosen a priori, see CLAUDE.md (formation prior, why gamma 0.9)
+tau: 0.005
+policy_delay: 2
+policy_noise: 0.2
+noise_clip: 0.5
+expl_noise: 0.3
+expl_noise_min: 0.05
+expl_noise_decay: 0.9999
+
+# Replay buffer
+buffer_size: 300000
+
+# Logging & saving
+log_interval: 5000
+save_interval: 50000
+eval_interval: 50000
+eval_n_omega: 15
+eval_n_episodes: 2
+eval_steps: 240                # a whole shift; eval cost is large, revisit in TIP 8/11
+
+# Output
+save_dir: "saved_models_moma_ac_v2_pilot_att"
+
+# Attention actor and critic (independent of N; the MLP has 10 fixed slots)
+network: attention
